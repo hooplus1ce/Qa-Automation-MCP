@@ -188,7 +188,9 @@ async with Client(transport) as client:
   等渲染帧后才点击。
 - **验证回路**:点击后依次检查选区变化、目标仍处于已选状态、编辑器、目标单元格
   scenegraph 的填充/描边等视觉状态；仍无证据时比较单元格中心的局部截图哈希，再决定
-  是否重试。返回的是紧凑证据而非完整场景图或截图。
+  是否重试。`verify=False` 时只执行 trusted 输入，不读取 scenegraph 或截图，也不返回
+  空的视觉证据字段；默认验证开启时，截图只作为前述证据不足时的最终兜底。返回的是
+  紧凑证据而非完整场景图或截图。
 - **统一定位器**:页面控件优先使用 `ui_analyze_scope` 返回的 CSS；CSS 当前不可用时
   回退 AX `role/name/description`，再回退 XPath，最后才使用经 `analysis_id` 校验的
   顶层 viewport 绝对坐标。`ui_click` 是常用点击入口，`ui_interact` 覆盖 fill、press、
@@ -319,6 +321,33 @@ uv run fastmcp dev apps server.py
 可选依赖；客户端进程的工作目录必须是本仓库根目录。若平台不会自动读取
 `.mcp.json`，可将其中 `mcpServers.vtable-ui-automation` 原样导入其 MCP 设置。
 
+## 项目结构
+
+项目按 FastMCP 的组合服务器模式组织。根 `server.py` 只负责创建服务器和启动
+stdio；`fastmcp.json` 是运行配置的单一来源。各领域模块创建独立的本地 FastMCP
+子服务器，由 `mcp_server.factory.create_server()` 无 namespace 挂载，因此已有工具名
+和资源 URI 保持兼容。
+
+```text
+vtable_mcp/
+├── server.py                    # 稳定入口:server:mcp
+├── fastmcp.json                 # FastMCP 声明式运行配置
+├── .mcp.json                    # Agent Host 项目级自动发现
+├── mcp_server/
+│   ├── factory.py               # 组合根与官方 Providers
+│   ├── app_ui.py                # FastMCPApp UI 与 app-only 后端工具
+│   ├── demo_tools.py            # Prefab UI 演示工具
+│   ├── browser_tools.py         # Chrome/CDP/Context 生命周期
+│   ├── ui_tools.py              # DOM、iframe、Portal、截图工具
+│   ├── vtable_tools.py          # VTable API 分析与交互工具
+│   ├── system_tools.py          # Profile 与指标
+│   └── resources.py             # vtable:// JS 资源
+├── vtable_playwright.py         # Playwright/VTable 驱动实现
+├── vtable_js.py                 # 浏览器侧 VTable 脚本
+├── automation_profiles.py       # 应用定位策略
+└── tool_metrics.py              # 工具可观测性
+```
+
 ## 替换为真实数据 / 真实执行
 
 - **数据**:编辑 `sample_data.py` 的 `TEST_CASES` / `MOLD_MASTER_FIELDS`,保持同构即可。
@@ -335,3 +364,8 @@ uv run fastmcp dev apps server.py
      `ui_snapshot` 的完整 ARIA 子树;
   页面内的 VTable 脚本仍可通过 `client.read_resource("vtable://js/...")` 读取。
   整个流程由 AI 按 "语义目标 → 确定性解析 → trusted 操作 → 回读验证" 闭环完成。
+
+截图边界：`ui_screenshot` 只有在客户端明确调用时才执行页面截图，不会被普通点击隐式
+触发。Playwright 的页面截图通常不会修改 DOM 或滚动页面，但浏览器在有硬件加速的有头
+模式下仍可能发生短暂合成器同步，不能承诺所有环境绝对零闪烁；对 VTable 点击请使用
+`verify=False`，对视觉诊断再显式调用 `ui_screenshot`。

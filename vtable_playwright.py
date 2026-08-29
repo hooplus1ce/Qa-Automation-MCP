@@ -101,7 +101,6 @@ PLAYWRIGHT_INSTALL_HINT = (
 
 BIND_TIMEOUT_MS = 10_000          # 等 VTable 实例绑定
 NAV_TIMEOUT_MS = 30_000           # 页面加载超时
-SETTLE_MS = 60                    # 鼠标就位后等待 hover/布局稳定
 SCROLL_WAIT_RAF = 2               # 滚动后多等几帧
 ACTIVE_PROFILE = active_profile()
 ACTIVE_IFRAME_SELECTOR = ACTIVE_PROFILE.active_iframe_selector
@@ -1971,8 +1970,13 @@ async def _click_cell_impl(
     before_sel = await frame.evaluate(
         "() => { const t = window._vtable; return t ? t.getSelectedCellRanges() : null; }"
     )
-    before_visual = await _cell_visual_state(frame, col, row)
-    before_screenshot = await _cell_screenshot(page, x, y)
+    # Visual evidence is optional. In particular, verify=False must remain a
+    # pure trusted-input path and must not trigger a compositor screenshot.
+    before_visual = None
+    before_screenshot = None
+    if verify:
+        before_visual = await _cell_visual_state(frame, col, row)
+        before_screenshot = await _cell_screenshot(page, x, y)
     # Arm immediately before the trusted input so setup/scroll mutations are
     # not attributed to the user action being measured.
     if observe_after:
@@ -2056,27 +2060,30 @@ async def _click_cell_impl(
     frame_details = await _frame_context_details(page, frame)
     response["frame"] = frame_details
     verification = response.get("verification") or {}
-    proof = [
-        {"type": name, "matched": bool(verification.get(key))}
-        for name, key in (
-            ("selection-changed", "selection_changed"),
-            ("target-selected", "target_selected"),
-            ("editor-open", "editor_open"),
-            ("scenegraph-changed", "scenegraph_changed"),
-            ("screenshot-changed", "screenshot_changed"),
-        )
-    ]
-    if verification.get("screenshot"):
-        proof[-1]["matched"] = bool(verification["screenshot"].get("changed"))
+    proof = []
+    if verify:
+        proof = [
+            {"type": name, "matched": bool(verification.get(key))}
+            for name, key in (
+                ("selection-changed", "selection_changed"),
+                ("target-selected", "target_selected"),
+                ("editor-open", "editor_open"),
+                ("scenegraph-changed", "scenegraph_changed"),
+                ("screenshot-changed", "screenshot_changed"),
+            )
+        ]
+        if verification.get("screenshot"):
+            proof[-1]["matched"] = bool(verification["screenshot"].get("changed"))
+    before_state: dict[str, Any] = {"selection": before_sel}
+    if before_visual is not None:
+        before_state["scenegraph_paints"] = before_visual.get("paints", [])
+    if before_screenshot is not None:
+        before_state["screenshot_digest"] = before_screenshot.get("digest")
     return _interaction_contract(
         response,
         action="dblclick" if double_click else "click",
         target={"kind": "vtable-cell", "col": col, "row": row},
-        before_state={
-            "selection": before_sel,
-            "scenegraph_paints": (before_visual or {}).get("paints", []),
-            "screenshot_digest": (before_screenshot or {}).get("digest"),
-        },
+        before_state=before_state,
         after_state={
             "scenegraph_paints": (verification.get("scenegraph") or {}).get(
                 "after_paints", []
@@ -2147,8 +2154,6 @@ async def _trusted_viewport_click(
                 f"point ({x:g}, {y:g}) is outside viewport "
                 f"({viewport['width']:g} x {viewport['height']:g})"
             )
-        await page.mouse.move(x, y)
-        await page.wait_for_timeout(SETTLE_MS)  # 让 hover/布局稳定
         if double_click:
             await page.mouse.dblclick(x, y, button=button)
         else:

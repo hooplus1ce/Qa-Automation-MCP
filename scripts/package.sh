@@ -12,6 +12,9 @@ rm -f "$OUT"
 # 打包内容:源码 + 文档 + 脚本(排除 venv/缓存/运行数据)
 zip -r "$OUT" \
   server.py \
+  mcp_server/ \
+  automation_profiles.py \
+  tool_metrics.py \
   vtable_js.py \
   vtable_playwright.py \
   sample_data.py \

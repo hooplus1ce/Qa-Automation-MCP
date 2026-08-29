@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import vtable_playwright as vpw
 
@@ -488,6 +489,21 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clicked["target"]["field"], "sku")
         self.assertEqual(clicked["target"]["record_index"], 1)
         self.assertTrue((await self.page.evaluate("window.__vtableClick"))["trusted"])
+
+    async def test_vtable_click_without_verification_does_not_capture_visual_evidence(self) -> None:
+        await self._mount_fake_vtable()
+
+        with (
+            patch.object(vpw, "_cell_visual_state", new_callable=AsyncMock) as visual,
+            patch.object(vpw, "_cell_screenshot", new_callable=AsyncMock) as screenshot,
+        ):
+            result = await vpw.click_vtable_cell_by_field("sku", 1, verify=False)
+
+        self.assertEqual(result["status"], "clicked")
+        visual.assert_not_awaited()
+        screenshot.assert_not_awaited()
+        self.assertEqual(result["interaction"]["before_state"], {"selection": []})
+        self.assertEqual(result["interaction"]["evidence"], [])
 
     async def test_vtable_analysis_coordinates_reuse_generic_viewport_click(self) -> None:
         await self._mount_fake_vtable()
