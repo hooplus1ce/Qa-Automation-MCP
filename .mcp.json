@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "vtable-ui-automation": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        ".",
+        "--extra",
+        "browser",
+        "fastmcp",
+        "run",
+        "fastmcp.json",
+        "--no-banner"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

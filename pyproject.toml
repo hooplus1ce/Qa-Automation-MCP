@@ -1,0 +1,17 @@
+[project]
+name = "vtable-mcp"
+version = "0.1.0"
+description = "VTable 虚拟表格 MCP 服务器:交互式 UI 工具 + 内化的 VTable JS 脚本资源"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp[apps]>=3.4.0",
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.62",
+]
+
+[tool.uv]
+package = false
