@@ -30,6 +30,7 @@ def create_server() -> FastMCP:
         max_results: int = 20,
         analysis_id: str | None = None,
         expect_input: bool = False,
+        compact: bool = False,
     ) -> dict:
         """统一点击页面控件，并即时返回 Portal、提示和聚焦浮层。
 
@@ -55,6 +56,7 @@ def create_server() -> FastMCP:
             max_results=max_results,
             analysis_id=analysis_id,
             expect_input=expect_input,
+            compact=compact,
         )
 
     @mcp.tool()
@@ -127,6 +129,7 @@ def create_server() -> FastMCP:
         max_results: int = 20,
         analysis_id: str | None = None,
         expect_input: bool = False,
+        compact: bool = False,
     ) -> dict:
         """在当前页面/活动 iframe 中执行统一 DOM 交互并返回聚焦浮层结果。
 
@@ -160,6 +163,7 @@ def create_server() -> FastMCP:
             max_results=max_results,
             analysis_id=analysis_id,
             expect_input=expect_input,
+            compact=compact,
         )
 
     @mcp.tool()

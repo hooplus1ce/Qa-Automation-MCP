@@ -720,5 +720,58 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await vpw.current_page()), second)
 
 
+    async def test_modal_resolves_to_inner_dialog_geometry_and_compact_changes(self) -> None:
+        await self.page.set_content(
+            "<button id='open-modal'>Open</button>"
+            "<script>document.querySelector('#open-modal').onclick = () => {"
+            " const wrap = document.createElement('div');"
+            " wrap.className = 'ant-modal-wrap legions-pro-modal';"
+            " wrap.setAttribute('role', 'dialog');"
+            " wrap.style.cssText = 'position:fixed;left:0;top:0;width:1000px;height:800px;display:block';"
+            " const modal = document.createElement('div');"
+            " modal.className = 'ant-modal';"
+            " modal.setAttribute('role', 'document');"
+            " modal.style.cssText = 'position:absolute;left:200px;top:100px;width:600px;height:400px;display:block';"
+            " modal.textContent = 'Actual dialog content';"
+            " wrap.append(modal);"
+            " document.body.append(wrap);"
+            "};</script>"
+        )
+
+        result = await vpw.dom_interact("click", css="#open-modal", settle_ms=80)
+        self.assertEqual(result["status"], "acted")
+        # Should resolve to 1 dialog (not duplicated wrap + inner dialog)
+        dialog_overlays = [item for item in result["overlays"] if item.get("kind") == "dialog"]
+        self.assertEqual(len(dialog_overlays), 1)
+        dialog = dialog_overlays[0]
+        self.assertEqual(dialog["text"], "Actual dialog content")
+        self.assertEqual(dialog["page_box"]["x"], 200)
+        self.assertEqual(dialog["page_box"]["width"], 600)
+        self.assertIn("changes", result)
+        self.assertEqual(result["changes"][0]["kind"], "dialog")
+        self.assertEqual(result["changes"][0]["page_box"]["x"], 200)
+        # Target should not contain null fields
+        self.assertNotIn("xpath", result["interaction"]["target"])
+
+    async def test_transitional_animation_events_are_deduplicated(self) -> None:
+        await self.page.set_content(
+            "<button id='trigger'>Trigger</button>"
+            "<script>document.querySelector('#trigger').onclick = () => {"
+            " const node = document.createElement('div');"
+            " node.className = 'ant-message-notice move-up-enter';"
+            " node.textContent = 'Toast message';"
+            " node.style.cssText = 'position:fixed;left:10px;top:10px;width:100px;height:30px;display:block';"
+            " document.body.append(node);"
+            " setTimeout(() => { node.className = 'ant-message-notice'; }, 10);"
+            "};</script>"
+        )
+
+        result = await vpw.dom_interact("click", css="#trigger", settle_ms=80)
+        self.assertEqual(result["status"], "acted")
+        messages = [item for item in result["ui_events"] if item.get("text") == "Toast message"]
+        # Only 1 deduplicated event instead of intermediate move-up-enter ghost
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn("move-up-enter", messages[0]["selector"])
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

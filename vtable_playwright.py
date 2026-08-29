@@ -53,9 +53,11 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
+import zlib
 import urllib.error
 import urllib.request
 import weakref
@@ -112,6 +114,15 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+VTABLE_SHOW_CURSOR = _env_bool("VTABLE_SHOW_CURSOR", True)
 
 OVERLAY_RESULT_LIMIT = _env_int("VTABLE_OVERLAY_RESULT_LIMIT", 20)
 
@@ -224,6 +235,193 @@ ANTD_OVERLAY_SELECTOR = ",".join(ACTIVE_PROFILE.overlay_selectors)
 OVERLAY_OBSERVER_KEY = "__vtable_mcp_overlay_observer__"
 OVERLAY_EVENT_LIMIT = 100
 OVERLAY_SETTLE_LIMIT_MS = 2_000
+
+_last_mouse_point: tuple[float, float] | None = None
+
+# Solidified Windows 11 Dark HD high-definition pointer cursor (32x32, hotspot at (5, 10))
+_EMBEDDED_CURSOR_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAB8klEQVR42u2WTUsCURSGy68srSZF6Z"
+    "OIIiho1zJCw7XQOgjFH+BP0HLVbjYRtHFb0CzCHyC4aycJg7kRgtnoQnDET2Q6dzgTw6Bpee/QYg"
+    "684L0jvM85Z+bcOzdnhRVW/OOYN8g8Y1EU/YVCIQC/XSgnyG4KyHA45BWMVqt1D1srIC9ogTnEYD"
+    "C4JMY8z6si0Wg0nuFRELQKcjOFgOxviCn8VJVOp1WIer3+AutNEMcUwgigh6jVagJziFEApkLAO3"
+    "A7CmAChIMaxE8AYyDWQIvUICYB6CHa7baYSCSOqEJMA0AUi8W+IeLx+DHs+ahATAugh2g2m2+w3j"
+    "K8mOwB9O3I5XJXsF7Hien8cxV+C5BMJlUAQRCuYb2N05KMbBsTgFAopKRSKSWfzyvValU173a7Ej"
+    "w7xDawASDGxFQLWZY/JEl6LRaLd9Fo9BT+s4vnhRdPT3otIBmT6Pf7cqlUeoxEImewTz6/AzTeAP"
+    "lByzOfmNoo5jhONc9ms6p5pVJ5CofD57BHPrl97HcQZwAxXsLMZxvNnU7nghiScmslL5fLD/DoBP"
+    "u8ozuaPZixdlmx0ZiGtl6vl4FWvIM+IfMMZryHpfahsUtnSv0e6MCSksESwIz9eDOie/iMqwKW1Y"
+    "3ZenDMuky7FyKEHbN10OyxFcb4AvzesBnJB6WlAAAAAElFTkSuQmCC"
+)
+_EMBEDDED_CURSOR_DATA_URL = f"data:image/png;base64,{_EMBEDDED_CURSOR_PNG_BASE64}"
+_CURSOR_HOT_X = 5
+_CURSOR_HOT_Y = 10
+_CURSOR_WIDTH = 32
+_CURSOR_HEIGHT = 32
+
+
+def _build_cursor_helper_script() -> str:
+    cursor_css = f"""
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: {_CURSOR_WIDTH}px;
+    height: {_CURSOR_HEIGHT}px;
+    pointer-events: none !important;
+    z-index: 2147483647 !important;
+    background-image: url("{_EMBEDDED_CURSOR_DATA_URL}");
+    background-size: {_CURSOR_WIDTH}px {_CURSOR_HEIGHT}px;
+    background-repeat: no-repeat;
+    transform: translate(-100px, -100px);
+    opacity: 0;
+    transition: opacity 0.15s ease-out, transform 0.02s linear;
+    transform-origin: {_CURSOR_HOT_X}px {_CURSOR_HOT_Y}px;
+    filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.4));
+"""
+    inner_content = "''"
+    update_pos = f"""
+    const scale = isMouseDown ? ' scale(0.92)' : ' scale(1)';
+    cursor.style.transform = `translate(${{x - {_CURSOR_HOT_X}}}px, ${{y - {_CURSOR_HOT_Y}}}px)${{scale}}`;
+"""
+    return f"""(() => {{
+  if (document.getElementById('__vtable_win_cursor__')) return 'already-installed';
+
+  const cursor = document.createElement('div');
+  cursor.id = '__vtable_win_cursor__';
+  cursor.innerHTML = {inner_content};
+  cursor.style.cssText = `{cursor_css}`;
+
+  const ripple = document.createElement('div');
+  ripple.id = '__vtable_win_ripple__';
+  ripple.style.cssText = `
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2px solid rgba(0, 120, 215, 0.7);
+    background: rgba(0, 120, 215, 0.2);
+    pointer-events: none !important;
+    z-index: 2147483646 !important;
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0;
+    transition: transform 0.25s cubic-bezier(0.1, 0.8, 0.2, 1), opacity 0.25s ease-out;
+  `;
+
+  document.documentElement.appendChild(cursor);
+  document.documentElement.appendChild(ripple);
+
+  let hideTimer = null;
+  let isMouseDown = false;
+
+  const scheduleHide = () => {{
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {{
+      if (!isMouseDown) {{
+        cursor.style.opacity = '0';
+      }}
+    }}, 150);
+  }};
+
+  const showCursor = () => {{
+    cursor.style.opacity = '1';
+    scheduleHide();
+  }};
+
+  const updatePos = (x, y) => {{
+    {update_pos}
+  }};
+
+  window.__vtable_update_cursor = (x, y, down = false, clickRipple = false) => {{
+    isMouseDown = down;
+    showCursor();
+    updatePos(x, y);
+    if (clickRipple) {{
+      ripple.style.transition = 'none';
+      ripple.style.left = x + 'px';
+      ripple.style.top = y + 'px';
+      ripple.style.transform = 'translate(-50%, -50%) scale(0.3)';
+      ripple.style.opacity = '1';
+      requestAnimationFrame(() => {{
+        ripple.style.transition = 'transform 0.28s cubic-bezier(0.1, 0.8, 0.2, 1), opacity 0.28s ease-out';
+        ripple.style.transform = 'translate(-50%, -50%) scale(1.5)';
+        ripple.style.opacity = '0';
+      }});
+    }}
+  }};
+
+  window.addEventListener('mousemove', e => {{
+    showCursor();
+    updatePos(e.clientX, e.clientY);
+  }}, true);
+
+  window.addEventListener('mousedown', e => {{
+    isMouseDown = true;
+    showCursor();
+    updatePos(e.clientX, e.clientY);
+    ripple.style.transition = 'none';
+    ripple.style.transform = `translate(${{e.clientX}}px, ${{e.clientY}}px) scale(0.4)`;
+    ripple.style.opacity = '1';
+    requestAnimationFrame(() => {{
+      ripple.style.transition = 'transform 0.28s cubic-bezier(0.1, 0.8, 0.2, 1), opacity 0.28s ease-out';
+      ripple.style.transform = `translate(${{e.clientX}}px, ${{e.clientY}}px) scale(1.4)`;
+      ripple.style.opacity = '0';
+    }});
+  }}, true);
+
+  window.addEventListener('mouseup', e => {{
+    isMouseDown = false;
+    showCursor();
+    updatePos(e.clientX, e.clientY);
+  }}, true);
+
+  return 'installed-win-cursor';
+}})()"""
+
+
+_WIN_CURSOR_HELPER_SCRIPT = _build_cursor_helper_script()
+
+
+async def _ensure_cursor_helper(page: Page) -> None:
+    """Ensure the Windows-style virtual mouse cursor helper is installed on the page."""
+    if not VTABLE_SHOW_CURSOR:
+        return
+    try:
+        await page.evaluate(_WIN_CURSOR_HELPER_SCRIPT)
+    except Exception:
+        pass
+
+
+async def _smooth_mouse_move_to(
+    page: Page, target_x: float, target_y: float
+) -> None:
+    """Smoothly glide the mouse from its last known position to (target_x, target_y) at >= 60fps."""
+    global _last_mouse_point
+    target_x, target_y = float(target_x), float(target_y)
+    start_x, start_y = (
+        _last_mouse_point
+        if _last_mouse_point
+        else (max(0.0, target_x - 60), max(0.0, target_y - 40))
+    )
+    dx = target_x - start_x
+    dy = target_y - start_y
+    dist = math.hypot(dx, dy)
+
+    steps = max(10, min(35, int(dist / 22)))
+    for step in range(1, steps + 1):
+        t = step / steps
+        ease_t = 1 - math.pow(1 - t, 3)
+        curr_x = start_x + dx * ease_t
+        curr_y = start_y + dy * ease_t
+        if VTABLE_SHOW_CURSOR:
+            try:
+                await page.evaluate(
+                    f"window.__vtable_update_cursor && window.__vtable_update_cursor({curr_x:.1f}, {curr_y:.1f})"
+                )
+            except Exception:
+                pass
+        await page.mouse.move(curr_x, curr_y)
+        await asyncio.sleep(0.016)
+    _last_mouse_point = (target_x, target_y)
 
 
 # Scan only actionable controls. Canvas cells are intentionally absent: VTable
@@ -560,16 +758,22 @@ _OVERLAY_OBSERVER_TEMPLATE = r"""
       if (value) return `[${attr}="${cssEscape(value)}"]`;
     }
     if (el.id) return `#${cssEscape(el.id)}`;
-    const stateClasses = new Set(["active", "focus", "hover", "checked", "selected", "disabled", "loading", "animating", "hidden"]);
+    const stateClasses = new Set([
+      "active", "focus", "hover", "checked", "selected", "disabled", "loading", "animating", "hidden",
+      "move-up-enter", "move-up-enter-active", "move-up-leave", "move-up-leave-active",
+      "zoom-appear", "zoom-appear-active", "zoom-leave", "zoom-leave-active", "zoom-enter", "zoom-enter-active",
+      "fade-enter", "fade-enter-active", "fade-leave", "fade-leave-active",
+      "ant-zoom-appear", "ant-zoom-appear-active", "ant-zoom-enter", "ant-zoom-leave",
+    ]);
     const classes = classText(el).split(/\s+/).filter(Boolean)
-      .filter(value => !stateClasses.has(value)).slice(0, 4);
+      .filter(value => !stateClasses.has(value) && !/(?:-enter|-leave|-appear|zoom-|move-up|fade-)/.test(value)).slice(0, 4);
     const role = el.getAttribute("role");
     const own = `${el.tagName.toLowerCase()}${classes.map(value => `.${cssEscape(value)}`).join("")}${role ? `[role="${cssEscape(role)}"]` : ""}`;
     if (document.querySelectorAll(own).length === 1) return own;
     let current = el;
     const parts = [];
     for (let depth = 0; current && depth < 3; depth++, current = current.parentElement) {
-      const part = current.id ? `#${cssEscape(current.id)}` : `${current.tagName.toLowerCase()}${classText(current).split(/\s+/).filter(Boolean).filter(value => !stateClasses.has(value)).slice(0, 2).map(value => `.${cssEscape(value)}`).join("")}`;
+      const part = current.id ? `#${cssEscape(current.id)}` : `${current.tagName.toLowerCase()}${classText(current).split(/\s+/).filter(Boolean).filter(value => !stateClasses.has(value) && !/(?:-enter|-leave|-appear|zoom-|move-up|fade-)/.test(value)).slice(0, 2).map(value => `.${cssEscape(value)}`).join("")}`;
       parts.unshift(part || current.tagName.toLowerCase());
       const candidate = parts.join(" > ");
       if (document.querySelectorAll(candidate).length === 1) return candidate;
@@ -580,9 +784,19 @@ _OVERLAY_OBSERVER_TEMPLATE = r"""
   };
   const canonicalOverlay = element => {
     if (!isElement(element)) return null;
-    if (!element.matches(".virtual-option")) return element;
-    const parent = element.parentElement;
-    return parent && parent.querySelectorAll(".virtual-option").length > 1 ? parent : element;
+    if (element.matches(".virtual-option")) {
+      const parent = element.parentElement;
+      return parent && parent.querySelectorAll(".virtual-option").length > 1 ? parent : element;
+    }
+    if (element.matches && element.matches(".ant-modal-root, .ant-modal-wrap, .ant-drawer-root")) {
+      const inner = element.querySelector(".ant-modal, .ant-drawer-content-wrapper, .ant-drawer");
+      if (inner) return inner;
+    }
+    if (element.matches && element.matches(".ant-modal-content")) {
+      const dialog = element.closest(".ant-modal");
+      if (dialog) return dialog;
+    }
+    return element;
   };
   const describe = (el, event) => {
     if (!isElement(el)) return null;
@@ -869,13 +1083,28 @@ def _frame_name_url(frame: Frame) -> tuple[str, str]:
 
 
 def _dedupe_overlays(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the latest signal for each overlay fingerprint across observer drains."""
+    """Keep the latest and most settled signal for each overlay fingerprint."""
     latest: dict[tuple[str, str], dict[str, Any]] = {}
     for item in items:
-        key = (str(item.get("frame_id", "")), str(item.get("fingerprint", "")))
+        text = str(item.get("text", "")).strip()
+        kind = str(item.get("kind", ""))
+        fid = str(item.get("frame_id", ""))
+        # Group by frame, kind, and non-empty text if available, else identity/fingerprint
+        key = (fid, f"{kind}|{text}") if text else (fid, str(item.get("fingerprint", "")))
         previous = latest.get(key)
-        if previous is None or item.get("timestamp", 0) >= previous.get("timestamp", 0):
+        if previous is None:
             latest[key] = item
+            continue
+        # Prefer visible item over hidden transitional item
+        if item.get("visible", False) and not previous.get("visible", False) and item.get("event") != "removed":
+            latest[key] = item
+        elif item.get("event") == "removed":
+            latest[key] = item
+        elif item.get("timestamp", 0) >= previous.get("timestamp", 0):
+            prev_sel = str(previous.get("selector", ""))
+            transitional = any(tok in prev_sel for tok in ("-enter", "-appear", "-leave"))
+            if transitional or (item.get("timestamp", 0) > previous.get("timestamp", 0)):
+                latest[key] = item
     return sorted(latest.values(), key=lambda item: item.get("timestamp", 0))
 
 
@@ -941,7 +1170,8 @@ async def _enrich_overlay_items(
             "iframe"
         )
         if frame_id in frame_elements:
-            record["iframe"] = frame_elements[frame_id]
+            elem = frame_elements[frame_id]
+            record["iframe"] = {"id": elem.get("id", ""), "name": elem.get("name", "")}
         box = record.get("box")
         offset = offsets.get(frame_id)
         if box and offset:
@@ -953,12 +1183,19 @@ async def _enrich_overlay_items(
             }
         else:
             record["page_box"] = None
-        # Internal dedupe fields are useful inside the server but waste AI
-        # context once the result has been classified.
+        # Internal dedupe fields are useful inside the server but waste AI context.
         record.pop("identity", None)
         record.pop("fingerprint", None)
         record.pop("class_name", None)
         record.pop("timestamp", None)
+        if not record.get("label"):
+            record.pop("label", None)
+        if not record.get("role"):
+            record.pop("role", None)
+        if record.get("page_box") is None:
+            record.pop("page_box", None)
+        if record.get("box") is None:
+            record.pop("box", None)
         enriched.append(record)
     return enriched[: max(1, int(max_results))]
 
@@ -1005,11 +1242,15 @@ async def _overlay_context(page: Page, items: list[dict[str, Any]]) -> dict[str,
         ),
         default=None,
     )
+    if focus is not None:
+        compact_focus = dict(focus)
+        compact_focus.pop("iframe", None)
+        compact_focus.pop("box", None)
+        focus = compact_focus
     return {
         "active_iframe": active_info,
         "focus_layer": focus,
     }
-
 
 async def _frame_context_details(page: Page, frame: Frame) -> dict[str, Any]:
     """Add iframe element identity without making detached-frame errors fatal."""
@@ -1169,6 +1410,11 @@ async def _start_browser_impl(headless: bool = True) -> dict:
     _selected_context = _browser.contexts[0] if _browser.contexts else None
     if _selected_context is not None:
         _context_id(_selected_context, name="default")
+        if VTABLE_SHOW_CURSOR:
+            try:
+                await _selected_context.add_init_script(_WIN_CURSOR_HELPER_SCRIPT)
+            except Exception:
+                pass
     return {"status": "opened", "browser": "chromium", "headless": headless}
 
 
@@ -1206,6 +1452,16 @@ async def _connect_browser_impl(cdp_url: str = "http://127.0.0.1:9222") -> dict:
     _selected_context = _browser.contexts[0] if _browser.contexts else None
     if _selected_context is not None:
         _context_id(_selected_context, name="default")
+        if VTABLE_SHOW_CURSOR:
+            try:
+                await _selected_context.add_init_script(_WIN_CURSOR_HELPER_SCRIPT)
+                for p in _selected_context.pages:
+                    try:
+                        await p.evaluate(_WIN_CURSOR_HELPER_SCRIPT)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     tabs = []
     try:
         if _browser.contexts:
@@ -1338,8 +1594,9 @@ async def launch_chrome(
 
 async def _close_browser_impl() -> dict:
     """关闭浏览器并释放驱动资源；外部 CDP 浏览器只断开，受管进程会终止。"""
-    global _browser, _pw, _cdp, _selected_page, _selected_context
+    global _browser, _pw, _cdp, _selected_page, _selected_context, _last_mouse_point
     global _chrome_process, _chrome_port, _chrome_profile, _chrome_profile_owned
+    _last_mouse_point = None
     errors: list[str] = []
     listeners = list(_overlay_frame_listeners.values())
     for listener in listeners:
@@ -1835,6 +2092,7 @@ def _interaction_contract(
     before_state: dict[str, Any] | None = None,
     after_state: dict[str, Any] | None = None,
     evidence: list[dict[str, Any]] | None = None,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Attach one stable evidence model while retaining legacy result fields."""
     items = evidence or []
@@ -1845,10 +2103,12 @@ def _interaction_contract(
     confidence = "none"
     if succeeded:
         confidence = "medium" if raw_coordinate and not strong else "high"
+    clean_target = {k: v for k, v in target.items() if v is not None}
+    clean_locator = {k: v for k, v in (response.get("locator") or {}).items() if v is not None}
     response["interaction"] = {
-        "target": target,
+        "target": clean_target,
         "frame": response.get("frame"),
-        "locator": response.get("locator"),
+        "locator": clean_locator if clean_locator else None,
         "coordinate": coordinate,
         "action": action,
         "before_state": before_state or {},
@@ -1856,6 +2116,37 @@ def _interaction_contract(
         "evidence": items,
         "confidence": confidence,
     }
+    # Attach an ultra-clean semantic delta summary for high-signal test assertions
+    changes = []
+    raw_changes = response.get("overlays") or response.get("ui_events") or []
+    for ch in raw_changes:
+        summary: dict[str, Any] = {
+            "kind": ch.get("kind"),
+            "text": ch.get("text"),
+            "visible": ch.get("visible", True),
+        }
+        if ch.get("event"):
+            summary["event"] = ch.get("event")
+        if ch.get("page_box"):
+            summary["page_box"] = ch.get("page_box")
+        if ch.get("selector") and ch.get("kind") in {"dialog", "drawer", "dropdown"}:
+            summary["selector"] = ch.get("selector")
+        changes.append(summary)
+    if changes:
+        response["changes"] = changes
+    if compact:
+        compact_res: dict[str, Any] = {
+            "status": response.get("status"),
+            "action": action,
+            "target": clean_target,
+            "confidence": confidence,
+        }
+        if changes:
+            compact_res["changes"] = changes
+        focus = (response.get("context") or {}).get("focus_layer")
+        if focus:
+            compact_res["focus_layer"] = focus
+        return compact_res
     return response
 
 
@@ -1976,7 +2267,7 @@ async def _click_cell_impl(
     before_screenshot = None
     if verify:
         before_visual = await _cell_visual_state(frame, col, row)
-        before_screenshot = await _cell_screenshot(page, x, y)
+        before_screenshot = await _cell_screenshot(page, x, y, frame=frame, col=col, row=row)
     # Arm immediately before the trusted input so setup/scroll mutations are
     # not attributed to the user action being measured.
     if observe_after:
@@ -2154,10 +2445,26 @@ async def _trusted_viewport_click(
                 f"point ({x:g}, {y:g}) is outside viewport "
                 f"({viewport['width']:g} x {viewport['height']:g})"
             )
+        await _ensure_cursor_helper(page)
+        await _smooth_mouse_move_to(page, x, y)
+        if VTABLE_SHOW_CURSOR:
+            try:
+                await page.evaluate(
+                    f"window.__vtable_update_cursor && window.__vtable_update_cursor({x:.1f}, {y:.1f}, true, true)"
+                )
+            except Exception:
+                pass
         if double_click:
             await page.mouse.dblclick(x, y, button=button)
         else:
             await page.mouse.click(x, y, button=button)
+        if VTABLE_SHOW_CURSOR:
+            try:
+                await page.evaluate(
+                    f"window.__vtable_update_cursor && window.__vtable_update_cursor({x:.1f}, {y:.1f}, false, false)"
+                )
+            except Exception:
+                pass
         return {
             "status": "ok",
             "point": {"x": x, "y": y},
@@ -2192,11 +2499,62 @@ async def _cell_visual_state(frame: Frame, col: int, row: int) -> dict[str, Any]
         return None
 
 
-async def _cell_screenshot(page: Page, x: float, y: float) -> dict[str, Any] | None:
-    """Hash a small screenshot around a VTable point as the final visual fallback."""
+_CELL_CANVAS_SLICE_JS = r"""([col, row, size]) => {
+  const el = document.querySelector('.vtable');
+  const canvas = el ? el.querySelector('canvas') : document.querySelector('canvas');
+  if (!canvas) return null;
+  const vt = window._vtable;
+  let localX = 0, localY = 0;
+  if (vt && vt.getCellRelativeRect) {
+    const r = vt.getCellRelativeRect(col, row);
+    if (r) {
+      localX = r.left !== undefined ? r.left : (r.bounds ? r.bounds.x1 : 0);
+      localY = r.top !== undefined ? r.top : (r.bounds ? r.bounds.y1 : 0);
+    }
+  }
+  try {
+    const s = Math.max(20, Math.min(100, Number(size) || 40));
+    const smallCanvas = document.createElement('canvas');
+    smallCanvas.width = s;
+    smallCanvas.height = s;
+    const sctx = smallCanvas.getContext('2d');
+    if (!sctx) return null;
+    sctx.drawImage(canvas, Math.max(0, localX), Math.max(0, localY), s, s, 0, 0, s, s);
+    return smallCanvas.toDataURL('image/png');
+  } catch (_) {
+    return null;
+  }
+}"""
+
+
+async def _cell_screenshot(
+    page: Page,
+    x: float,
+    y: float,
+    *,
+    frame: Frame | None = None,
+    col: int | None = None,
+    row: int | None = None,
+) -> dict[str, Any] | None:
+    """Hash a visual snapshot of the cell region.
+
+    Prefers in-memory canvas slice (0ms GPU flush, 0 flicker) when frame and col/row
+    are provided; gracefully falls back to page.screenshot only if canvas is unavailable.
+    """
+    size = float(VTABLE_VERIFICATION_STRATEGY.screenshot_size)
+    if frame is not None and col is not None and row is not None:
+        try:
+            slice_data = await frame.evaluate(_CELL_CANVAS_SLICE_JS, [col, row, size])
+            if slice_data and isinstance(slice_data, str):
+                digest = hashlib.sha256(slice_data.encode("utf-8")).hexdigest()[:16]
+                return {
+                    "digest": digest,
+                    "clip": {"x": round(x, 2), "y": round(y, 2), "width": size, "height": size},
+                }
+        except Exception:
+            pass
     try:
         viewport = await _page_viewport_size(page)
-        size = float(VTABLE_VERIFICATION_STRATEGY.screenshot_size)
         left = max(0.0, min(float(x) - size / 2, viewport["width"] - size))
         top = max(0.0, min(float(y) - size / 2, viewport["height"] - size))
         image = await page.screenshot(clip={"x": left, "y": top, "width": size, "height": size})
@@ -2247,7 +2605,7 @@ async def _verify_landed(
         after_center = await cell_center(page, frame, col, row)
         if after_center:
             after_screenshot = await _cell_screenshot(
-                page, after_center["x"], after_center["y"]
+                page, after_center["x"], after_center["y"], frame=frame, col=col, row=row
             )
         screenshot_changed = bool(
             before_screenshot
@@ -2538,6 +2896,25 @@ async def _perform_dom_action(
 ) -> dict[str, Any] | None:
     action = action.lower().strip()
     kwargs = {"timeout": timeout_ms}
+    if action in {"click", "dblclick", "rightclick", "hover"}:
+        try:
+            target = locator.first
+            box = await target.bounding_box()
+            if box and box["width"] > 0 and box["height"] > 0:
+                offset = await _frame_page_offset(page, target_frame)
+                center_x = offset["x"] + box["x"] + box["width"] / 2
+                center_y = offset["y"] + box["y"] + box["height"] / 2
+                await _ensure_cursor_helper(page)
+                await _smooth_mouse_move_to(page, center_x, center_y)
+                if VTABLE_SHOW_CURSOR and action in {"click", "dblclick", "rightclick"}:
+                    try:
+                        await page.evaluate(
+                            f"window.__vtable_update_cursor && window.__vtable_update_cursor({center_x:.1f}, {center_y:.1f}, true, true)"
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     if action == "click":
         await locator.click(**kwargs)
     elif action == "dblclick":
@@ -2546,6 +2923,13 @@ async def _perform_dom_action(
         await locator.click(button="right", **kwargs)
     elif action == "hover":
         await locator.hover(**kwargs)
+    if VTABLE_SHOW_CURSOR and action in {"click", "dblclick", "rightclick"}:
+        try:
+            await page.evaluate(
+                "window.__vtable_update_cursor && window.__vtable_update_cursor(window.__vtable_last_x || 0, window.__vtable_last_y || 0, false, false)"
+            )
+        except Exception:
+            pass
     elif action == "fill":
         if value is None:
             raise ValueError("fill requires value")
@@ -2677,6 +3061,7 @@ async def _dom_interact_impl(
     max_results: int = OVERLAY_RESULT_LIMIT,
     analysis_id: str | None = None,
     expect_input: bool = False,
+    compact: bool = False,
 ) -> dict:
     if not 0 <= settle_ms <= OVERLAY_SETTLE_LIMIT_MS:
         raise ValueError(f"settle_ms must be between 0 and {OVERLAY_SETTLE_LIMIT_MS}")
@@ -2853,13 +3238,14 @@ async def _dom_interact_impl(
         },
         before_state={
             "focused_editable": focused_before,
-            "visible_overlay_count": len(response.get("baseline") or []),
+            "visible_overlay_count": len(installed.get("baseline") or []) if installed else len(response.get("baseline") or []),
         },
         after_state={
             "focused_editable": focused_after,
             "visible_overlay_count": len(response.get("visible_overlays") or []),
         },
         evidence=proof,
+        compact=compact,
     )
 
 
@@ -2885,6 +3271,7 @@ async def dom_interact(
     max_results: int = OVERLAY_RESULT_LIMIT,
     analysis_id: str | None = None,
     expect_input: bool = False,
+    compact: bool = False,
 ) -> dict:
     """Perform one semantic DOM action in the active application scope."""
     async with _action_lock:
@@ -2909,6 +3296,7 @@ async def dom_interact(
             max_results=max_results,
             analysis_id=analysis_id,
             expect_input=expect_input,
+            compact=compact,
         )
 
 
@@ -3135,7 +3523,10 @@ async def _finalize_overlay_observation(
     response.update(
         {
             "settle_ms": settle_ms,
-            "baseline": await _enrich_overlay_items(page, baseline, max_results=max_results),
+            "baseline": (
+                await _enrich_overlay_items(page, baseline, max_results=min(2, max_results))
+                if max_results > 20 else []
+            ),
             "ui_events": ui_events,
             "overlays": overlays,
             "visible_overlays": visible_overlays,
