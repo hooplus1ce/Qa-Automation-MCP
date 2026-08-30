@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: "Run real APS e2e contracts"
+        type: boolean
+        default: true
+      run_detail:
+        description: "Also run material detail page contracts (APS_E2E_DETAIL)"
+        type: boolean
+        default: false
+      aps_cdp_url:
+        description: "CDP URL of the Chrome that already opened the APS page"
+        default: "http://127.0.0.1:9222"
+      e2e_runner:
+        description: "Runner label that can reach the APS system"
+        default: "self-hosted"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra browser
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install chromium --with-deps
+
+      - name: Lint (ruff)
+        run: uv run ruff check qa_automation tests
+
+      - name: Unit tests
+        run: uv run python -m unittest discover -s tests -v
+        env:
+          QA_AUTOMATION_WORKSPACE_ROOT: .
+
+  e2e:
+    # 真实 APS 页面契约测试:不随 push/pr 运行,仅手动触发,
+    # 且必须落在能访问 APS 系统的自托管 runner 上。
+    # 前置条件(人工保证):runner 本机 Chrome 已用 --remote-debugging-port=9222
+    # 启动并停留在 "产品工艺 > 清洗改机设置" 模块页面;
+    # 未停留在目标模块时测试会自动 skip 而不是失败。
+    # 注意:APS_E2E_VALIDATE_SAVE(空白保存校验)会提交业务数据,
+    # 永远不接入 CI,仅限本机手动执行。
+    if: github.event_name == 'workflow_dispatch' && inputs.run_e2e
+    runs-on: ${{ inputs.e2e_runner || 'self-hosted' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra browser
+
+      - name: Pre-flight CDP connectivity check
+        run: |
+          python - <<'PY'
+          import json, sys, urllib.request
+          url = "${{ inputs.aps_cdp_url || 'http://127.0.0.1:9222' }}/json/version"
+          try:
+              with urllib.request.urlopen(url, timeout=3) as resp:
+                  payload = json.loads(resp.read().decode("utf-8", "replace"))
+              assert isinstance(payload, dict) and "Browser" in payload, "not a CDP endpoint"
+              print(f"CDP endpoint ready: {payload.get('Browser')}")
+          except Exception as exc:
+              print(f"::error::CDP 端点不可用({url}): {exc}。"
+                    "请先在 runner 本机用 --remote-debugging-port 启动 Chrome "
+                    "并打开 APS 目标模块页面。")
+              sys.exit(1)
+          PY
+
+      - name: Run APS e2e contracts
+        env:
+          APS_E2E: "1"
+          APS_E2E_DETAIL: ${{ inputs.run_detail && '1' || '0' }}
+          APS_DETAIL_RUN: ${{ inputs.run_detail && '1' || '0' }}
+          APS_CDP_URL: ${{ inputs.aps_cdp_url || 'http://127.0.0.1:9222' }}
+          QA_AUTOMATION_WORKSPACE_ROOT: .
+        run: uv run python -m unittest -v tests.e2e.aps_clean_changeover_spec

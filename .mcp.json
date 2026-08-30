@@ -1,22 +1,21 @@
 {
   "mcpServers": {
-    "vtable-ui-automation": {
+    "qa-automation": {
       "type": "stdio",
       "command": "uv",
       "args": [
         "run",
         "--project",
-        ".",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP",
         "--extra",
         "browser",
+        "--env-file",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation",
         "fastmcp",
         "run",
-        "fastmcp.json",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
         "--no-banner"
-      ],
-      "env": {
-        "PYTHONUNBUFFERED": "1"
-      }
+      ]
     }
   }
 }

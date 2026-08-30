@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from automation_profiles import profile_contract
-from tool_metrics import instrument_tool, metrics_snapshot
+from qa_automation.mcp.metrics import instrument_tool, metrics_snapshot
+from qa_automation.profiles import profile_contract
 
 
 class ProfileTests(unittest.TestCase):

@@ -1,11 +1,11 @@
-# vtable-mcp
+# Qa-Automation-MCP
 
-VTable 虚拟表格 MCP 服务器(独立分发版)
+面向 AI 与测试工程的通用 UI 自动化 MCP 服务。框架能力不绑定具体组件库：
 
-- **交互式 UI 工具**(FastMCP Apps):测试用例表 / 引擎仪表盘 / 动态表单 / 用例执行台,工具返回的不是文本而是渲染在对话中的可交互界面
-- **VTable JS 脚本资源**:19 个逆向脚本(React Fiber 绑定、单元格判定、坐标定位、scenegraph 表头图标、字段/记录地址解析、紧凑语义分析、编辑落值、批量读值、拖放落点等)**内化于本项目**,通过 MCP 资源 `vtable://js/{name}` 暴露,客户端按协议读取
-- **内置 providers**:Approval(审批门控)/ Choice / FileUpload / GenerativeUI,一行注册即用
-- **零外部依赖**:数据全部内建于 `sample_data.py`(11 条调拨订单测试用例 + 模具主数据表单),解压即可运行
+- **通用浏览器自动化**：Chrome/CDP、BrowserContext、页面与 iframe、语义 DOM 交互、截图和浮层观测。
+- **可选组件适配器**：VTable 位于 `qa_automation/components/vtable/`，只负责页面中 VTable 组件的确定性分析与交互。
+- **FastMCP 组合服务**：浏览器、通用 UI、诊断、演示和 VTable 资源分别实现为聚焦子服务器，由统一入口组合。
+- **内置演示数据**：位于 `qa_automation/mcp/apps/sample_data.py`，不在项目根目录散落运行时 Python 模块。
 
 ## VTable 实例 API 文档
 
@@ -27,16 +27,15 @@ uv sync
 uv run fastmcp run fastmcp.json
 
 # 等价的直接入口
-uv run python server.py
+uv run qa-automation-mcp
 
 # 3. (可选)启动 FastMCP Apps 开发预览:浏览器打开 http://127.0.0.1:9090
 #    该命令仅用于 UI 预览,会为预览临时启动一个 HTTP MCP 端点
 #    选择工具 -> Launch 即可看到渲染的 UI
-uv run fastmcp dev apps server.py --dev-port 9090 --mcp-port 9000
+uv run fastmcp dev apps qa_automation/mcp/server.py --dev-port 9090 --mcp-port 9000
 
-# 4. (可选)使用最新 MCP Inspector v2 检查 stdio 服务
-#    Inspector 绑定 Ubuntu 回环地址;远程 iPhone 请通过 SSH 转发 6274 和 6275
-bash scripts/run_inspector_v2.sh
+# 4. (可选)使用 MCP Inspector 检查 stdio 服务
+npx @modelcontextprotocol/inspector uv run fastmcp run fastmcp.json
 
 # (可选)启用 Playwright 浏览器交互工具
 uv sync --extra browser
@@ -62,7 +61,7 @@ SSH 端口转发本身不执行 TLS;这里使用 loopback 地址访问,浏览器
 
 ### Windows 局域网客户端
 
-Windows 10/11 通常自带 OpenSSH Client。在 Ubuntu 上启动 `bash scripts/run_inspector_v2.sh` 后,在 Windows PowerShell 中执行:
+Windows 10/11 通常自带 OpenSSH Client。在远端启动 MCP Inspector 后,可在 Windows PowerShell 中执行:
 
 ```powershell
 ssh.exe -N `
@@ -112,7 +111,7 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `vtable://js/{name}` | 资源 | 19 个 VTable JS 脚本(fast_bind、vtable_analysis、resolve_cell、read_cells …) |
 
 FastMCPApp 后端工具(`execute_test_case` / `save_mold_master`)不暴露给客户端,
-仅由 UI 表单经 `CallTool` 触发(职责分离),提交结果落盘到 `data/` 目录。
+仅由 UI 表单经 `CallTool` 触发(职责分离),默认提交结果落盘到使用方项目的 `.qa-automation/data/`；可用 `QA_AUTOMATION_DATA_DIR` 覆盖。
 
 客户端读取 vtable JS 脚本:
 
@@ -123,7 +122,7 @@ from fastmcp.client.transports import StdioTransport
 transport = StdioTransport(
     command="uv",
     args=["run", "fastmcp", "run", "fastmcp.json", "--no-banner"],
-    cwd="/path/to/vtable_mcp",
+    cwd="/path/to/Qa-Automation-MCP",
 )
 
 async with Client(transport) as client:
@@ -137,7 +136,7 @@ async with Client(transport) as client:
 {
   "command": "uv",
   "args": ["run", "fastmcp", "run", "fastmcp.json", "--no-banner"],
-  "cwd": "/path/to/vtable_mcp"
+  "cwd": "/path/to/Qa-Automation-MCP"
 }
 ```
 
@@ -193,8 +192,9 @@ async with Client(transport) as client:
   紧凑证据而非完整场景图或截图。
 - **统一定位器**:页面控件优先使用 `ui_analyze_scope` 返回的 CSS；CSS 当前不可用时
   回退 AX `role/name/description`，再回退 XPath，最后才使用经 `analysis_id` 校验的
-  顶层 viewport 绝对坐标。`ui_click` 是常用点击入口，`ui_interact` 覆盖 fill、press、
-  select 等其他动作。
+  顶层 viewport 绝对坐标。坐标回退仅对 click/dblclick/rightclick 生效,fill/press 等
+  动作必须提供定位器,不会被静默降级成点击。`ui_click` 是常用点击入口,`ui_interact`
+  覆盖 fill、press、select 等其他动作。
 
 配合 **Playwright 1.60/1.62 新特性**形成完整的 AI 测试闭环:
 
@@ -208,19 +208,27 @@ async with Client(transport) as client:
 
 - `ui_profile` 暴露 `aps-antd` 当前配置：活动 Tab iframe 选择器、Portal/下拉选择器、定位顺序
   (CSS → AX → XPath → text/placeholder → coordinate) 以及 VTable 视觉验证顺序。可用
-  `UI_AUTOMATION_PROFILE` 和 `UI_ACTIVE_IFRAME_SELECTOR` 配置；当前 profile 只在服务进程内解析一次。
+  `QA_AUTOMATION_PROFILE` 和 `QA_AUTOMATION_ACTIVE_IFRAME_SELECTOR` 配置；当前 profile 只在服务进程内解析一次。
 - 所有浏览器/UI/VTable 工具的响应附带 `metrics`，`automation_metrics` 提供进程内最近调用和聚合统计，
   用于发现响应过大、跨 iframe 扫描过慢或工具重试异常。指标不落盘，服务重启后清空。
 - APS 真实页面回归位于 `tests/e2e/aps_clean_changeover_spec.py`，默认不触碰浏览器；确认已在
   9222 端口打开“产品工艺 > 清洗改机设置”后执行：
 
   ```bash
-  bash scripts/run_aps_e2e.sh
+  APS_E2E=1 uv run python -m unittest -v tests.e2e.aps_clean_changeover_spec
   ```
 
-  脚本默认只运行已确认的清洗改机设置场景；物料替代明细页的双 VTable、编辑器和空白保存提示
-  场景需要先切换到该模块，再显式执行 `APS_E2E_DETAIL=1 APS_DETAIL_RUN=1 bash scripts/run_aps_e2e.sh`，
-  其中空白保存仍由页面状态和 `APS_E2E_VALIDATE_SAVE=1` 控制，避免误提交业务数据。
+  物料替代明细页的双 VTable、编辑器和空白保存提示场景，需要先切换到对应模块，再增加
+  `APS_E2E_DETAIL=1 APS_DETAIL_RUN=1`。空白保存仍由页面状态和
+  `APS_E2E_VALIDATE_SAVE=1` 控制，避免误提交业务数据。
+
+  CI 中该回归不随 push/pull request 运行：`.github/workflows/ci.yml` 提供
+  `e2e` 作业，仅在 **手动触发(workflow_dispatch)** 时于能访问 APS 系统的自托管
+  runner 上执行，运行前会先做 CDP 连通性预检。触发时可配置 `aps_cdp_url` 与
+  `e2e_runner`，勾选 `run_detail` 一并跑物料明细页场景。前置条件由人工保证：
+  runner 本机 Chrome 已用 `--remote-debugging-port=9222` 启动并停留在目标模块
+  页面；未停留在目标模块时测试自动 skip 而非失败。`APS_E2E_VALIDATE_SAVE`
+  会提交业务数据，保持仅限本机手动执行，永不进入 CI。
 
 - `ui_snapshot`:`page.aria_snapshot(mode='ai', boxes=True)` 把 accessibility
   树(含 `[ref=xx]` 元素引用与 `[box=x,y,w,h]` 视口坐标)喂给 AI —— 官方 Playwright
@@ -251,7 +259,7 @@ async with Client(transport) as client:
   会优先解析这个 iframe;`vtable_frame` 也会优先从活动模块查找 VTable,再回退到
   所有 frame。没有该 Tab 结构的页面仍可使用 `frame="vtable"` 或 name/URL 子串。
   这是业务页面 profile,不是通用 iframe 规则,可通过环境变量
-  `VTABLE_ACTIVE_IFRAME_SELECTOR` 覆盖。
+  `QA_AUTOMATION_ACTIVE_IFRAME_SELECTOR` 覆盖。
 - **Portal / 消息即时观测**:React Ant Design 的 Modal、Drawer、Dropdown、Select、
   Picker、Popover、Tooltip、Message、Notification 等通常追加到所属 iframe 的
   `document.body`,也可能由 `getPopupContainer` 追加到顶层文档。`ui_click`
@@ -285,9 +293,12 @@ async with Client(transport) as client:
   `overlay_observe(stop=False)` 会在下一次 observe 调用时推进 baseline 并清空已读事件;
   它适合连续诊断,而需要严格绑定“点击前/点击后”的场景应使用组合点击工具。
 - **浏览器生命周期**:优先调用 `browser_start(port=9222, headless=false)` 启动受管
-  Chrome;它会创建隔离的临时 profile、等待 `/json/version` 就绪并自动接管。已有
-  Chrome 则调用 `browser_connect(port=9222)` 或传完整 `cdp_url`;`browser_close`
-  会终止本服务启动的受管进程，但对外部 CDP 浏览器只断开连接。
+  Chrome;它会创建隔离的临时 profile、等待 `/json/version` 就绪并自动接管。启动前会
+  预检端口:端口已有可用 CDP 端点(提示改用 `browser_connect` 复用)、被非 Chrome
+  服务占用、或 Chrome 启动即退出(profile 被其他实例锁定)时,都会立刻返回明确原因
+  与建议,不再空等超时。已有 Chrome 则调用 `browser_connect(port=9222)` 或传完整
+  `cdp_url`;`browser_close` 会终止本服务启动的受管进程，但对外部 CDP 浏览器只断开
+  连接。
 - **多账号会话**:`browser_session(action="list")` 查看会话；`create` 创建新的
   BrowserContext(可传 `name` 和已有 `storage_state_path`)，`select` 切换当前
   Cookie 环境，`save` 将登录态保存为 Playwright storage state，`close` 关闭非默认
@@ -300,57 +311,184 @@ async with Client(transport) as client:
 依赖 `playwright>=1.62`(可选,`uv sync --extra browser`);未安装时工具返回
 可操作报错,不影响服务器其余功能。
 
-## 打包分发
+## 部署与分发
 
-```bash
-bash scripts/package.sh          # 生成 dist/vtable-mcp-0.1.0.zip
+`fastmcp.json` 是运行配置的单一来源。依赖环境只由外层 `uv run` 创建；
+`fastmcp.json` 不声明第二个 UVEnvironment，避免重复派生 `uv run --skip-env`。
+
+仓库根目录的 `.env.qa-automation.example` 是共享运行变量模板；本机复制为
+`.env.qa-automation` 后由 `uv run --env-file` 显式加载。该文件属于 MCP 服务项目，
+其中的产物路径保持相对；最终解析基准由 Agent 传入的使用方项目 `cwd` 决定。
+
+```dotenv
+# 禁用 Python 标准输出缓冲，保证 stdio MCP 消息立即发送给 Agent。
+PYTHONUNBUFFERED=1
+
+# 选择页面适配 Profile；aps-antd 是内置页面策略，不限制使用方项目类型。
+QA_AUTOMATION_PROFILE=aps-antd
+
+# 是否在浏览器页面中显示 MCP 模拟鼠标指针，支持 true/false。
+QA_AUTOMATION_SHOW_CURSOR=true
+
+# 单次浮层扫描最多返回的结果数量，至少为 1。
+QA_AUTOMATION_OVERLAY_RESULT_LIMIT=20
+
+# 使用该 MCP 服务的项目根目录；点号表示 Agent 传入的当前 cwd。
+QA_AUTOMATION_WORKSPACE_ROOT=.
+
+# 下载、截图、会话等产物根目录；相对路径基于使用方项目根目录。
+QA_AUTOMATION_ARTIFACT_ROOT=.qa-automation
+
+# FastMCPApp 执行记录目录；相对路径同样基于使用方项目根目录。
+QA_AUTOMATION_DATA_DIR=.qa-automation/data
 ```
 
-接收方解压后:
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `PYTHONUNBUFFERED` | `1` | 禁用 stdout 缓冲，避免 stdio MCP 消息延迟。 |
+| `QA_AUTOMATION_PROFILE` | `aps-antd` | 选择浏览器页面定位与浮层适配策略；名称不限定使用方项目类型。配置了未知名称时会告警并回退到默认 `aps-antd`,不会导致服务启动失败。 |
+| `QA_AUTOMATION_SHOW_CURSOR` | `true` | 控制浏览器页面中的模拟鼠标指针。 |
+| `QA_AUTOMATION_OVERLAY_RESULT_LIMIT` | `20` | 限制单次浮层扫描返回数量。 |
+| `QA_AUTOMATION_WORKSPACE_ROOT` | `.` | 指向使用该 MCP 服务的项目根目录；相对 Agent `cwd` 解析。 |
+| `QA_AUTOMATION_ARTIFACT_ROOT` | `.qa-automation` | 下载、截图、会话和浏览器 Profile 的统一产物根目录。 |
+| `QA_AUTOMATION_DATA_DIR` | `.qa-automation/data` | FastMCPApp 执行记录和表单提交记录目录。 |
 
-```bash
-uv sync                          # 安装依赖(需要网络)
-uv run fastmcp run fastmcp.json  # MCP 客户端使用 stdio 连接
+下文将 Agent 当前打开并使用该 MCP 服务的任意项目统一称为“使用方项目”；它不要求
+特定业务类型，也不要求包含本 MCP 的源码或配置文件。
 
-# (可选)仅用于浏览器预览 FastMCPApp UI
-uv run fastmcp dev apps server.py
+### 场景 A：直接打开并开发/测试本 MCP 项目自身 (OMP / VS Code / Trae)
+
+在当前项目根目录下运行时，客户端默认就会以当前目录作为工作目录。此时仓库根目录
+自带的 `.mcp.json` **不需要且严禁配置 `"cwd": "${workspaceFolder}"`**：
+- OMP 的变量展开规则仅支持系统环境变量（`${VAR}` / `${VAR:-default}`），不支持
+  IDE 专有的宏 `${workspaceFolder}`；若配置了未解析的 `${workspaceFolder}`，OMP
+  会将其作为字面量传递给 Windows 底层 `CreateProcess`，导致报 `[WinError 123] 文件名、目录名或卷标语法不正确` 并连接失败；
+- 省略 `cwd` 时，OMP、VS Code、Trae 均会天然使用当前项目根目录启动服务。
+
+```json
+{
+  "mcpServers": {
+    "qa-automation": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP",
+        "--extra",
+        "browser",
+        "--env-file",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation",
+        "fastmcp",
+        "run",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
+        "--no-banner"
+      ]
+    }
+  }
+}
 ```
 
-支持项目级 MCP 自动发现的 Agent 客户端可直接读取仓库根目录的 `.mcp.json`，并以
-`vtable-ui-automation` 名称启动本服务。配置使用 stdio，启动时自动启用 `browser`
-可选依赖；客户端进程的工作目录必须是本仓库根目录。若平台不会自动读取
-`.mcp.json`，可将其中 `mcpServers.vtable-ui-automation` 原样导入其 MCP 设置。
+### 场景 B：在其他外部项目（如 APS 项目）中使用本 MCP 服务
+
+当 Agent 打开外部项目时，可通过 Agent 平台的**全局用户配置**（例如 Trae 的
+`AppData/Roaming/TRAE SOLO CN/User/mcp.json`）加载本服务。此时由 IDE 全局管理器
+负责将 `${workspaceFolder}` 展开为用户当前正在使用的外部项目目录：
+
+```json
+{
+  "mcpServers": {
+    "qa-automation": {
+      "command": "uv",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "run",
+        "--project",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP",
+        "--extra",
+        "browser",
+        "--env-file",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation",
+        "fastmcp",
+        "run",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
+        "--no-banner"
+      ]
+    }
+  }
+}
+```
+
+配置核心关注点：
+- `cwd: "${workspaceFolder}"`：仅在跨项目全局配置中生效，指向 Agent 当前打开的使用方项目；
+- `uv run --project D:/Developer/Hoolinks/Qa-Automation-MCP`：指定 MCP 依赖和源码；
+- `fastmcp run D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json`：官方声明式入口。
+当前 FastMCP 3.4.6 的 filesystem source 实际相对进程 `cwd` 解析，而不是按配置
+文件目录解析；因此本机 `fastmcp.json` 使用 MCP 服务文件的绝对路径，确保使用方
+项目工作区作为 `cwd` 时仍可加载服务。启动命令为：
+
+```bash
+uv run \
+  --project D:/Developer/Hoolinks/Qa-Automation-MCP \
+  --extra browser \
+  --env-file D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation \
+  fastmcp run D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json \
+  --no-banner
+```
+
+所有持久化业务产物限制在使用方项目的 `${workspaceFolder}/.qa-automation/`：
+
+```text
+.qa-automation/
+├── data/             # FastMCPApp 执行与提交记录
+├── downloads/        # Playwright/CDP 浏览器下载
+├── screenshots/      # ui_screenshot 显式截图
+├── sessions/         # browser_session storage state
+└── browser-profile/  # browser_start 受管 Chrome Profile
+```
+
+截图结果同时返回 `path` 和受大小限制的 `image_base64`；下载目录优先通过 Chromium
+CDP 配置，并保留 Playwright download 事件持久化作为退路。`browser_session`、
+`vtable_drop_files` 接受工作区内相对或绝对路径，越出使用方项目工作区的路径会被拒绝。
 
 ## 项目结构
 
-项目按 FastMCP 的组合服务器模式组织。根 `server.py` 只负责创建服务器和启动
-stdio；`fastmcp.json` 是运行配置的单一来源。各领域模块创建独立的本地 FastMCP
-子服务器，由 `mcp_server.factory.create_server()` 无 namespace 挂载，因此已有工具名
-和资源 URI 保持兼容。
+FastMCP 官方不强制唯一目录结构；官方文档推荐用 `fastmcp.json` 作为配置真源，并通过
+聚焦服务器组合或按功能组织组件。本项目采用组合服务器模式，保留现有公共工具名，避免
+namespace 造成破坏性重命名：
+
+- [Project Configuration](https://gofastmcp.com/deployment/server-configuration)
+- [Composing Servers](https://gofastmcp.com/servers/composition)
+- [Filesystem Provider directory conventions](https://gofastmcp.com/servers/providers/filesystem)
 
 ```text
-vtable_mcp/
-├── server.py                    # 稳定入口:server:mcp
-├── fastmcp.json                 # FastMCP 声明式运行配置
-├── .mcp.json                    # Agent Host 项目级自动发现
-├── mcp_server/
-│   ├── factory.py               # 组合根与官方 Providers
-│   ├── app_ui.py                # FastMCPApp UI 与 app-only 后端工具
-│   ├── demo_tools.py            # Prefab UI 演示工具
-│   ├── browser_tools.py         # Chrome/CDP/Context 生命周期
-│   ├── ui_tools.py              # DOM、iframe、Portal、截图工具
-│   ├── vtable_tools.py          # VTable API 分析与交互工具
-│   ├── system_tools.py          # Profile 与指标
-│   └── resources.py             # vtable:// JS 资源
-├── vtable_playwright.py         # Playwright/VTable 驱动实现
-├── vtable_js.py                 # 浏览器侧 VTable 脚本
-├── automation_profiles.py       # 应用定位策略
-└── tool_metrics.py              # 工具可观测性
+Qa-Automation-MCP/
+├── fastmcp.json                     # FastMCP 声明式运行配置
+├── .mcp.json                        # Agent Host 项目级自动发现
+├── .env.qa-automation.example       # MCP 共享运行变量模板
+├── pyproject.toml                   # Python/uv 项目元数据
+├── qa_automation/                   # 通用 UI 自动化测试框架
+│   ├── workspace.py                 # 使用方项目工作区与产物路径边界
+│   ├── browser.py                   # Chrome/CDP/Context/Page 生命周期
+│   ├── interaction/                 # DOM 定位、交互、快照与证据契约
+│   ├── overlay/                     # Portal/ARIA 浮层观测
+│   ├── profiles.py                  # 页面 Profile 与定位策略
+│   ├── components/
+│   │   └── vtable/                  # 可选 VTable 组件适配器及 JS 资源
+│   ├── mcp/
+│   │   ├── server.py                # FastMCP 组合根和 stdio 入口
+│   │   ├── servers/                 # 浏览器/UI/VTable/诊断/演示子服务器
+│   │   ├── resources/               # MCP 资源
+│   │   ├── apps/                    # FastMCP Apps 与演示数据
+│   │   └── metrics.py               # 工具可观测性
+│   └── assets/                      # 框架运行资产
+├── tests/
+└── docs/
 ```
 
 ## 替换为真实数据 / 真实执行
 
-- **数据**:编辑 `sample_data.py` 的 `TEST_CASES` / `MOLD_MASTER_FIELDS`,保持同构即可。
+- **数据**:编辑 `qa_automation/mcp/apps/sample_data.py` 的 `TEST_CASES` / `MOLD_MASTER_FIELDS`,保持同构即可。
 - **真实执行**:`execute_test_case` 目前是模拟执行。接入真实浏览器时,可先调
   `browser_open(url)` 打开页面,再按"AI 闭环"驱动:
   1. CDP 多页签先 `browser_pages` → `browser_select_page`;随后调用
@@ -364,8 +502,16 @@ vtable_mcp/
      `ui_snapshot` 的完整 ARIA 子树;
   页面内的 VTable 脚本仍可通过 `client.read_resource("vtable://js/...")` 读取。
   整个流程由 AI 按 "语义目标 → 确定性解析 → trusted 操作 → 回读验证" 闭环完成。
+  5. 真实物理拖拽使用 `ui_mouse_drag(start_x, start_y, end_x, end_y)`，使用底层事件流
+     （起点按下 mousePressed → 24+ 步连续细密轨迹移动 mouseMoved → 终点释放 mouseReleased）
+     驱动，并带全流程虚拟光标反馈。调用前必须先获取待拖拽对象的起始坐标与目标位置的结束坐标：
+     - Canvas 列表/表格（如 VTable 列重排、列宽调整）：先通过 `vtable_analysis` 获取
+       待移动列头与目标列头的 `point` 视口坐标；
+     - 常规 DOM 元素或滑块：先通过 `ui_analyze_scope` 或 `ui_snapshot` 获取目标元素的
+       `page_box` 视口中心坐标。
 
-截图边界：`ui_screenshot` 只有在客户端明确调用时才执行页面截图，不会被普通点击隐式
-触发。Playwright 的页面截图通常不会修改 DOM 或滚动页面，但浏览器在有硬件加速的有头
-模式下仍可能发生短暂合成器同步，不能承诺所有环境绝对零闪烁；对 VTable 点击请使用
-`verify=False`，对视觉诊断再显式调用 `ui_screenshot`。
+截图边界：`ui_screenshot` 只有在客户端明确调用时才执行页面截图，并保存到使用方项目
+工作区的 `.qa-automation/screenshots/`，同时返回文件路径和 base64 图像。普通点击
+不会隐式落盘；VTable 点击校验使用的微型图像只保留在内存。Playwright 页面截图通常
+不会修改 DOM 或滚动页面，但有头硬件加速模式仍可能发生短暂合成器同步；对 VTable
+点击请使用 `verify=False`，需要视觉诊断时再显式调用 `ui_screenshot`。

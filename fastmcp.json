@@ -2,12 +2,8 @@
   "$schema": "https://gofastmcp.com/public/schemas/fastmcp.json/v1.json",
   "source": {
     "type": "filesystem",
-    "path": "server.py",
+    "path": "D:/Developer/Hoolinks/Qa-Automation-MCP/qa_automation/mcp/server.py",
     "entrypoint": "mcp"
-  },
-  "environment": {
-    "type": "uv",
-    "project": "."
   },
   "deployment": {
     "transport": "stdio",

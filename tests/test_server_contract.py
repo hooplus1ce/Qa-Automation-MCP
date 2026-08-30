@@ -6,8 +6,8 @@ import unittest
 
 from fastmcp import Client
 
-import server
-from mcp_server import browser_tools, ui_tools, vtable_tools
+from qa_automation.mcp import server
+from qa_automation.mcp.servers import browser, ui, vtable
 
 
 class ServerContractTests(unittest.IsolatedAsyncioTestCase):
@@ -16,9 +16,9 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
             async with Client(mcp) as client:
                 return {tool.name for tool in await client.list_tools()}
 
-        browser_names = await tool_names(browser_tools.create_server())
-        ui_names = await tool_names(ui_tools.create_server())
-        vtable_names = await tool_names(vtable_tools.create_server())
+        browser_names = await tool_names(browser.create_server())
+        ui_names = await tool_names(ui.create_server())
+        vtable_names = await tool_names(vtable.create_server())
         root_names = await tool_names(server.mcp)
 
         self.assertIn("browser_start", browser_names)
@@ -56,6 +56,7 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("browser_session", by_name)
         self.assertIn("ui_click", by_name)
         self.assertIn("ui_interact", by_name)
+        self.assertIn("ui_mouse_drag", by_name)
         self.assertIn("ui_screenshot", by_name)
         self.assertIn("overlay_scan", by_name)
         self.assertIn("overlay_observe", by_name)
@@ -85,6 +86,13 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("width", screenshot_schema["properties"])
         self.assertIn("height", screenshot_schema["properties"])
         self.assertIn("image_format", screenshot_schema["properties"])
+        self.assertIn("filename", screenshot_schema["properties"])
+        drag_schema = by_name["ui_mouse_drag"].inputSchema
+        self.assertIn("start_x", drag_schema["required"])
+        self.assertIn("start_y", drag_schema["required"])
+        self.assertIn("end_x", drag_schema["required"])
+        self.assertIn("end_y", drag_schema["required"])
+        self.assertIn("steps", drag_schema["properties"])
         self.assertIn("css", by_name["ui_click"].inputSchema["properties"])
         self.assertIn(
             "max_controls", by_name["ui_analyze_scope"].inputSchema["properties"]
@@ -106,6 +114,9 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "visible_only", by_name["vtable_analysis"].inputSchema["properties"]
         )
+        self.assertIn("frame", by_name["vtable_analysis"].inputSchema["properties"])
+        self.assertIn("frame", by_name["vtable_meta"].inputSchema["properties"])
+        self.assertIn("frame", by_name["vtable_read_cells"].inputSchema["properties"])
         self.assertIn("port", by_name["browser_start"].inputSchema["properties"])
         self.assertIn(
             "user_data_dir", by_name["browser_start"].inputSchema["properties"]
@@ -126,6 +137,104 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
             "active",
         )
 
+    async def test_ui_snapshot_dispatches_cleanly_via_mcp_client(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import qa_automation as automation
+        from qa_automation.interaction import snapshot
+
+        with patch.object(
+            snapshot,
+            "_dom_snapshot_impl",
+            AsyncMock(return_value={"status": "ok", "snapshot": "- document"}),
+        ) as mock_impl:
+            # 1. 位置参数调用
+            snap1 = await automation.dom_snapshot("div", depth=2)
+            # 2. 关键字参数调用
+            snap2 = await automation.dom_snapshot(selector="div", depth=2)
+            # 3. 无参调用
+            snap3 = await automation.dom_snapshot()
+
+            self.assertEqual(snap1["status"], "ok")
+            self.assertEqual(snap2["status"], "ok")
+            self.assertEqual(snap3["status"], "ok")
+            self.assertEqual(mock_impl.call_count, 3)
+
+            # 4. 通过 FastMCP Client 真实调用 ui_snapshot 工具
+            async with Client(server.mcp) as client:
+                call_default = await client.call_tool("ui_snapshot", {})
+                call_with_selector = await client.call_tool(
+                    "ui_snapshot", {"selector": "div"}
+                )
+                self.assertIsNotNone(call_default.structured_content)
+                self.assertIsNotNone(call_with_selector.structured_content)
+                self.assertEqual(call_default.structured_content["status"], "ok")
+                self.assertEqual(
+                    call_with_selector.structured_content["status"], "ok"
+                )
+
+    async def test_vtable_analysis_accepts_frame_argument_via_mcp_client(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from qa_automation.components.vtable import analysis
+
+        with patch.object(
+            analysis,
+            "_vtable_analysis_impl",
+            AsyncMock(return_value={"status": "ok", "analysis": {"columns": []}}),
+        ) as mock_impl:
+            async with Client(server.mcp) as client:
+                result = await client.call_tool(
+                    "vtable_analysis",
+                    {"frame": "active", "max_columns": 5},
+                )
+
+            self.assertIsNotNone(result.structured_content)
+            self.assertEqual(result.structured_content["status"], "ok")
+            mock_impl.assert_awaited_once()
+            kwargs = mock_impl.await_args.kwargs
+            self.assertEqual(kwargs["frame"], "active")
+            self.assertEqual(kwargs["max_columns"], 5)
+
+    async def test_ui_mouse_drag_dispatches_cleanly_via_mcp_client(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import qa_automation as automation
+
+        with patch.object(
+            automation,
+            "mouse_drag",
+            AsyncMock(
+                return_value={
+                    "status": "dragged",
+                    "start": {"x": 100.0, "y": 150.0},
+                    "end": {"x": 300.0, "y": 150.0},
+                    "distance": 200.0,
+                    "steps": 24,
+                    "button": "left",
+                    "channel": "cdp",
+                }
+            ),
+        ) as mock_drag:
+            async with Client(server.mcp) as client:
+                result = await client.call_tool(
+                    "ui_mouse_drag",
+                    {
+                        "start_x": 100.0,
+                        "start_y": 150.0,
+                        "end_x": 300.0,
+                        "end_y": 150.0,
+                        "steps": 24,
+                    },
+                )
+
+            self.assertIsNotNone(result.structured_content)
+            self.assertEqual(result.structured_content["status"], "dragged")
+            mock_drag.assert_awaited_once()
+            kwargs = mock_drag.await_args.kwargs
+            self.assertEqual(kwargs["start_x"], 100.0)
+            self.assertEqual(kwargs["end_x"], 300.0)
+            self.assertEqual(kwargs["steps"], 24)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

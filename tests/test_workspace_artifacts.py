@@ -1,0 +1,215 @@
+"""Workspace-bound artifact and local file contracts."""
+
+from __future__ import annotations
+
+import asyncio
+import unittest
+from contextlib import chdir
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from qa_automation import browser
+from qa_automation.components import vtable as vtable_component
+from qa_automation.interaction import snapshot
+from qa_automation.workspace import (
+    artifact_file,
+    data_dir,
+    resolve_workspace_path,
+    workspace_root,
+)
+
+
+class WorkspacePathTests(unittest.TestCase):
+    def test_relative_paths_resolve_inside_selected_workspace(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ",
+            {
+                "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+                "QA_AUTOMATION_DATA_DIR": ".qa-automation/data",
+            },
+        ):
+            root = Path(directory).resolve()
+
+            self.assertEqual(workspace_root(), root)
+            self.assertEqual(data_dir(), root / ".qa-automation" / "data")
+            self.assertEqual(
+                artifact_file("outputs", "result.json", fallback="output.json"),
+                root / ".qa-automation" / "outputs" / "result.json",
+            )
+
+    def test_workspace_paths_reject_parent_escape(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ", {"QA_AUTOMATION_WORKSPACE_ROOT": "."}
+        ):
+            outside = Path(directory).resolve().parent / "outside.txt"
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "must stay inside MCP consumer workspace",
+            ):
+                resolve_workspace_path(outside)
+
+
+class WorkspaceArtifactTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ui_screenshot_is_persisted_under_workspace(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ",
+            {
+                "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+            },
+        ):
+            frame = SimpleNamespace(name="", url="about:blank")
+            page = SimpleNamespace(main_frame=frame)
+            page.screenshot = AsyncMock(return_value=b"synthetic-png")
+            with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=page)):
+                result = await snapshot._screenshot_element_impl(
+                    x=0,
+                    y=0,
+                    width=20,
+                    height=10,
+                    filename="viewport.png",
+                )
+
+            output = Path(result["path"])
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(
+                output,
+                Path(directory).resolve()
+                / ".qa-automation"
+                / "screenshots"
+                / "viewport.png",
+            )
+            self.assertEqual(output.read_bytes(), b"synthetic-png")
+
+    async def test_browser_download_uses_sanitized_workspace_filename(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ",
+            {
+                "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+            },
+        ):
+            download = SimpleNamespace(
+                suggested_filename="../report?.csv",
+                failure=AsyncMock(return_value=None),
+                save_as=AsyncMock(),
+            )
+            browser._state.download_failures.clear()
+
+            await browser._persist_download(download)
+
+            target = Path(download.save_as.await_args.args[0])
+            self.assertEqual(
+                target.parent,
+                Path(directory).resolve() / ".qa-automation" / "downloads",
+            )
+            self.assertEqual(target.name, "report_.csv")
+            self.assertEqual(browser._state.download_failures, [])
+
+    async def test_real_browser_download_is_persisted_under_workspace(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ",
+            {
+                "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+            },
+        ):
+            try:
+                await browser.start_browser(headless=True)
+            except Exception as exc:
+                raise unittest.SkipTest(
+                    f"Playwright browser unavailable: {exc}"
+                ) from exc
+            try:
+                page = await browser.current_page()
+                await page.set_content(
+                    '<a id="download" download="report.txt" '
+                    'href="data:text/plain,workspace-download">Download</a>'
+                )
+                async with page.expect_download() as pending:
+                    await page.locator("#download").click()
+                await (await pending.value).path()
+                if browser._state.download_tasks:
+                    await asyncio.gather(*list(browser._state.download_tasks))
+
+                files = list(
+                    (
+                        Path(directory).resolve()
+                        / ".qa-automation"
+                        / "downloads"
+                    ).glob("report*.txt")
+                )
+                self.assertEqual(len(files), 1)
+                self.assertEqual(
+                    files[0].read_text(encoding="utf-8"),
+                    "workspace-download",
+                )
+            finally:
+                await browser.close_browser()
+
+    async def test_session_state_is_saved_inside_workspace(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ", {"QA_AUTOMATION_WORKSPACE_ROOT": "."}
+        ):
+            context = SimpleNamespace(storage_state=AsyncMock())
+            current = SimpleNamespace(context=context)
+            with (
+                patch.object(browser._state, "browser", SimpleNamespace()),
+                patch.object(browser._state, "selected_context", None),
+                patch.object(
+                    browser,
+                    "_current_page_impl",
+                    AsyncMock(return_value=current),
+                ),
+            ):
+                result = await browser._browser_session_impl(
+                    "save",
+                    storage_state_path=".qa-automation/sessions/admin.json",
+                )
+
+            expected = (
+                Path(directory).resolve()
+                / ".qa-automation"
+                / "sessions"
+                / "admin.json"
+            )
+            context.storage_state.assert_awaited_once_with(path=str(expected))
+            self.assertEqual(result["path"], str(expected))
+
+    async def test_vtable_file_drop_rejects_outside_workspace(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ", {"QA_AUTOMATION_WORKSPACE_ROOT": "."}
+        ):
+            outside = Path(directory).resolve().parent / "outside-upload.txt"
+            outside.write_text("outside", encoding="utf-8")
+            current_page = AsyncMock()
+            try:
+                with (
+                    patch.object(
+                        vtable_component,
+                        "_current_page_impl",
+                        current_page,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "must stay inside MCP consumer workspace",
+                    ),
+                ):
+                    await vtable_component._drop_files_impl(
+                        0,
+                        1,
+                        [str(outside)],
+                    )
+            finally:
+                outside.unlink(missing_ok=True)
+
+            current_page.assert_not_awaited()
+
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

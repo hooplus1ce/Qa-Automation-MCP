@@ -6,8 +6,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-import vtable_playwright as vpw
-
+import qa_automation as automation
 
 FRAME_DOCUMENT = """
 <!doctype html>
@@ -40,10 +39,10 @@ FRAME_DOCUMENT = """
 class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         try:
-            await vpw.start_browser(headless=True)
+            await automation.start_browser(headless=True)
         except Exception as exc:
             raise unittest.SkipTest(f"Playwright browser unavailable: {exc}") from exc
-        self.page = await vpw.current_page()
+        self.page = await automation.current_page()
         await self.page.set_content(
             "<button id='top-message'>Show top message</button>"
             "<script>"
@@ -144,10 +143,10 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def asyncTearDown(self) -> None:
-        await vpw.close_browser()
+        await automation.close_browser()
 
     async def test_click_collects_modal_from_iframe_portal(self) -> None:
-        result = await vpw.click_dom_and_observe(
+        result = await automation.click_dom_and_observe(
             "button",
             name="Open modal",
             frame="application",
@@ -161,7 +160,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(modal["visible"])
 
     async def test_short_lived_message_is_retained_as_event(self) -> None:
-        result = await vpw.click_dom_and_observe(
+        result = await automation.click_dom_and_observe(
             "button",
             name="Show message",
             frame="application",
@@ -175,7 +174,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(item["text"] == "Saved from iframe" for item in result["visible_overlays"]))
 
     async def test_top_level_portal_is_collected(self) -> None:
-        result = await vpw.click_dom_and_observe(
+        result = await automation.click_dom_and_observe(
             "button",
             name="Show top message",
             settle_ms=80,
@@ -200,7 +199,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "};</script>"
         )
 
-        result = await vpw.click_dom_and_observe("button", name="Open module", settle_ms=80)
+        result = await automation.click_dom_and_observe("button", name="Open module", settle_ms=80)
 
         self.assertEqual(result["status"], "clicked")
         modal = next(item for item in result["overlays"] if item["text"] == "Dynamic modal")
@@ -226,7 +225,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "};</script>"
         )
 
-        result = await vpw.click_dom_and_observe(
+        result = await automation.click_dom_and_observe(
             "button", name="Open short module", settle_ms=100
         )
 
@@ -248,7 +247,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "</script>"
         )
 
-        result = await vpw.click_dom_and_observe("button", name="Update message", settle_ms=80)
+        result = await automation.click_dom_and_observe("button", name="Update message", settle_ms=80)
 
         self.assertEqual(result["status"], "clicked")
         updated = next(item for item in result["ui_events"] if item["text"] == "updated")
@@ -265,7 +264,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "</script>"
         )
 
-        result = await vpw.click_dom_and_observe(
+        result = await automation.click_dom_and_observe(
             "button", name="Commit message", settle_ms=40
         )
 
@@ -284,30 +283,30 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.page.wait_for_timeout(20)
         second = next(frame for frame in self.page.frames if frame.name == "second")
-        before = vpw._frame_id(self.page, second)
+        before = automation._frame_id(self.page, second)
         await self.page.locator("iframe").first.evaluate("element => element.remove()")
         await self.page.wait_for_timeout(20)
-        after = vpw._frame_id(self.page, second)
+        after = automation._frame_id(self.page, second)
 
         self.assertEqual(before, after)
 
     async def test_observer_is_stopped_when_click_raises(self) -> None:
-        original = vpw._click_dom_impl
+        original = automation._click_dom_impl
 
         async def explode(*args, **kwargs):
             raise RuntimeError("synthetic click failure")
 
-        vpw._click_dom_impl = explode
+        automation._click_dom_impl = explode
         try:
-            result = await vpw.click_dom_and_observe("button", name="missing", settle_ms=0)
+            result = await automation.click_dom_and_observe("button", name="missing", settle_ms=0)
         finally:
-            vpw._click_dom_impl = original
+            automation._click_dom_impl = original
 
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["observer_cleanup_failed"])
         self.assertFalse(
             await self.page.evaluate(
-                "key => Boolean(window[key])", vpw.OVERLAY_OBSERVER_KEY
+                "key => Boolean(window[key])", automation.OVERLAY_OBSERVER_KEY
             )
         )
 
@@ -316,11 +315,11 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "<div id='notice' class='ant-message-notice' role='status' "
             "style='display:block;position:fixed;left:1px;top:1px;width:100px;height:30px'>one</div>"
         )
-        first = await vpw.observe_overlays(settle_ms=0, stop=False)
+        first = await automation.observe_overlays(settle_ms=0, stop=False)
         self.assertEqual(first["status"], "ok")
         await self.page.locator("#notice").evaluate("element => element.firstChild.data = 'two'")
-        second = await vpw.observe_overlays(settle_ms=0, stop=False)
-        third = await vpw.observe_overlays(settle_ms=0, stop=True)
+        second = await automation.observe_overlays(settle_ms=0, stop=False)
+        third = await automation.observe_overlays(settle_ms=0, stop=True)
 
         self.assertTrue(any(item["text"] == "two" for item in second["overlays"]))
         self.assertFalse(any(item["text"] == "two" for item in third["overlays"]))
@@ -335,10 +334,10 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "</div>"
         )
         await self.page.wait_for_timeout(30)
-        active = await vpw.active_application_frame(self.page)
+        active = await automation.active_application_frame(self.page)
         self.assertIsNotNone(active)
         self.assertEqual(active.name, "active-module")
-        resolved = await vpw.resolve_frame(self.page, "active")
+        resolved = await automation.resolve_frame(self.page, "active")
         self.assertEqual(resolved.name, "active-module")
 
     async def test_custom_vtable_popup_focus_and_page_box(self) -> None:
@@ -352,7 +351,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             " document.body.append(node);"
             "};</script>"
         )
-        result = await vpw.click_dom_and_observe(
+        result = await automation.click_dom_and_observe(
             "button", name="Open filter", settle_ms=20
         )
         self.assertEqual(result["status"], "clicked")
@@ -373,7 +372,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             " document.body.append(node);"
             "};</script>"
         )
-        result = await vpw.dom_interact(
+        result = await automation.dom_interact(
             "click", css="#open", observe_after=True, settle_ms=20
         )
         self.assertEqual(result["status"], "acted")
@@ -407,7 +406,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         await self.page.locator("iframe").wait_for()
         await self.page.frames[1].get_by_role("button", name="Confirm").wait_for()
 
-        result = await vpw.analyze_scope(max_controls=10)
+        result = await automation.analyze_scope(max_controls=10)
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["scope"]["mode"], "focus_layer")
@@ -449,7 +448,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         frame = self.page.frames[1]
         await frame.get_by_role("combobox", name="Warehouse").wait_for()
 
-        result = await vpw.dom_interact(
+        result = await automation.dom_interact(
             "select",
             role="combobox",
             name="Warehouse",
@@ -466,9 +465,9 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
     async def test_vtable_analysis_reports_interaction_evidence_and_coordinates(self) -> None:
         await self._mount_fake_vtable()
 
-        analysis = await vpw.vtable_analysis(max_columns=2, sample_rows=2)
-        resolved = await vpw.resolve_vtable_cell("sku", 1)
-        clicked = await vpw.click_vtable_cell_by_field("sku", 1, verify=False)
+        analysis = await automation.vtable_analysis(max_columns=2, sample_rows=2)
+        resolved = await automation.resolve_vtable_cell("sku", 1)
+        clicked = await automation.click_vtable_cell_by_field("sku", 1, verify=False)
 
         self.assertEqual(analysis["status"], "ok")
         self.assertEqual(
@@ -494,10 +493,10 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         await self._mount_fake_vtable()
 
         with (
-            patch.object(vpw, "_cell_visual_state", new_callable=AsyncMock) as visual,
-            patch.object(vpw, "_cell_screenshot", new_callable=AsyncMock) as screenshot,
+            patch.object(automation, "_cell_visual_state", new_callable=AsyncMock) as visual,
+            patch.object(automation, "_cell_screenshot", new_callable=AsyncMock) as screenshot,
         ):
-            result = await vpw.click_vtable_cell_by_field("sku", 1, verify=False)
+            result = await automation.click_vtable_cell_by_field("sku", 1, verify=False)
 
         self.assertEqual(result["status"], "clicked")
         visual.assert_not_awaited()
@@ -508,10 +507,10 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
     async def test_vtable_analysis_coordinates_reuse_generic_viewport_click(self) -> None:
         await self._mount_fake_vtable()
 
-        analysis = await vpw.vtable_analysis(max_columns=2, sample_rows=0)
+        analysis = await automation.vtable_analysis(max_columns=2, sample_rows=0)
         sort_icon = analysis["analysis"]["columns"][0]["header_icons"][0]
         point = sort_icon["geometry"]["point"]
-        clicked = await vpw.dom_interact(
+        clicked = await automation.dom_interact(
             "click",
             x=point["x"],
             y=point["y"],
@@ -540,7 +539,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             }"""
         )
 
-        result = await vpw.click_vtable_cell_by_field("sku", 1, verify=True)
+        result = await automation.click_vtable_cell_by_field("sku", 1, verify=True)
 
         self.assertEqual(result["status"], "clicked")
         self.assertTrue(result["verification"]["scenegraph_changed"])
@@ -570,19 +569,38 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             }"""
         )
 
-        result = await vpw.click_vtable_cell_by_field("sku", 1, verify=True)
+        result = await automation.click_vtable_cell_by_field("sku", 1, verify=True)
 
         self.assertEqual(result["status"], "clicked")
         self.assertFalse(result["verification"]["scenegraph_changed"])
         self.assertTrue(result["verification"]["screenshot"]["changed"])
 
+    async def test_vtable_analysis_accepts_fresh_coordinate(self) -> None:
+        await self._mount_fake_vtable()
+        analysis = await automation.vtable_analysis(max_columns=2, sample_rows=1)
+        point = analysis["analysis"]["columns"][0]["header_icons"][0]["geometry"]["point"]
+
+        result = await automation.dom_interact(
+            "click",
+            x=point["x"],
+            y=point["y"],
+            analysis_id=analysis["analysis_id"],
+            observe_after=False,
+        )
+
+        self.assertEqual(result["status"], "acted")
+        self.assertNotIn("reason", result)
+        click_event = await self.page.evaluate("window.__vtableClick")
+        self.assertIsNotNone(click_event)
+        self.assertTrue(click_event["trusted"])
+
     async def test_vtable_analysis_rejects_stale_coordinate(self) -> None:
         await self._mount_fake_vtable()
-        analysis = await vpw.vtable_analysis(max_columns=2, sample_rows=1)
+        analysis = await automation.vtable_analysis(max_columns=2, sample_rows=1)
         point = analysis["analysis"]["columns"][0]["header_icons"][0]["geometry"]["point"]
         await self.page.evaluate("window._vtable.scrollLeft = 25; window.__vtableClick = null")
 
-        result = await vpw.dom_interact(
+        result = await automation.dom_interact(
             "click",
             x=point["x"],
             y=point["y"],
@@ -603,7 +621,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         )
         box = await self.page.locator("#edit").bounding_box()
 
-        result = await vpw.dom_interact(
+        result = await automation.dom_interact(
             "click",
             x=box["x"] + box["width"] / 2,
             y=box["y"] + box["height"] / 2,
@@ -635,7 +653,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             }"""
         )
 
-        analysis = await vpw.vtable_analysis(fields=["name"], sample_rows=1)
+        analysis = await automation.vtable_analysis(fields=["name"], sample_rows=1)
         cell = analysis["analysis"]["columns"][0]["sample_cells"][0]
 
         self.assertEqual(cell["interaction"]["confidence"], "candidate")
@@ -648,7 +666,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "style='display:block;width:180px;height:500px'><li role='menuitem'>Navigation</li></ul>"
         )
 
-        result = await vpw.scan_overlays(scope="all")
+        result = await automation.scan_overlays(scope="all")
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["overlays"], [])
@@ -691,11 +709,11 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             }"""
         )
 
-        analysis = await vpw.vtable_analysis(max_columns=1, sample_rows=0)
+        analysis = await automation.vtable_analysis(max_columns=1, sample_rows=0)
         icon = analysis["analysis"]["columns"][0]["header_icons"][0]
         canvas_box = await frame.locator("canvas").bounding_box()
         point = icon["geometry"]["point"]
-        result = await vpw.dom_interact(
+        result = await automation.dom_interact(
             "click", x=point["x"], y=point["y"], observe_after=False
         )
 
@@ -707,17 +725,17 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_page_selection_survives_followup_calls(self) -> None:
         second = await self.page.context.new_page()
         await second.set_content("<title>Second module</title><button>Second</button>")
-        listed = await vpw.list_pages()
+        listed = await automation.list_pages()
         second_id = next(
             item["page_id"] for item in listed["pages"] if item["title"] == "Second module"
         )
 
-        selected = await vpw.select_page(second_id)
-        context = await vpw.page_context(max_results=2)
+        selected = await automation.select_page(second_id)
+        context = await automation.page_context(max_results=2)
 
         self.assertEqual(selected["status"], "selected")
         self.assertEqual(context["page_id"], second_id)
-        self.assertEqual((await vpw.current_page()), second)
+        self.assertEqual((await automation.current_page()), second)
 
 
     async def test_modal_resolves_to_inner_dialog_geometry_and_compact_changes(self) -> None:
@@ -738,7 +756,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "};</script>"
         )
 
-        result = await vpw.dom_interact("click", css="#open-modal", settle_ms=80)
+        result = await automation.dom_interact("click", css="#open-modal", settle_ms=80)
         self.assertEqual(result["status"], "acted")
         # Should resolve to 1 dialog (not duplicated wrap + inner dialog)
         dialog_overlays = [item for item in result["overlays"] if item.get("kind") == "dialog"]
@@ -766,12 +784,77 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "};</script>"
         )
 
-        result = await vpw.dom_interact("click", css="#trigger", settle_ms=80)
+        result = await automation.dom_interact("click", css="#trigger", settle_ms=80)
         self.assertEqual(result["status"], "acted")
         messages = [item for item in result["ui_events"] if item.get("text") == "Toast message"]
         # Only 1 deduplicated event instead of intermediate move-up-enter ghost
         self.assertEqual(len(messages), 1)
         self.assertNotIn("move-up-enter", messages[0]["selector"])
+
+    async def test_iframe_control_click_glides_to_exact_viewport_center_without_double_offset(self) -> None:
+        await self.page.set_content(
+            "<iframe name='offset-frame' style='position:absolute;left:200px;top:150px;width:400px;height:300px;border:none;' "
+            "srcdoc=\"<button id='target-btn' style='position:absolute;left:50px;top:30px;width:100px;height:40px;'>Click Target</button>\"></iframe>"
+        )
+        await self.page.wait_for_timeout(50)
+        coords = []
+
+        async def record_move(page, target_x, target_y):
+            coords.append((target_x, target_y))
+        with patch("qa_automation.interaction._smooth_mouse_move_to", side_effect=record_move):
+            result = await automation.dom_interact(
+                "click",
+                css="#target-btn",
+                frame="offset-frame",
+                observe_after=False,
+            )
+
+        self.assertEqual(result["status"], "acted")
+        self.assertEqual(len(coords), 1)
+        glide_x, glide_y = coords[0]
+        # Bounding box is at (200 + 50 = 250, 150 + 30 = 180, width=100, height=40)
+        # True viewport center is (250 + 50 = 300, 180 + 20 = 200)
+        self.assertAlmostEqual(glide_x, 300.0, delta=2)
+        self.assertAlmostEqual(glide_y, 200.0, delta=2)
+
+    async def test_mouse_drag_dispatches_sequential_events_with_continuous_movement(self) -> None:
+        await self.page.set_content(
+            "<canvas id='drag-box' width='300' height='300' style='position:absolute;left:10px;top:10px;width:300px;height:300px;'></canvas>"
+            "<script>"
+            "window.__dragEvents = [];"
+            "const el = document.getElementById('drag-box');"
+            "['mousedown', 'mousemove', 'mouseup'].forEach(t => {"
+            " el.addEventListener(t, e => {"
+            "  window.__dragEvents.push({type: t, x: e.clientX, y: e.clientY, buttons: e.buttons});"
+            " });"
+            "});"
+            "</script>"
+        )
+        await self.page.wait_for_timeout(30)
+
+        result = await automation.mouse_drag(
+            start_x=30.0,
+            start_y=30.0,
+            end_x=180.0,
+            end_y=90.0,
+            steps=12,
+            hold_ms=20,
+            settle_ms=20,
+        )
+
+        self.assertEqual(result["status"], "dragged")
+        self.assertEqual(result["start"], {"x": 30.0, "y": 30.0})
+        self.assertEqual(result["end"], {"x": 180.0, "y": 90.0})
+        self.assertEqual(result["steps"], 12)
+
+        events = await self.page.evaluate("window.__dragEvents")
+        types = [e["type"] for e in events]
+        self.assertIn("mousedown", types)
+        self.assertIn("mouseup", types)
+        self.assertIn("mousemove", types)
+        # Verify that during drag, mousemove had buttons pressed
+        drag_moves = [e for e in events if e["type"] == "mousemove" and e["buttons"] > 0]
+        self.assertGreaterEqual(len(drag_moves), 8)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

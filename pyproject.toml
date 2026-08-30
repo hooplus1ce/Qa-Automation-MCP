@@ -1,17 +1,52 @@
 [project]
-name = "vtable-mcp"
+name = "qa-automation-mcp"
 version = "0.1.0"
-description = "VTable 虚拟表格 MCP 服务器:交互式 UI 工具 + 内化的 VTable JS 脚本资源"
+description = "通用 UI 自动化测试 MCP 服务，包含浏览器、DOM、浮层与可选组件适配器"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp[apps]>=3.4.0",
 ]
 
+[project.scripts]
+qa-automation-mcp = "qa_automation.mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project.optional-dependencies]
 browser = [
     "playwright>=1.62",
 ]
 
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
 [tool.uv]
-package = false
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# F: pyflakes(含 F821 未定义名称,可静态抓住 import 遗漏类 P0)
+# E/W: pycodacity, I: isort, B: bugbear, UP: pyupgrade
+select = ["F", "E", "W", "I", "B", "UP"]
+ignore = [
+    "E501", # 行长由 format 管理
+]
+
+[tool.ruff.lint.per-file-ignores]
+# facade 模块:全部导入都是有意再导出(供 `import qa_automation as automation` 使用)
+"qa_automation/__init__.py" = ["F401"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["qa_automation"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.5",
+]
