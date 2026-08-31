@@ -180,8 +180,8 @@ async def cell_center(page: Page, frame: Frame, col: int, row: int) -> dict[str,
     rel = await frame.evaluate(_wrap2(CELL_RELATIVE_LOC), [col, row])
     if not rel:
         return None
-    raw_x = (rel.get("left", 0) + rel.get("right", 0)) / 2
-    raw_y = (rel.get("top", 0) + rel.get("bottom", 0)) / 2
+    raw_x = rel.get("x") if "x" in rel else (rel.get("left", 0) + rel.get("right", 0)) / 2
+    raw_y = rel.get("y") if "y" in rel else (rel.get("top", 0) + rel.get("bottom", 0)) / 2
     offset = await cell_offset(frame)
     x = offset["left"] + raw_x
     y = offset["top"] + raw_y

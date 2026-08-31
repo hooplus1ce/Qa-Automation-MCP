@@ -22,6 +22,7 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         root_names = await tool_names(server.mcp)
 
         self.assertIn("browser_start", browser_names)
+        self.assertIn("browser_login", browser_names)
         self.assertIn("ui_interact", ui_names)
         self.assertIn("vtable_analysis", vtable_names)
         self.assertTrue(browser_names <= root_names)

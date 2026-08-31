@@ -40,6 +40,7 @@ from .browser import (
     launch_chrome,
     list_pages,
     open_url,
+    browser_login,
     select_page,
     set_page_preference_probe,
     start_browser,
@@ -224,6 +225,7 @@ __all__ = [
     "select_page",
     "browser_session",
     "open_url",
+    "browser_login",
     # VTable
     "vtable_frame",
     "active_application_frame",

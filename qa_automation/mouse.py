@@ -46,23 +46,7 @@ def _build_cursor_helper_script() -> str:
     transform-origin: {_CURSOR_HOT_X}px {_CURSOR_HOT_Y}px;
     filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.4));
 """
-    update_pos = f"""
-    window.__qa_automation_last_x = x;
-    window.__qa_automation_last_y = y;
-    const scale = isMouseDown ? ' scale(0.92)' : ' scale(1)';
-    cursor.style.transform = `translate(${{x - {_CURSOR_HOT_X}}}px, ${{y - {_CURSOR_HOT_Y}}}px)${{scale}}`;
-"""
-    return f"""(() => {{
-  if (document.getElementById('__qa_automation_cursor__')) return 'already-installed';
-
-  const cursor = document.createElement('div');
-  cursor.id = '__qa_automation_cursor__';
-  cursor.innerHTML = '';
-  cursor.style.cssText = `{cursor_css}`;
-
-  const ripple = document.createElement('div');
-  ripple.id = '__qa_automation_ripple__';
-  ripple.style.cssText = `
+    ripple_css = """
     position: fixed;
     left: 0;
     top: 0;
@@ -76,18 +60,37 @@ def _build_cursor_helper_script() -> str:
     transform: translate(-50%, -50%) scale(0);
     opacity: 0;
     transition: transform 0.25s cubic-bezier(0.1, 0.8, 0.2, 1), opacity 0.25s ease-out;
-  `;
+"""
+    update_pos = f"""
+    window.__qa_automation_last_x = x;
+    window.__qa_automation_last_y = y;
+    const scale = isMouseDown ? ' scale(0.92)' : ' scale(1)';
+    cursor.style.transform = `translate(${{x - {_CURSOR_HOT_X}}}px, ${{y - {_CURSOR_HOT_Y}}}px)${{scale}}`;
+"""
+    return f"""(() => {{
+  let cursor = document.getElementById('__qa_automation_cursor__');
+  if (!cursor) {{
+    cursor = document.createElement('div');
+    cursor.id = '__qa_automation_cursor__';
+    document.documentElement.appendChild(cursor);
+  }}
+  cursor.innerHTML = '';
+  cursor.style.cssText = `{cursor_css}`;
 
-  document.documentElement.appendChild(cursor);
-  document.documentElement.appendChild(ripple);
-
+  let ripple = document.getElementById('__qa_automation_ripple__');
+  if (!ripple) {{
+    ripple = document.createElement('div');
+    ripple.id = '__qa_automation_ripple__';
+    document.documentElement.appendChild(ripple);
+  }}
+  ripple.style.cssText = `{ripple_css}`;
   window.__qa_automation_last_x = 0;
   window.__qa_automation_last_y = 0;
   let hideTimer = null;
   let safetyHideTimer = null;
   let isMouseDown = false;
 
-  const scheduleHide = (delay = 200) => {{
+  const scheduleHide = (delay = 2000) => {{
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {{
       if (!isMouseDown) {{
@@ -98,12 +101,12 @@ def _build_cursor_helper_script() -> str:
     safetyHideTimer = setTimeout(() => {{
       isMouseDown = false;
       cursor.style.opacity = '0';
-    }}, Math.max(delay + 300, 600));
+    }}, Math.max(delay + 500, 2500));
   }};
 
-  const showCursor = () => {{
+  const showCursor = (stay = 3500) => {{
     cursor.style.opacity = '1';
-    scheduleHide(250);
+    scheduleHide(stay);
   }};
 
   const updatePos = (x, y) => {{
@@ -121,14 +124,10 @@ def _build_cursor_helper_script() -> str:
     }}
   }};
 
-  window.__qa_automation_update_cursor = (x, y, down = false, clickRipple = false) => {{
+  window.__qa_automation_update_cursor = (x, y, down = false, clickRipple = false, stayMs = 3500) => {{
     isMouseDown = down;
     updatePos(x, y);
-    if (down) {{
-      showCursor();
-    }} else {{
-      scheduleHide(150);
-    }}
+    showCursor(stayMs);
     if (clickRipple) {{
       ripple.style.transition = 'none';
       ripple.style.left = x + 'px';
@@ -193,7 +192,7 @@ async def _smooth_mouse_move_to(
         if SHOW_CURSOR:
             try:
                 await page.evaluate(
-                    f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({curr_x:.1f}, {curr_y:.1f})"
+                    f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({curr_x:.1f}, {curr_y:.1f}, false, false, 2000)"
                 )
             except Exception:
                 pass

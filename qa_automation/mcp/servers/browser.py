@@ -89,4 +89,25 @@ def create_server() -> FastMCP:
         """
         return await automation.close_browser()
 
+    @mcp.tool()
+    @instrument_tool
+    async def browser_login(
+        username: str = "pingxiang",
+        password: str = "Ac123456",
+        url: str = "https://demo18-scm.hoolinks.com/static/admin/",
+        captcha: str | None = None,
+        max_retries: int = 3,
+    ) -> dict:
+        """针对新建浏览器会话/登录过期的专属自动登录工具:
+        自动处理登录失效弹窗、自动输入账号密码、截图并尝试AI识别图形验证码完成登录。
+        若无需自动识别或已有验证码字符，可直接传入 captcha 参数跳过识别。
+        """
+        return await automation.browser_login(
+            username=username,
+            password=password,
+            url=url,
+            captcha=captcha,
+            max_retries=max_retries,
+        )
+
     return mcp

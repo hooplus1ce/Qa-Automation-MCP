@@ -297,21 +297,27 @@ async def _dom_interact_impl(
 
         if locator is None:
             # 坐标回退只对点击类动作有意义,避免 fill/press 等被静默降级成点击
-            if action not in {"click", "dblclick", "rightclick"}:
+            if action not in {"click", "dblclick", "rightclick", "hover"}:
                 raise ValueError(
                     f"action {action!r} requires a locator; coordinate fallback "
-                    "only supports click, dblclick and rightclick"
+                    "only supports click, dblclick, rightclick and hover"
                 )
-            from ..components.vtable import _trusted_viewport_click
-            clicked = await _trusted_viewport_click(
-                page,
-                float(x),
-                float(y),
-                double_click=(action == "dblclick"),
-                button="right" if action == "rightclick" else "left",
-            )
-            if clicked["status"] != "ok":
-                raise ValueError(clicked.get("reason", "coordinate click failed"))
+            if action == "hover":
+                from ..components.vtable import _trusted_viewport_hover
+                act_res = await _trusted_viewport_hover(page, float(x), float(y))
+                if act_res["status"] != "ok":
+                    raise ValueError(act_res.get("reason", "coordinate hover failed"))
+            else:
+                from ..components.vtable import _trusted_viewport_click
+                clicked = await _trusted_viewport_click(
+                    page,
+                    float(x),
+                    float(y),
+                    double_click=(action == "dblclick"),
+                    button="right" if action == "rightclick" else "left",
+                )
+                if clicked["status"] != "ok":
+                    raise ValueError(clicked.get("reason", "coordinate click failed"))
             response = {
                 "status": "acted",
                 "page_id": _page_id(page),

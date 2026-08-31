@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -103,6 +104,41 @@ async def _trusted_viewport_click(
         }
     except Exception as e:
         return {"status": "failed", "reason": f"click-error: {e}"}
+
+
+async def _trusted_viewport_hover(
+    page: Page,
+    x: float,
+    y: float,
+) -> dict:
+    try:
+        x, y = float(x), float(y)
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError("coordinates must be finite numbers")
+        viewport = await _page_viewport_size(page)
+        if not (0 <= x < viewport["width"] and 0 <= y < viewport["height"]):
+            raise ValueError(
+                f"point ({x:g}, {y:g}) is outside viewport "
+                f"({viewport['width']:g} x {viewport['height']:g})"
+            )
+        await _ensure_cursor_helper(page)
+        await _smooth_mouse_move_to(page, x, y)
+        if SHOW_CURSOR:
+            try:
+                await page.evaluate(
+                    f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({x:.1f}, {y:.1f}, false, true, 3500)"
+                )
+            except Exception:
+                pass
+        await page.mouse.move(x, y)
+        await asyncio.sleep(0.4)
+        return {
+            "status": "ok",
+            "point": {"x": x, "y": y},
+            "coordinate_space": "top-page-viewport-css-pixels",
+        }
+    except Exception as e:
+        return {"status": "failed", "reason": f"hover-error: {e}"}
 
 
 async def _do_click(page: Page, frame: Frame, x: float, y: float, *, double_click: bool, button: str) -> dict:

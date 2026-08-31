@@ -43,6 +43,7 @@ class _BrowserState:
     browser: Browser | None = None
     pw: Any = None
     cdp: bool = False
+    cdp_url: str | None = None
     chrome_process: subprocess.Popen[Any] | None = None
     chrome_port: int | None = None
     chrome_profile: str | None = None
@@ -83,6 +84,7 @@ class _BrowserState:
         self.browser = None
         self.pw = None
         self.cdp = False
+        self.cdp_url = None
         self.selected_page = None
         self.selected_context = None
         self.page_ids.clear()
@@ -417,7 +419,21 @@ async def start_browser(headless: bool = True) -> dict:
 
 async def _connect_browser_impl(cdp_url: str = "http://127.0.0.1:9222") -> dict:
     if _state.browser is not None and _state.browser.is_connected():
-        return {"status": "already-connected", "cdp": cdp_url}
+        if _state.cdp and _state.cdp_url == cdp_url:
+            tabs = []
+            try:
+                if _state.browser.contexts:
+                    tabs = [p.url[:80] for p in _state.browser.contexts[0].pages]
+            except Exception:
+                pass
+            return {
+                "status": "already-connected",
+                "cdp": cdp_url,
+                "browser": _state.browser.version,
+                "tabs": tabs,
+            }
+        # 若先前连接的是非 CDP 浏览器(如 headless chromium)或不同的端点，先断开以切入目标 CDP
+        await _close_browser_impl()
     if async_playwright is None:
         raise RuntimeError(PLAYWRIGHT_INSTALL_HINT)
 
@@ -434,6 +450,7 @@ async def _connect_browser_impl(cdp_url: str = "http://127.0.0.1:9222") -> dict:
         ) from exc
     download_config = await _configure_browser_downloads(_state.browser)
     _state.cdp = True
+    _state.cdp_url = cdp_url
     _state.selected_page = None
     _state.selected_context = _state.browser.contexts[0] if _state.browser.contexts else None
     if _state.selected_context is not None:
@@ -553,6 +570,28 @@ async def _wait_for_cdp(
     raise RuntimeError(f"Chrome CDP 端口 {port} 未在 {timeout_ms}ms 内就绪: {last_error}")
 
 
+
+async def _maximize_and_fill_viewport(page: Page) -> None:
+    """Maximize the browser window and clear device metrics override to match window aspect ratio."""
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        try:
+            target_info = await cdp.send("Target.getTargetInfo")
+            tid = target_info.get("targetInfo", {}).get("targetId")
+            if tid:
+                win = await cdp.send("Browser.getWindowForTarget", {"targetId": tid})
+                wid = win.get("windowId")
+                if wid is not None:
+                    await cdp.send(
+                        "Browser.setWindowBounds",
+                        {"windowId": wid, "bounds": {"windowState": "maximized"}},
+                    )
+            await cdp.send("Emulation.clearDeviceMetricsOverride")
+        finally:
+            await cdp.detach()
+    except Exception:
+        pass
+
 async def _launch_chrome_impl(
     port: int = 9222,
     headless: bool = False,
@@ -596,6 +635,8 @@ async def _launch_chrome_impl(
     ]
     if headless:
         args.append("--headless=new")
+    else:
+        args.append("--start-maximized")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _state.chrome_process = proc
     _state.chrome_port = port
@@ -611,6 +652,11 @@ async def _launch_chrome_impl(
             shutil.rmtree(profile, ignore_errors=True)
         raise
     conn = await _connect_browser_impl(cdp_url)
+    try:
+        init_page = await _current_page_impl()
+        await _maximize_and_fill_viewport(init_page)
+    except Exception:
+        pass
     return {
         "status": "launched",
         "port": port,
@@ -698,7 +744,16 @@ async def close_browser() -> dict:
 
 async def _current_page_impl() -> Page:
     if _state.browser is None or not _state.browser.is_connected():
-        await _start_browser_impl()
+        # 优先探测受管 Chrome 或本地 9222 端口，避免盲目拉起无头浏览器导致操作不可见
+        cdp_target = f"http://127.0.0.1:{_state.chrome_port}" if _state.chrome_port else "http://127.0.0.1:9222"
+        connected = False
+        try:
+            await _connect_browser_impl(cdp_target)
+            connected = True
+        except Exception:
+            pass
+        if not connected:
+            await _start_browser_impl()
     assert _state.browser is not None
     if _state.selected_page is not None:
         try:
@@ -712,7 +767,7 @@ async def _current_page_impl() -> Page:
         ctx = (
             _state.browser.contexts[0]
             if _state.browser.contexts
-            else await _state.browser.new_context()
+            else await _state.browser.new_context(no_viewport=True)
         )
         _state.selected_context = ctx
         _context_id(
@@ -727,7 +782,9 @@ async def _current_page_impl() -> Page:
         page = await ctx.new_page()
         page.set_default_timeout(3_000)
         page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
-        return _select_page_object(page)
+        _select_page_object(page)
+        await _maximize_and_fill_viewport(page)
+        return page
     if len(pages) > 1:
         # 页面偏好探测由组合层注入(通用层不感知 VTable/Profile)
         if _page_preference_probe is not None:
@@ -893,6 +950,8 @@ async def _browser_session_impl(
                 require_file=True,
             )
             kwargs["storage_state"] = str(resolved_storage_state)
+        if "no_viewport" not in kwargs and "viewport" not in kwargs:
+            kwargs["no_viewport"] = True
         ctx = await _state.browser.new_context(**kwargs)
         _watch_download_context(ctx)
         created_id = _context_id(ctx, name=name)
@@ -901,6 +960,7 @@ async def _browser_session_impl(
         _state.selected_page = None
         page = await ctx.new_page()
         _select_page_object(page)
+        await _maximize_and_fill_viewport(page)
         return {
             "status": "created",
             "session_id": created_id,
@@ -979,10 +1039,9 @@ async def browser_session(
 
 
 async def _open_url_impl(url: str, *, headless: bool = True) -> dict:
-    if _state.browser is None or not _state.browser.is_connected():
-        await _start_browser_impl(headless=headless)
     page = await _current_page_impl()
     await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+    await _maximize_and_fill_viewport(page)
     return {
         "status": "opened",
         "page_id": _page_id(page),
@@ -994,3 +1053,241 @@ async def _open_url_impl(url: str, *, headless: bool = True) -> dict:
 async def open_url(url: str, *, headless: bool = True) -> dict:
     async with _action_lock:
         return await _open_url_impl(url, headless=headless)
+
+
+def _recognize_captcha_with_ai(image_bytes: bytes) -> str | None:
+    """Attempt to recognize 4-character graphical captcha using available vision APIs or local OCR."""
+    import base64
+    import json
+    import re
+    import urllib.request
+
+    b64_img = base64.b64encode(image_bytes).decode("ascii")
+
+    # 1. Check local OCR service if running (e.g. localhost:17521)
+    for ocr_url in ("http://127.0.0.1:17521/ocr", "http://localhost:17521/ocr"):
+        try:
+            req = urllib.request.Request(
+                ocr_url,
+                data=json.dumps({"image": b64_img}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                data = json.load(resp)
+                code = data.get("result") or data.get("code") or data.get("text") or ""
+                cleaned = re.sub(r"[^a-zA-Z0-9]", "", str(code)).strip()
+                if len(cleaned) == 4:
+                    return cleaned
+        except Exception:
+            pass
+
+    # 2. Check OpenAI-compatible vision endpoint
+    api_key = os.getenv("QA_AUTOMATION_VISION_KEY") or os.getenv("OPENAI_API_KEY")
+    api_url = os.getenv("QA_AUTOMATION_VISION_URL")
+    if not api_url and api_key:
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        api_url = f"{base_url}/chat/completions"
+    model = os.getenv("QA_AUTOMATION_VISION_MODEL") or os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+
+    if api_key and api_url:
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Identify the 4 characters (letters or digits) in this verification code image. Output ONLY the 4 characters, nothing else."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
+                        ],
+                    }
+                ],
+                "max_tokens": 10,
+                "temperature": 0.1,
+            }
+            req = urllib.request.Request(
+                api_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
+                res = json.load(resp)
+                raw_text = res["choices"][0]["message"]["content"].strip()
+                cleaned = re.sub(r"[^a-zA-Z0-9]", "", raw_text)
+                if len(cleaned) == 4:
+                    return cleaned
+        except Exception:
+            pass
+
+    return None
+
+
+async def _browser_login_impl(
+    username: str = "pingxiang",
+    password: str = "Ac123456",
+    *,
+    url: str = "https://demo18-scm.hoolinks.com/static/admin/",
+    captcha: str | None = None,
+    max_retries: int = 3,
+) -> dict[str, Any]:
+    """Log in to the APS system, automatically handling login state, expired dialog, and captcha."""
+    import base64
+
+    if _state.browser is None or not _state.browser.is_connected():
+        # Try connecting to port 9222 first; if not available, launch a new browser
+        try:
+            await _connect_browser_impl("http://127.0.0.1:9222")
+        except Exception:
+            await _start_browser_impl(headless=False)
+
+    page = await _current_page_impl()
+    await _maximize_and_fill_viewport(page)
+
+    # Check if we need to navigate
+    curr_url = page.url or ""
+    if not curr_url or curr_url == "about:blank" or curr_url.startswith("chrome://") or "demo18-scm" not in curr_url:
+        await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(1000)
+
+    # Check if expired modal "登录状态已过期，请重新登录" is present
+    try:
+        relogin_btn = page.locator("button:has-text('重新登录')")
+        if await relogin_btn.count() > 0 and await relogin_btn.first.is_visible():
+            await relogin_btn.first.click()
+            await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    # Check if already logged in (on /static/admin and no login inputs present)
+    if "login" not in page.url and await page.locator("input[placeholder='请输入账号']").count() == 0:
+        return {
+            "status": "already-logged-in",
+            "page_id": _page_id(page),
+            "url": page.url,
+            "title": (await page.title())[:200],
+        }
+
+    # If on admin root but not logged in, navigate to login page
+    if "login" not in page.url and await page.locator("input[placeholder='请输入账号']").count() == 0:
+        await page.goto("https://demo18-scm.hoolinks.com/static/admin/login", wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(500)
+
+    # Wait for login form inputs to be ready
+    user_input = page.locator("input[placeholder='请输入账号']").first
+    pwd_input = page.locator("input[placeholder='请输入密码']").first
+    captcha_input = page.locator("input[placeholder='请输入图形验证码']").first
+    login_btn = page.locator("button:has-text('登 录')").first
+
+    await user_input.wait_for(state="visible", timeout=10_000)
+
+    attempts = 0
+    current_captcha = captcha
+
+    while attempts < max(1, max_retries):
+        attempts += 1
+
+        # Fill credentials
+        await user_input.fill(username)
+        await pwd_input.fill(password)
+
+        # Resolve captcha
+        resolved_code = current_captcha
+        captcha_file = None
+        b64_captcha = ""
+
+        if not resolved_code:
+            img_loc = page.locator("img[src*='validateCode']")
+            if await img_loc.count() == 0:
+                img_loc = page.locator("input[placeholder='请输入图形验证码'] + img, input[placeholder='请输入图形验证码'] ~ img")
+
+            if await img_loc.count() > 0:
+                captcha_file = artifact_dir("screenshots") / "captcha_login.png"
+                captcha_file.parent.mkdir(parents=True, exist_ok=True)
+                img_bytes = await img_loc.first.screenshot(path=str(captcha_file))
+                b64_captcha = base64.b64encode(img_bytes).decode("ascii")
+
+                # Attempt AI vision recognition
+                resolved_code = _recognize_captcha_with_ai(img_bytes)
+
+            if not resolved_code:
+                # Cannot automatically recognize without AI vision model / OCR, return captcha artifact for inspect_image
+                return {
+                    "status": "captcha-needed",
+                    "page_id": _page_id(page),
+                    "captcha_image_path": str(captcha_file) if captcha_file else None,
+                    "captcha_image_base64": b64_captcha,
+                    "username": username,
+                    "message": "已截取图形验证码图片。请使用 inspect_image 工具识别验证码字符，并再次调用 browser_login(captcha=...) 完成登录。",
+                }
+
+        # Fill captcha
+        await captcha_input.fill(resolved_code)
+        await login_btn.click()
+
+        # Wait for outcome: either URL navigates to /static/admin or an error notification appears
+        start_t = time.monotonic()
+        login_ok = False
+        has_error = False
+
+        while time.monotonic() - start_t < 4.0:
+            if "login" not in page.url and ("static/admin" in page.url or "scm" in page.url):
+                login_ok = True
+                break
+
+            # Check for error notice/message
+            err_msg = page.locator(".ant-message-error, .ant-notification-notice-error, .ant-form-explain")
+            if await err_msg.count() > 0 and await err_msg.first.is_visible():
+                err_text = await err_msg.first.inner_text()
+                if "验证码" in err_text or "错误" in err_text:
+                    has_error = True
+                    break
+            await page.wait_for_timeout(300)
+
+        if login_ok:
+            return {
+                "status": "logged-in",
+                "page_id": _page_id(page),
+                "username": username,
+                "url": page.url,
+                "title": (await page.title())[:200],
+            }
+
+        # Captcha or login failed, refresh captcha image and retry
+        if attempts < max_retries:
+            try:
+                img_loc = page.locator("img[src*='validateCode']")
+                if await img_loc.count() > 0:
+                    await img_loc.first.click()
+                    await page.wait_for_timeout(600)
+            except Exception:
+                pass
+            current_captcha = None
+
+    return {
+        "status": "failed",
+        "page_id": _page_id(page),
+        "url": page.url,
+        "reason": f"登录失败，已尝试 {attempts} 次，请检查账号密码或验证码。",
+    }
+
+
+async def browser_login(
+    username: str = "pingxiang",
+    password: str = "Ac123456",
+    *,
+    url: str = "https://demo18-scm.hoolinks.com/static/admin/",
+    captcha: str | None = None,
+    max_retries: int = 3,
+) -> dict[str, Any]:
+    """统一登录工具: 针对新建浏览器会话/登录过期自动登录 APS 系统。"""
+    async with _action_lock:
+        return await _browser_login_impl(
+            username=username,
+            password=password,
+            url=url,
+            captcha=captcha,
+            max_retries=max_retries,
+        )
