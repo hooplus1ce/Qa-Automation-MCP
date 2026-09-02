@@ -352,19 +352,42 @@ IS_CELL_VISIBLE = r"""
     const top    = pick(rect.top,    pick(rect.y1, rect.bounds && rect.bounds.y1));
     const right  = pick(rect.right,  pick(rect.x2, rect.bounds && rect.bounds.x2));
     const bottom = pick(rect.bottom, pick(rect.y2, rect.bounds && rect.bounds.y2));
-    if (left === undefined || top === undefined) return null;
-    const frozenW = t.frozenColCount ? t.getFrozenColsWidth() : 0;
-    const frozenH = t.frozenRowCount ? t.getFrozenRowsHeight() : 0;
-    // getCellRelativeRect 使用 CSS 像素；canvas.width/height 可能已乘 DPR，
-    // 因此可视边界必须使用实际 CSS 盒尺寸。
-    const canvasRect = t.canvas.getBoundingClientRect();
+    if (left === undefined || top === undefined || right === undefined || bottom === undefined) return null;
+    const frozenColCount = t.frozenColCount || 0;
+    const frozenRowCount = t.frozenRowCount || 0;
+    const rightFrozenColCount = t.rightFrozenColCount || 0;
+    const bottomFrozenRowCount = t.bottomFrozenRowCount || 0;
+    const frozenW = frozenColCount && t.getFrozenColsWidth ? t.getFrozenColsWidth() : 0;
+    const frozenH = frozenRowCount && t.getFrozenRowsHeight ? t.getFrozenRowsHeight() : 0;
+    const rightFrozenW = rightFrozenColCount && t.getRightFrozenColsWidth ? t.getRightFrozenColsWidth() : 0;
+    const bottomFrozenH = bottomFrozenRowCount && t.getBottomFrozenRowsHeight ? t.getBottomFrozenRowsHeight() : 0;
+    const canvasRect = t.canvas ? t.canvas.getBoundingClientRect() : (t.getElement ? t.getElement().getBoundingClientRect() : {width: 1000, height: 500});
     const cw = canvasRect.width, ch = canvasRect.height;
     const tol = 1;
     const cx = (left + right) / 2;
     const cy = (top + bottom) / 2;
     if (cx === undefined || cy === undefined) return null;
-    return (cx >= frozenW - tol) && (cy >= frozenH - tol) &&
-           (cx <= cw + tol) && (cy <= ch + tol);
+    const isLeftFrozenCol = col < frozenColCount;
+    const isTopFrozenRow = row < frozenRowCount;
+    const isRightFrozenCol = col >= (t.colCount - rightFrozenColCount);
+    const isBottomFrozenRow = row >= (t.rowCount - bottomFrozenRowCount);
+    let hVisible = false;
+    if (isLeftFrozenCol) {
+        hVisible = cx <= frozenW + tol;
+    } else if (isRightFrozenCol) {
+        hVisible = cx >= (cw - rightFrozenW - tol) && cx <= (cw + tol);
+    } else {
+        hVisible = (cx >= frozenW - tol) && (cx <= (cw - rightFrozenW + tol));
+    }
+    let vVisible = false;
+    if (isTopFrozenRow) {
+        vVisible = cy <= frozenH + tol;
+    } else if (isBottomFrozenRow) {
+        vVisible = cy >= (ch - bottomFrozenH - tol) && cy <= (ch + tol);
+    } else {
+        vVisible = (cy >= frozenH - tol) && (cy <= (ch - bottomFrozenH + tol));
+    }
+    return hVisible && vVisible;
 })({col}, {row});
 """
 
@@ -431,6 +454,8 @@ return (function(col0, row0, col1, row1){
   if (!t) return null;
   const minCol = Math.min(col0, col1), maxCol = Math.max(col0, col1);
   const minRow = Math.min(row0, row1), maxRow = Math.max(row0, row1);
+  // 行优先 2D 矩阵:values[r-minRow][c-minCol] = {v, err},坐标由 min*/索引推导,
+  // 避免每格重复输出 c/r(省 ~15% 体积)
   const values = [];
   for (let r = minRow; r <= maxRow; r++) {
     const line = [];
@@ -438,7 +463,7 @@ return (function(col0, row0, col1, row1){
       let v = null, err = null;
       try { v = t.getCellValue ? t.getCellValue(c, r) : null; }
       catch (e) { err = String(e); }
-      line.push({ c, r, v, err });
+      line.push({ v, err });
     }
     values.push(line);
   }
@@ -453,10 +478,18 @@ return (function(){
   if (!t) return null;
   const meta = {};
   const keys = ['rowCount','colCount','frozenRowCount','frozenColCount',
-                'headerRowCount','bottomFrozenRowCount','rightFrozenColCount','theme'];
+                'headerRowCount','bottomFrozenRowCount','rightFrozenColCount'];
   for (const k of keys) {
     try { if (t[k] !== undefined) meta[k] = t[k]; } catch (e) {}
   }
+  // theme 全量体积大(5KB+)且 AI 不需要;只留主题名与默认字号摘要
+  try {
+    const th = t.theme || {};
+    meta.theme = {
+      name: typeof th.name === 'string' ? th.name : null,
+      fontSize: (th._defaultStyle && th._defaultStyle.fontSize) ?? (th.defaultStyle && th.defaultStyle.fontSize) ?? null,
+    };
+  } catch (e) {}
   if (Array.isArray(t.records)) meta.records = t.records.length;
   if (typeof t.getRecords === 'function') {
     try { meta.records = t.getRecords().length; } catch (e) {}
@@ -820,7 +853,7 @@ return (function(options, unused){
             const fingerprint = [name, x1, y1, x2, y2].join('|');
             if (!seenTargets.has(fingerprint)) {
               seenTargets.add(fingerprint);
-              targets.push({name, function: fn, node_type: type || null, cursor: cursor || null, confidence: 'confirmed', evidence: knownFunction ? ['scenegraph-function'] : (pointer ? ['scenegraph-cursor:pointer'] : ['scenegraph-control']), box: {x: x1, y: y1, width, height}, center: {x: (x1 + x2) / 2, y: (y1 + y2) / 2}});
+              targets.push({name, function: fn, confidence: 'confirmed', evidence: knownFunction ? ['scenegraph-function'] : (pointer ? ['scenegraph-cursor:pointer'] : ['scenegraph-control']), box: {x: x1, y: y1, width, height}, center: {x: (x1 + x2) / 2, y: (y1 + y2) / 2}});
             }
           }
         }

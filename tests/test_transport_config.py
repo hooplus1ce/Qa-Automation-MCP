@@ -80,7 +80,7 @@ class TransportConfigTests(unittest.TestCase):
             )
         values = dict(line.split("=", 1) for _, line in assignments)
 
-        self.assertEqual(values["QA_AUTOMATION_WORKSPACE_ROOT"], ".")
+        self.assertEqual(values["QA_AUTOMATION_PROJECT_ROOT"], ".")
         self.assertEqual(
             values["QA_AUTOMATION_ARTIFACT_ROOT"],
             ".qa-automation",

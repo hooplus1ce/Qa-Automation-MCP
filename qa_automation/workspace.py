@@ -21,13 +21,24 @@ _WINDOWS_RESERVED_NAMES = {
 def workspace_root() -> Path:
     """Return the project root currently using this MCP service."""
     current = Path.cwd().resolve()
-    configured = os.getenv("QA_AUTOMATION_WORKSPACE_ROOT", ".").strip() or "."
+    # 统一使用 QA_AUTOMATION_PROJECT_ROOT（支持绝对路径或相对路径，兼容历史别名），默认回退到当前工作目录 .
+    configured = (
+        os.getenv("QA_AUTOMATION_PROJECT_ROOT", "").strip()
+        or os.getenv("QA_AUTOMATION_PROJECT_DIR", "").strip()
+        or os.getenv("QA_AUTOMATION_WORKSPACE_ROOT", "").strip()
+        or "."
+    )
     root = Path(configured).expanduser()
     if not root.is_absolute():
         root = current / root
     root = root.resolve()
+    if not root.exists():
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
     if not root.is_dir():
-        raise ValueError(f"MCP consumer workspace is not a directory: {root}")
+        raise ValueError(f"MCP consumer project root is not a directory: {root}")
     return root
 
 

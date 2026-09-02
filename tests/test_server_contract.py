@@ -7,7 +7,7 @@ import unittest
 from fastmcp import Client
 
 from qa_automation.mcp import server
-from qa_automation.mcp.servers import browser, ui, vtable
+from qa_automation.mcp.servers import browser, tencent_docs, ui, vtable
 
 
 class ServerContractTests(unittest.IsolatedAsyncioTestCase):
@@ -19,14 +19,17 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         browser_names = await tool_names(browser.create_server())
         ui_names = await tool_names(ui.create_server())
         vtable_names = await tool_names(vtable.create_server())
+        tencent_docs_names = await tool_names(tencent_docs.create_server())
         root_names = await tool_names(server.mcp)
 
         self.assertIn("browser_start", browser_names)
         self.assertIn("browser_login", browser_names)
         self.assertIn("ui_interact", ui_names)
         self.assertIn("vtable_analysis", vtable_names)
+        self.assertIn("update_test_case_result", tencent_docs_names)
         self.assertTrue(browser_names <= root_names)
         self.assertTrue(ui_names <= root_names)
+        self.assertTrue(tencent_docs_names <= root_names)
         self.assertTrue(vtable_names <= root_names)
         self.assertNotIn("browser.browser_start", root_names)
 
@@ -236,6 +239,57 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["start_x"], 100.0)
             self.assertEqual(kwargs["end_x"], 300.0)
             self.assertEqual(kwargs["steps"], 24)
+
+    async def test_update_test_case_result_schema_and_dispatch(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        async with Client(server.mcp) as client:
+            tools = {tool.name: tool for tool in await client.list_tools()}
+            self.assertIn("update_test_case_result", tools)
+            schema = tools["update_test_case_result"].inputSchema
+            props = schema["properties"]
+            self.assertEqual(
+                set(props.keys()),
+                {"file_id", "sheet_id", "case_id", "test_result", "executor", "execution_date"},
+            )
+            self.assertEqual(
+                schema["required"],
+                ["file_id", "sheet_id", "case_id", "test_result", "executor"],
+            )
+
+        mock_call = AsyncMock()
+        mock_call.side_effect = [
+            {"csv_data": "用例编号,级别,测试结果,执行人,执行时间"},
+            {"csv_data": "用例编号\nAPS_JCPZ_0001\nAPS_JCPZ_0758\nAPS_JCPZ_0759"},
+            {"error": ""},
+        ]
+
+        with patch("qa_automation.mcp.servers.tencent_docs._call_mcp_tool", mock_call):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool(
+                    "update_test_case_result",
+                    {
+                        "file_id": "mock_file",
+                        "sheet_id": "mock_sheet",
+                        "case_id": "APS_JCPZ_0758",
+                        "test_result": "通过",
+                        "executor": "Hoo",
+                    },
+                )
+
+            self.assertIsNotNone(result.structured_content)
+            data = result.structured_content
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["case_id"], "APS_JCPZ_0758")
+            self.assertEqual(data["row_index"], 2)
+            self.assertEqual(data["row_number"], 3)
+            self.assertEqual(data["updated_fields"]["测试结果"], "通过")
+            self.assertEqual(data["updated_fields"]["执行人"], "Hoo")
+            self.assertTrue(data["updated_fields"]["执行时间"])
+            self.assertEqual(data["columns_resolved"]["用例编号"], 0)
+            self.assertEqual(data["columns_resolved"]["测试结果"], 2)
+            self.assertEqual(data["columns_resolved"]["执行人"], 3)
+            self.assertEqual(data["columns_resolved"]["执行时间"], 4)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

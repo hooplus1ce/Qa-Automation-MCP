@@ -33,6 +33,7 @@ from .browser import (
     _start_browser_impl,
     _state,
     _wait_for_cdp,
+    browser_login,
     browser_session,
     close_browser,
     connect_browser,
@@ -40,7 +41,6 @@ from .browser import (
     launch_chrome,
     list_pages,
     open_url,
-    browser_login,
     select_page,
     set_page_preference_probe,
     start_browser,
@@ -110,6 +110,7 @@ from .config import (
     OVERLAY_RESULT_LIMIT,
     OVERLAY_SETTLE_LIMIT_MS,
     PLAYWRIGHT_INSTALL_HINT,
+    QA_AUTOMATION_PROJECT_ROOT,
     SCROLL_WAIT_RAF,
     SETTLE_MS,
     SHOW_CURSOR,
@@ -144,6 +145,12 @@ from .interaction.snapshot import (
     dom_snapshot,
     page_context,
     screenshot_element,
+)
+from .interaction.typewriter import (
+    calculate_typewriter_delay,
+    typewriter_fill,
+    typewriter_keyboard_type,
+    typewriter_type,
 )
 from .mouse import (
     _WIN_CURSOR_HELPER_SCRIPT,
@@ -212,6 +219,7 @@ __all__ = [
     "NAV_TIMEOUT_MS",
     "OVERLAY_OBSERVER_KEY",
     "OVERLAY_RESULT_LIMIT",
+    "QA_AUTOMATION_PROJECT_ROOT",
     "SHOW_CURSOR",
     "VTABLE_VERIFICATION_STRATEGY",
     "active_profile",
@@ -252,4 +260,9 @@ __all__ = [
     "observe_overlays",
     "dom_snapshot",
     "screenshot_element",
+    # Typewriter Text Input
+    "calculate_typewriter_delay",
+    "typewriter_fill",
+    "typewriter_type",
+    "typewriter_keyboard_type",
 ]

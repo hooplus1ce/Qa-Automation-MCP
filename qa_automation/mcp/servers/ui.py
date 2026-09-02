@@ -86,6 +86,10 @@ def create_server() -> FastMCP:
         本工具使用底层真实事件流（移动至起点 → 按下 mousePressed → 连续 24+ 步平滑细密轨迹移动
         mouseMoved → 释放 mouseReleased），带全流程虚拟光标拖拽可视化，既能完美触发 Canvas 列表内部
         对连续 mousemove 轨迹有严格位移阈值要求的列拖拽重排与调宽，也能通用处理常规 DOM 元素的物理拖放。
+
+        【VTable 列拖拽注意】起点必须落在列标题文字区，切勿选在表头功能图标（排序/筛选/冻结/下拉，
+        坐标见 vtable_analysis 的 header_icons）上：这些图标会拦截 mousedown，导致按住拖动不进入列重排，
+        释放后仅等效一次单击、列序不变。可把起点取在标题文字左端以避开图标。
         """
         return await automation.mouse_drag(
             start_x=start_x,
@@ -212,7 +216,7 @@ def create_server() -> FastMCP:
     async def ui_snapshot(
         selector: str | None = None,
         frame: str | None = None,
-        depth: int | None = None,
+        depth: int = 6,
         boxes: bool = True,
         ai_mode: bool = True,
     ) -> dict:

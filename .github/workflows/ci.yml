@@ -44,7 +44,7 @@ jobs:
       - name: Unit tests
         run: uv run python -m unittest discover -s tests -v
         env:
-          QA_AUTOMATION_WORKSPACE_ROOT: .
+          QA_AUTOMATION_PROJECT_ROOT: .
 
   e2e:
     # 真实 APS 页面契约测试:不随 push/pr 运行,仅手动触发,
@@ -91,5 +91,5 @@ jobs:
           APS_E2E_DETAIL: ${{ inputs.run_detail && '1' || '0' }}
           APS_DETAIL_RUN: ${{ inputs.run_detail && '1' || '0' }}
           APS_CDP_URL: ${{ inputs.aps_cdp_url || 'http://127.0.0.1:9222' }}
-          QA_AUTOMATION_WORKSPACE_ROOT: .
+          QA_AUTOMATION_PROJECT_ROOT: .
         run: uv run python -m unittest -v tests.e2e.aps_clean_changeover_spec

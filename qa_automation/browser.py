@@ -343,7 +343,7 @@ async def _frame_context_details(page: Page, frame: Frame) -> dict[str, Any]:
     try:
         element = await frame.frame_element()
         attrs = await element.evaluate(
-            "(el) => ({id: el.id || '', name: el.getAttribute('name') || '', src: el.getAttribute('src') || ''})"
+            "(el) => ({id: el.id || '', name: el.getAttribute('name') || ''})"
         )
         details["iframe"] = attrs
     except Exception:
@@ -1230,7 +1230,6 @@ async def _browser_login_impl(
         # Wait for outcome: either URL navigates to /static/admin or an error notification appears
         start_t = time.monotonic()
         login_ok = False
-        has_error = False
 
         while time.monotonic() - start_t < 4.0:
             if "login" not in page.url and ("static/admin" in page.url or "scm" in page.url):
@@ -1242,7 +1241,6 @@ async def _browser_login_impl(
             if await err_msg.count() > 0 and await err_msg.first.is_visible():
                 err_text = await err_msg.first.inner_text()
                 if "验证码" in err_text or "错误" in err_text:
-                    has_error = True
                     break
             await page.wait_for_timeout(300)
 

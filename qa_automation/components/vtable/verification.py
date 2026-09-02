@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
 
-from ...browser import _page_viewport_size
+from ...browser import _frame_page_offset, _page_viewport_size
 from ...config import VTABLE_VERIFICATION_STRATEGY
 from .binding import _wrap2, cell_center
 from .scripts import CELL_VISUAL_STATE
@@ -98,6 +98,104 @@ async def _cell_screenshot(
     except Exception:
         return None
 
+async def _inspect_inline_editor(page: Page, frame: Frame) -> dict[str, Any] | None:
+    """Extract interactive inline editor controls (inputs, suffix/prefix icons, buttons) within VTable."""
+    try:
+        offset = await _frame_page_offset(page, frame)
+        return await frame.evaluate(
+            r"""(offset) => {
+                const t = window._vtable;
+                if (!t || !t.editorManager || !t.editorManager.editingEditor) return null;
+                const vtableEl = t.getElement ? t.getElement() : document.querySelector('.vtable');
+                if (!vtableEl) return null;
+
+                const inputs = [];
+                const inputNodes = Array.from(vtableEl.querySelectorAll('input:not(.table-focus-control):not([type="hidden"]), textarea')).filter(el => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                });
+                for (const inp of inputNodes) {
+                    const r = inp.getBoundingClientRect();
+                    inputs.push({
+                        kind: 'input',
+                        tag: inp.tagName.toLowerCase(),
+                        type: inp.type || 'text',
+                        value: inp.value || '',
+                        placeholder: inp.placeholder || '',
+                        box: {
+                            x: Math.round(r.x + offset.x),
+                            y: Math.round(r.y + offset.y),
+                            width: Math.round(r.width),
+                            height: Math.round(r.height)
+                        },
+                        point: {
+                            x: +(r.x + r.width / 2 + offset.x).toFixed(1),
+                            y: +(r.y + r.height / 2 + offset.y).toFixed(1)
+                        }
+                    });
+                }
+
+                const candidates = Array.from(vtableEl.querySelectorAll('div, span, button, i, svg')).filter(el => {
+                    if (el.closest('.input-container') || el.tagName.toLowerCase() === 'canvas') return false;
+                    const style = getComputedStyle(el);
+                    const hasPointer = style.cursor === 'pointer' || el.classList.contains('anticon') || el.tagName.toLowerCase() === 'button';
+                    if (!hasPointer) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 5 && r.height > 5 && r.width < 120 && r.height < 120;
+                });
+
+                const elements = [];
+                for (const el of candidates) {
+                    const icon = el.querySelector('i, svg') || (el.tagName.toLowerCase() === 'i' || el.tagName.toLowerCase() === 'svg' ? el : null);
+                    const isIcon = el.classList.contains('anticon') || el.tagName.toLowerCase() === 'i' || el.tagName.toLowerCase() === 'svg';
+                    const isButton = el.tagName.toLowerCase() === 'button';
+                    const isPointer = el.children.length <= 1 && getComputedStyle(el).cursor === 'pointer';
+                    if (isIcon || isButton || isPointer) {
+                        const r = el.getBoundingClientRect();
+                        let name = 'action';
+                        const cls = (el.className || '') + ' ' + (icon ? icon.className || '' : '');
+                        if (/search/.test(cls)) name = 'search';
+                        else if (/close|clear/.test(cls)) name = 'clear';
+                        else if (/down|arrow/.test(cls)) name = 'dropdown';
+                        else if (/calendar|date/.test(cls)) name = 'date';
+                        else if (el.innerText && el.innerText.trim()) name = el.innerText.trim();
+
+                        elements.push({
+                            kind: isButton ? 'button' : (isIcon ? 'icon' : 'clickable'),
+                            name: name,
+                            class_name: String(el.className || (icon ? icon.className : '') || '').slice(0, 100),
+                            box: {
+                                x: Math.round(r.x + offset.x),
+                                y: Math.round(r.y + offset.y),
+                                width: Math.round(r.width),
+                                height: Math.round(r.height)
+                            },
+                            point: {
+                                x: +(r.x + r.width / 2 + offset.x).toFixed(1),
+                                y: +(r.y + r.height / 2 + offset.y).toFixed(1)
+                            }
+                        });
+                    }
+                }
+
+                const deduped = [];
+                for (const item of elements) {
+                    if (!deduped.some(d => Math.abs(d.point.x - item.point.x) < 5 && Math.abs(d.point.y - item.point.y) < 5)) {
+                        deduped.push(item);
+                    }
+                }
+
+                return {
+                    open: true,
+                    inputs: inputs,
+                    elements: deduped
+                };
+            }""",
+            offset,
+        )
+    except Exception:
+        return None
+
 
 async def _verify_landed(
     page: Page,
@@ -152,6 +250,9 @@ async def _verify_landed(
             and before_screenshot.get("digest") != after_screenshot.get("digest")
         )
     landed = sel_changed or editor_open or target_selected or scenegraph_changed or screenshot_changed
+    inline_editor = None
+    if editor_open:
+        inline_editor = await _inspect_inline_editor(page, frame)
     evidence: dict[str, Any] = {
         "landed": landed,
         "selection_changed": sel_changed,
@@ -159,6 +260,8 @@ async def _verify_landed(
         "target_selected": target_selected,
         "scenegraph_changed": scenegraph_changed,
     }
+    if inline_editor:
+        evidence["inline_editor"] = inline_editor
     if before_visual or after_visual:
         evidence["scenegraph"] = {
             "before_paints": (before_visual or {}).get("paints", []),

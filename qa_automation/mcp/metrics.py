@@ -77,7 +77,14 @@ def instrument_tool(function: Callable[..., Any]) -> Callable[..., Any]:
                 "error": type(error).__name__ if error else None,
             }
             if isinstance(result, dict):
-                result["metrics"] = metric
+                # 注入响应的字段保持最小集;完整明细留在 _recent 供 metrics_snapshot 聚合
+                result["metrics"] = {
+                    "tool": function.__name__,
+                    "elapsed_ms": elapsed_ms,
+                    "response_bytes": response_bytes,
+                    "estimated_context_tokens": math.ceil(response_bytes / 4),
+                    "result_count": _result_count(result),
+                }
             _recent.append(metric)
             item = _summary[function.__name__]
             item["calls"] += 1

@@ -97,6 +97,7 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `vtable_cell_info` | 工具 | 读单元格值/类型/中心点/可见性,交互前后确认 |
 | `vtable_cell_resolve` / `vtable_cell_click_by_field` | 工具 | 用内部 API 将字段+记录索引解析为地址并 trusted 点击 |
 | `vtable_analysis` | 工具 | 一次读取列头/scenegraph 图标/值单元格交互和编辑器证据，返回顶层 viewport 坐标 |
+| `interaction_chain` | 工具 | 交互工具链：传 actions 一次性批量执行 N 个动作（1 次调用替代 N 次往返），链尾统一观察一次（浮层 + URL 变化）；不传时返回紧凑页面分析供 AI 规划 |
 | `ui_click` / `ui_interact` | 工具 | 统一页面交互：CSS → AX → XPath → 视口坐标，支持 AntD Portal 观察 |
 | `ui_screenshot` | 工具 | 按元素定位器或顶层 viewport 矩形截取 PNG/JPEG，返回裁剪框与 base64 图像 |
 | `ui_page_context` / `ui_analyze_scope` | 工具 | 低 token 页面上下文与聚焦层控件分析 |
@@ -333,8 +334,8 @@ QA_AUTOMATION_SHOW_CURSOR=true
 # 单次浮层扫描最多返回的结果数量，至少为 1。
 QA_AUTOMATION_OVERLAY_RESULT_LIMIT=20
 
-# 使用该 MCP 服务的项目根目录；点号表示 Agent 传入的当前 cwd。
-QA_AUTOMATION_WORKSPACE_ROOT=.
+# 所运行的使用方项目根目录；支持绝对路径（脱离 cwd 限制）或点号 . （默认基于当前工作目录）。
+QA_AUTOMATION_PROJECT_ROOT=.
 
 # 下载、截图、会话等产物根目录；相对路径基于使用方项目根目录。
 QA_AUTOMATION_ARTIFACT_ROOT=.qa-automation
@@ -348,8 +349,7 @@ QA_AUTOMATION_DATA_DIR=.qa-automation/data
 | `PYTHONUNBUFFERED` | `1` | 禁用 stdout 缓冲，避免 stdio MCP 消息延迟。 |
 | `QA_AUTOMATION_PROFILE` | `aps-antd` | 选择浏览器页面定位与浮层适配策略；名称不限定使用方项目类型。配置了未知名称时会告警并回退到默认 `aps-antd`,不会导致服务启动失败。 |
 | `QA_AUTOMATION_SHOW_CURSOR` | `true` | 控制浏览器页面中的模拟鼠标指针。 |
-| `QA_AUTOMATION_OVERLAY_RESULT_LIMIT` | `20` | 限制单次浮层扫描返回数量。 |
-| `QA_AUTOMATION_WORKSPACE_ROOT` | `.` | 指向使用该 MCP 服务的项目根目录；相对 Agent `cwd` 解析。 |
+| `QA_AUTOMATION_PROJECT_ROOT` | `.` | 所运行的使用方项目根目录。支持绝对路径（优先级高于 `"cwd": "${workspaceFolder}"`，脱离进程当前工作目录限制）；若配置为 `.` 则基于进程当前 `cwd`。兼容历史别名 `QA_AUTOMATION_WORKSPACE_ROOT`。 |
 | `QA_AUTOMATION_ARTIFACT_ROOT` | `.qa-automation` | 下载、截图、会话和浏览器 Profile 的统一产物根目录。 |
 | `QA_AUTOMATION_DATA_DIR` | `.qa-automation/data` | FastMCPApp 执行记录和表单提交记录目录。 |
 
@@ -421,6 +421,7 @@ QA_AUTOMATION_DATA_DIR=.qa-automation/data
 
 配置核心关注点：
 - `cwd: "${workspaceFolder}"`：仅在跨项目全局配置中生效，指向 Agent 当前打开的使用方项目；
+- `QA_AUTOMATION_PROJECT_ROOT` 环境变量（推荐跨平台通用方案）：对于不支持 `"cwd"` 参数或不支持 `${workspaceFolder}` 变量展开的 Agent 客户端（如部分 CLI 工具或特定 IDE），可在 MCP 配置的 `"env"` 中直接添加 `"QA_AUTOMATION_PROJECT_ROOT": "D:/path/to/project"`，其优先级高于 `cwd`，所有产物均会自动落盘至该指定项目目录下；
 - `uv run --project D:/Developer/Hoolinks/Qa-Automation-MCP`：指定 MCP 依赖和源码；
 - `fastmcp run D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json`：官方声明式入口。
 当前 FastMCP 3.4.6 的 filesystem source 实际相对进程 `cwd` 解析，而不是按配置

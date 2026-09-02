@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +27,12 @@ from ..mouse import _ensure_cursor_helper, _smooth_mouse_move_to
 from .contract import _interaction_contract
 from .locator import _find_interaction_locator, _perform_antd_select
 from .snapshot import _focused_editable
+from .typewriter import (
+    calculate_typewriter_delay,
+    typewriter_fill,
+    typewriter_keyboard_type,
+    typewriter_type,
+)
 
 
 async def _perform_dom_action(
@@ -43,34 +50,47 @@ async def _perform_dom_action(
     center_x: float | None = None
     center_y: float | None = None
     if action in {"click", "dblclick", "rightclick", "hover"}:
+        target = locator.first
         try:
-            target = locator.first
             await target.scroll_into_view_if_needed(timeout=timeout_ms)
+            # 等待滚动及排版轻微稳定
+            await asyncio.sleep(0.04)
             box = await target.bounding_box()
+            if not box:
+                await asyncio.sleep(0.04)
+                box = await target.bounding_box()
             if box and box["width"] > 0 and box["height"] > 0:
                 center_x = float(box["x"]) + float(box["width"]) / 2
                 center_y = float(box["y"]) + float(box["height"]) / 2
                 await _ensure_cursor_helper(page)
+                # 光标平滑移动并等待停稳 (settle)
                 await _smooth_mouse_move_to(page, center_x, center_y)
-                if SHOW_CURSOR and action in {"click", "dblclick", "rightclick"}:
+        except Exception:
+            pass
+    if action in {"click", "dblclick", "rightclick", "hover"}:
+        try:
+            target = locator.first
+            if action == "hover":
+                await target.hover(**kwargs)
+            else:
+                # 光标已平滑移动并在目标上停稳，此时触发点击按压反馈与涟漪
+                if SHOW_CURSOR and center_x is not None and center_y is not None:
                     try:
                         await page.evaluate(
                             f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({center_x:.1f}, {center_y:.1f}, true, true)"
                         )
                     except Exception:
                         pass
-        except Exception:
-            pass
-    if action in {"click", "dblclick", "rightclick", "hover"}:
-        try:
-            if action == "click":
-                await locator.click(**kwargs)
-            elif action == "dblclick":
-                await locator.dblclick(**kwargs)
-            elif action == "rightclick":
-                await locator.click(button="right", **kwargs)
-            elif action == "hover":
-                await locator.hover(**kwargs)
+                click_kwargs = dict(kwargs)
+                click_kwargs.setdefault(
+                    "delay", 30
+                )  # 真实物理点击持握时间，防止 0ms 瞬间抬起导致前端事件丢失
+                if action == "click":
+                    await target.click(**click_kwargs)
+                elif action == "dblclick":
+                    await target.dblclick(**kwargs)
+                elif action == "rightclick":
+                    await target.click(button="right", **click_kwargs)
         finally:
             if SHOW_CURSOR:
                 try:
@@ -80,10 +100,13 @@ async def _perform_dom_action(
                 except Exception:
                     pass
         return None
-    elif action == "fill":
+    elif action in {"fill", "type"}:
         if value is None:
-            raise ValueError("fill requires value")
-        await locator.fill(value, **kwargs)
+            raise ValueError(f"{action} requires value")
+        if action == "fill":
+            await typewriter_fill(locator, value, timeout_ms=timeout_ms)
+        else:
+            await typewriter_type(locator, value, timeout_ms=timeout_ms)
     elif action == "press":
         if key is None:
             raise ValueError("press requires key")
@@ -117,7 +140,7 @@ async def _perform_dom_action(
     else:
         raise ValueError(
             f"Unsupported DOM action: {action!r}. Expected click, dblclick, "
-            "rightclick, hover, fill, press, check, uncheck or select."
+            "rightclick, hover, fill, type, press, check, uncheck or select."
         )
     return None
 
@@ -221,6 +244,7 @@ async def _dom_interact_impl(
             focused_before = await _focused_editable(page)
 
         from ..components.vtable.analysis import _analysis_cache
+
         if analysis_id is not None:
             cached = _analysis_cache.get(analysis_id)
             if cached is None:
@@ -235,23 +259,27 @@ async def _dom_interact_impl(
                     break
             if target_frame_obj is None:
                 from ..components.vtable.binding import vtable_frame
+
                 target_frame_obj = await vtable_frame(page)
             table_idx = cached.get("table_index")
             if table_idx is None and "table_index" in cached.get("options", {}):
                 table_idx = cached["options"]["table_index"]
             from ..components.vtable.binding import _wrap2, ensure_vtable
+
             try:
                 await ensure_vtable(target_frame_obj, table_idx)
             except Exception:
                 pass
             from ..components.vtable.scripts import VTABLE_ANALYSIS
-            raw = await target_frame_obj.evaluate(_wrap2(VTABLE_ANALYSIS), [cached["options"], None])
+
+            raw = await target_frame_obj.evaluate(
+                _wrap2(VTABLE_ANALYSIS), [cached["options"], None]
+            )
             if not raw or "error" in raw:
                 raise ValueError("scenegraph or canvas unavailable")
             from ..components.vtable.analysis import _analysis_layout_signature
-            sig = _analysis_layout_signature(
-                raw, cached["frame_id"], table_idx
-            )
+
+            sig = _analysis_layout_signature(raw, cached["frame_id"], table_idx)
             if sig != cached["signature"]:
                 response = {
                     "status": "failed",
@@ -267,12 +295,9 @@ async def _dom_interact_impl(
                 _arm_overlay_init_script,
                 _install_overlay_observers,
             )
-            listener, _ = await _acquire_overlay_frame_listener(
-                page, persistent=False
-            )
-            await _arm_overlay_init_script(
-                page, settle_ms=settle_ms, persistent=False
-            )
+
+            listener, _ = await _acquire_overlay_frame_listener(page, persistent=False)
+            await _arm_overlay_init_script(page, settle_ms=settle_ms, persistent=False)
             installed = await _install_overlay_observers(page, reset=True)
 
         locator = target_frame = locator_source = None
@@ -296,19 +321,48 @@ async def _dom_interact_impl(
                     raise
 
         if locator is None:
-            # 坐标回退只对点击类动作有意义,避免 fill/press 等被静默降级成点击
-            if action not in {"click", "dblclick", "rightclick", "hover"}:
+            # 坐标回退支持点击类动作与打字机输入动作
+            if action in {"fill", "type"}:
+                if value is None:
+                    raise ValueError(f"{action} requires value")
+                from ..components.vtable import _trusted_viewport_click
+
+                clicked = await _trusted_viewport_click(page, float(x), float(y))
+                if clicked["status"] != "ok":
+                    raise ValueError(clicked.get("reason", "coordinate click to focus failed"))
+                await typewriter_keyboard_type(page, value, clear_first=(action == "fill"))
+                response = {
+                    "status": "acted",
+                    "page_id": _page_id(page),
+                    "action": action,
+                    "frame": _frame_details(page, page.main_frame),
+                    "point": {"x": float(x), "y": float(y)},
+                    "coordinate_space": "top-page-viewport-css-pixels",
+                    "input": "playwright-keyboard-typewriter",
+                }
+            elif action not in {"click", "dblclick", "rightclick", "hover"}:
                 raise ValueError(
                     f"action {action!r} requires a locator; coordinate fallback "
-                    "only supports click, dblclick, rightclick and hover"
+                    "only supports click, dblclick, rightclick, hover, fill and type"
                 )
-            if action == "hover":
+            elif action == "hover":
                 from ..components.vtable import _trusted_viewport_hover
+
                 act_res = await _trusted_viewport_hover(page, float(x), float(y))
                 if act_res["status"] != "ok":
                     raise ValueError(act_res.get("reason", "coordinate hover failed"))
+                response = {
+                    "status": "acted",
+                    "page_id": _page_id(page),
+                    "action": action,
+                    "frame": _frame_details(page, page.main_frame),
+                    "point": {"x": float(x), "y": float(y)},
+                    "coordinate_space": "top-page-viewport-css-pixels",
+                    "input": "playwright-mouse",
+                }
             else:
                 from ..components.vtable import _trusted_viewport_click
+
                 clicked = await _trusted_viewport_click(
                     page,
                     float(x),
@@ -318,15 +372,15 @@ async def _dom_interact_impl(
                 )
                 if clicked["status"] != "ok":
                     raise ValueError(clicked.get("reason", "coordinate click failed"))
-            response = {
-                "status": "acted",
-                "page_id": _page_id(page),
-                "action": action,
-                "frame": _frame_details(page, page.main_frame),
-                "point": {"x": float(x), "y": float(y)},
-                "coordinate_space": "top-page-viewport-css-pixels",
-                "input": "playwright-mouse",
-            }
+                response = {
+                    "status": "acted",
+                    "page_id": _page_id(page),
+                    "action": action,
+                    "frame": _frame_details(page, page.main_frame),
+                    "point": {"x": float(x), "y": float(y)},
+                    "coordinate_space": "top-page-viewport-css-pixels",
+                    "input": "playwright-mouse",
+                }
         else:
             action_detail = await _perform_dom_action(
                 page,
@@ -375,6 +429,7 @@ async def _dom_interact_impl(
     finally:
         if installed is not None:
             from ..overlay import _finalize_overlay_observation
+
             await _finalize_overlay_observation(
                 page, installed, response, settle_ms=settle_ms, max_results=max_results
             )
@@ -383,11 +438,10 @@ async def _dom_interact_impl(
                 _release_overlay_frame_listener,
                 _stop_overlay_observers_best_effort,
             )
+
             cleanup_errors = await _stop_overlay_observers_best_effort(page)
             cleanup_errors.extend(
-                await _release_overlay_frame_listener(
-                    page, listener, persistent=False
-                )
+                await _release_overlay_frame_listener(page, listener, persistent=False)
             )
             if cleanup_errors:
                 response["observer_errors"] = cleanup_errors
@@ -430,7 +484,9 @@ async def _dom_interact_impl(
         },
         before_state={
             "focused_editable": focused_before,
-            "visible_overlay_count": len(installed.get("baseline") or []) if installed else len(response.get("baseline") or []),
+            "visible_overlay_count": len(installed.get("baseline") or [])
+            if installed
+            else len(response.get("baseline") or []),
         },
         after_state={
             "focused_editable": focused_after,
@@ -515,12 +571,14 @@ async def mouse_drag(
                 _arm_overlay_init_script,
                 _install_overlay_observers,
             )
+
             listener, _ = await _acquire_overlay_frame_listener(page, persistent=False)
             await _arm_overlay_init_script(page, settle_ms=settle_ms, persistent=False)
             installed = await _install_overlay_observers(page, reset=True)
         result: dict[str, Any] = {}
         try:
             from ..mouse import _mouse_drag_impl
+
             result = await _mouse_drag_impl(
                 page,
                 start_x,
@@ -536,6 +594,7 @@ async def mouse_drag(
         finally:
             if installed is not None:
                 from ..overlay import _finalize_overlay_observation
+
                 await _finalize_overlay_observation(
                     page, installed, result, settle_ms=settle_ms, max_results=max_results
                 )
@@ -544,6 +603,18 @@ async def mouse_drag(
                     _release_overlay_frame_listener,
                     _stop_overlay_observers_best_effort,
                 )
+
                 await _stop_overlay_observers_best_effort(page)
                 await _release_overlay_frame_listener(page, listener, persistent=False)
         return result
+
+
+__all__ = [
+    "calculate_typewriter_delay",
+    "click_dom",
+    "dom_interact",
+    "mouse_drag",
+    "typewriter_fill",
+    "typewriter_keyboard_type",
+    "typewriter_type",
+]

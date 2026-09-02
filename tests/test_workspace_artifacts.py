@@ -40,6 +40,55 @@ class WorkspacePathTests(unittest.TestCase):
                 root / ".qa-automation" / "outputs" / "result.json",
             )
 
+    def test_project_root_env_precedes_cwd_and_workspace_root(self) -> None:
+        with TemporaryDirectory() as mcp_dir, TemporaryDirectory() as project_dir:
+            # Process cwd is mcp_dir, but QA_AUTOMATION_PROJECT_ROOT points to project_dir
+            with chdir(mcp_dir), patch.dict(
+                "os.environ",
+                {
+                    "QA_AUTOMATION_PROJECT_ROOT": project_dir,
+                    "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                    "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+                    "QA_AUTOMATION_DATA_DIR": ".qa-automation/data",
+                },
+            ):
+                expected_root = Path(project_dir).resolve()
+                mcp_root = Path(mcp_dir).resolve()
+
+                self.assertNotEqual(expected_root, mcp_root)
+                self.assertEqual(workspace_root(), expected_root)
+                self.assertEqual(data_dir(), expected_root / ".qa-automation" / "data")
+                self.assertEqual(
+                    artifact_file("screenshots", "test.png", fallback="screenshot.png"),
+                    expected_root / ".qa-automation" / "screenshots" / "test.png",
+                )
+
+    def test_project_dir_alias_precedes_cwd(self) -> None:
+        with TemporaryDirectory() as mcp_dir, TemporaryDirectory() as project_dir:
+            with chdir(mcp_dir), patch.dict(
+                "os.environ",
+                {
+                    "QA_AUTOMATION_PROJECT_ROOT": "",
+                    "QA_AUTOMATION_PROJECT_DIR": project_dir,
+                    "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                },
+            ):
+                expected_root = Path(project_dir).resolve()
+                self.assertEqual(workspace_root(), expected_root)
+    def test_workspace_root_legacy_alias_compatibility(self) -> None:
+        with TemporaryDirectory() as mcp_dir, TemporaryDirectory() as project_dir:
+            with chdir(mcp_dir), patch.dict(
+                "os.environ",
+                {
+                    "QA_AUTOMATION_PROJECT_ROOT": "",
+                    "QA_AUTOMATION_PROJECT_DIR": "",
+                    "QA_AUTOMATION_WORKSPACE_ROOT": project_dir,
+                },
+            ):
+                expected_root = Path(project_dir).resolve()
+                self.assertEqual(workspace_root(), expected_root)
+
+
     def test_workspace_paths_reject_parent_escape(self) -> None:
         with TemporaryDirectory() as directory, chdir(directory), patch.dict(
             "os.environ", {"QA_AUTOMATION_WORKSPACE_ROOT": "."}

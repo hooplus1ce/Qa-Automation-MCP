@@ -53,6 +53,18 @@ def _interaction_contract(
         if ch.get("selector") and ch.get("kind") in {"dialog", "drawer", "dropdown"}:
             summary["selector"] = ch.get("selector")
         changes.append(summary)
+    inline_editor = response.get("inline_editor")
+    if inline_editor and isinstance(inline_editor, dict):
+        for el in inline_editor.get("elements") or []:
+            changes.append({
+                "kind": f"editor_{el.get('kind', 'element')}",
+                "name": el.get("name"),
+                "event": "mounted",
+                "visible": True,
+                "page_box": el.get("box"),
+                "point": el.get("point"),
+                "class_name": el.get("class_name"),
+            })
     if changes:
         response["changes"] = changes
     if compact:
@@ -67,5 +79,7 @@ def _interaction_contract(
         focus = (response.get("context") or {}).get("focus_layer")
         if focus:
             compact_res["focus_layer"] = focus
+        if inline_editor:
+            compact_res["inline_editor"] = inline_editor
         return compact_res
     return response

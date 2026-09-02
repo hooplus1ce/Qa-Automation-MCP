@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastmcp import FastMCP
 from fastmcp.apps.approval import Approval
 from fastmcp.apps.choice import Choice
 from fastmcp.apps.file_upload import FileUpload
 from fastmcp.apps.generative import GenerativeUI
+from fastmcp.server.providers.skills import SkillsDirectoryProvider
 
 from qa_automation.mcp.apps.provider import create_app
 from qa_automation.mcp.resources import vtable as vtable_resources
-from qa_automation.mcp.servers import browser, demos, diagnostics, ui, vtable
+from qa_automation.mcp.servers import (
+    browser,
+    chain,
+    demos,
+    diagnostics,
+    tencent_docs,
+    ui,
+    vtable,
+)
 
 
 def create_server() -> FastMCP:
@@ -21,16 +32,22 @@ def create_server() -> FastMCP:
     server.add_provider(FileUpload())
     server.add_provider(GenerativeUI())
 
+    skills_dir = Path(__file__).resolve().parent.parent.parent / "skills"
+    server.add_provider(SkillsDirectoryProvider(roots=skills_dir, reload=True))
+
     for module in (
         vtable_resources,
         demos,
         browser,
         ui,
         vtable,
+        chain,
         diagnostics,
+        tencent_docs,
     ):
         server.mount(module.create_server())
     return server
+
 
 mcp = create_server()
 

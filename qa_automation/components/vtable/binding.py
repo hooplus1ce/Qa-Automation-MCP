@@ -202,13 +202,45 @@ async def ensure_cell_visible(page: Page, frame: Frame, col: int, row: int) -> b
     if await cell_visible(frame, col, row):
         return True
     await frame.evaluate(
-        f"() => {{ const t = window._vtable; "
-        f"if (t && t.scrollToCell) t.scrollToCell({{col: {col}, row: {row}}}); return true; }}"
+        """([col, row]) => {
+            const t = window._vtable;
+            if (!t) return false;
+            if (typeof t.scrollToCell === 'function') {
+                t.scrollToCell(col, row);
+                t.scrollToCell({col, row});
+            }
+            const rect = t.getCellRelativeRect ? t.getCellRelativeRect(col, row) : null;
+            if (rect) {
+                const pick = (a, b) => (a !== undefined && a !== null ? a : b);
+                const left = pick(rect.left, pick(rect.x1, rect.bounds && rect.bounds.x1));
+                const right = pick(rect.right, pick(rect.x2, rect.bounds && rect.bounds.x2));
+                const canvasRect = t.canvas ? t.canvas.getBoundingClientRect() : {width: 1000};
+                const cw = canvasRect.width;
+                const rightFrozenW = (t.rightFrozenColCount && t.getRightFrozenColsWidth) ? t.getRightFrozenColsWidth() : 0;
+                const frozenW = (t.frozenColCount && t.getFrozenColsWidth) ? t.getFrozenColsWidth() : 0;
+                const isRightFrozen = col >= (t.colCount - (t.rightFrozenColCount || 0));
+                const isLeftFrozen = col < (t.frozenColCount || 0);
+                if (!isRightFrozen && !isLeftFrozen && left !== undefined && right !== undefined) {
+                    const cx = (left + right) / 2;
+                    if (cx > (cw - rightFrozenW)) {
+                        const delta = cx - (cw - rightFrozenW) + 60;
+                        if (t.setScrollLeft) t.setScrollLeft(t.scrollLeft + delta);
+                        else t.scrollLeft += delta;
+                    } else if (cx < frozenW) {
+                        const delta = frozenW - cx + 60;
+                        if (t.setScrollLeft) t.setScrollLeft(Math.max(0, t.scrollLeft - delta));
+                        else t.scrollLeft = Math.max(0, t.scrollLeft - delta);
+                    }
+                }
+            }
+            if (t.render) t.render();
+            return true;
+        }""",
+        [col, row],
     )
     for _ in range(SCROLL_WAIT_RAF):
         await frame.evaluate(_wrap(WAIT_RENDER))
     return await cell_visible(frame, col, row)
-
 
 async def _resolve_vtable_cell_impl(
     field: str, record_index: int | list[int]

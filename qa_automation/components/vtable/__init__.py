@@ -60,6 +60,7 @@ async def _trusted_viewport_click(
     *,
     double_click: bool = False,
     button: str = "left",
+    delay: float = 30.0,
 ) -> dict:
     try:
         x, y = float(x), float(y)
@@ -86,7 +87,7 @@ async def _trusted_viewport_click(
             if double_click:
                 await page.mouse.dblclick(x, y, button=button)
             else:
-                await page.mouse.click(x, y, button=button)
+                await page.mouse.click(x, y, button=button, delay=delay)
         finally:
             if SHOW_CURSOR:
                 try:
@@ -291,6 +292,8 @@ async def _click_cell_impl(
                 "button": button,
                 "verification": evidence,
             }
+            if evidence.get("inline_editor"):
+                response["inline_editor"] = evidence["inline_editor"]
         if observe_after and settle_ms:
             await page.wait_for_timeout(settle_ms)
     except Exception as exc:
