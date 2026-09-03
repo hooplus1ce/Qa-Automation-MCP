@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import unittest
 from contextlib import chdir
 from pathlib import Path
@@ -125,6 +126,7 @@ class WorkspaceArtifactTests(unittest.IsolatedAsyncioTestCase):
 
             output = Path(result["path"])
             self.assertEqual(result["status"], "ok")
+            self.assertNotIn("image_base64", result)
             self.assertEqual(
                 output,
                 Path(directory).resolve()
@@ -132,6 +134,33 @@ class WorkspaceArtifactTests(unittest.IsolatedAsyncioTestCase):
                 / "screenshots"
                 / "viewport.png",
             )
+            self.assertEqual(output.read_bytes(), b"synthetic-png")
+
+    async def test_ui_screenshot_base64_is_opt_in(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ",
+            {
+                "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+            },
+        ):
+            frame = SimpleNamespace(name="", url="about:blank")
+            page = SimpleNamespace(main_frame=frame)
+            page.screenshot = AsyncMock(return_value=b"synthetic-png")
+            with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=page)):
+                result = await snapshot._screenshot_element_impl(
+                    x=0,
+                    y=0,
+                    width=20,
+                    height=10,
+                    include_base64=True,
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(
+                base64.b64decode(result["image_base64"]), b"synthetic-png"
+            )
+            output = Path(result["path"])
             self.assertEqual(output.read_bytes(), b"synthetic-png")
 
     async def test_browser_download_uses_sanitized_workspace_filename(self) -> None:

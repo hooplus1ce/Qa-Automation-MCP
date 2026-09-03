@@ -99,7 +99,7 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `vtable_analysis` | 工具 | 一次读取列头/scenegraph 图标/值单元格交互和编辑器证据，返回顶层 viewport 坐标 |
 | `interaction_chain` | 工具 | 交互工具链：传 actions 一次性批量执行 N 个动作（1 次调用替代 N 次往返），链尾统一观察一次（浮层 + URL 变化）；不传时返回紧凑页面分析供 AI 规划 |
 | `ui_click` / `ui_interact` | 工具 | 统一页面交互：CSS → AX → XPath → 视口坐标，支持 AntD Portal 观察 |
-| `ui_screenshot` | 工具 | 按元素定位器或顶层 viewport 矩形截取 PNG/JPEG，返回裁剪框与 base64 图像 |
+| `ui_screenshot` | 工具 | 按元素定位器或顶层 viewport 矩形截取 PNG/JPEG 并保存到 `.qa-automation/screenshots/`，返回文件路径（不再回传整图 base64） |
 | `ui_page_context` / `ui_analyze_scope` | 工具 | 低 token 页面上下文与聚焦层控件分析 |
 | `overlay_scan` / `overlay_observe` | 工具 | 当前活动范围的浮层快照与事件监听 |
 | `ui_snapshot` | 工具 | aria 快照(mode='ai' + boxes):AI 的"语义之眼",含 [ref]/[box](支持 `frame`) |
@@ -237,8 +237,10 @@ async with Client(transport) as client:
   但工具栏/弹窗/编辑器输入框全在树里,AI 先读快照再决定交互目标。
 - `ui_screenshot` 使用 Playwright 的页面裁剪能力截取指定元素的实际可见区域；定位器沿用
   `ui_interact` 的 CSS → AX → XPath → text/placeholder 顺序，并支持 `padding`。VTable 单元格
-  或分析返回的坐标可传 `x/y/width/height` 做顶层 viewport 截图；默认 `max_bytes=2MB`，避免
-  图像响应无界膨胀上下文。结果提供 `digest`，适合交互前后视觉比对。
+  或分析返回的坐标可传 `x/y/width/height` 做顶层 viewport 截图；默认 `max_bytes=2MB`，
+  超限时返回 failed 且只保留文件。截图一律落盘到 `.qa-automation/screenshots/`，响应只
+  返回文件路径 `path`（不回传 base64），需要看像素时直接打开该文件，避免大图撑爆上下文。
+  结果提供 `digest`，适合交互前后视觉比对。
 - `vtable_meta` / `vtable_read_cells`:先用 VTable 内部 API 读规模
   (rowCount/colCount/冻结行列)与区域值,做到"先看全局再动手"。
 - `vtable_drop_files`:`Locator.drop(payload, position=)`(1.60 新增)模拟 native
@@ -448,8 +450,9 @@ uv run \
 └── browser-profile/  # browser_start 受管 Chrome Profile
 ```
 
-截图结果同时返回 `path` 和受大小限制的 `image_base64`；下载目录优先通过 Chromium
-CDP 配置，并保留 Playwright download 事件持久化作为退路。`browser_session`、
+截图结果落盘到使用方项目工作区 `.qa-automation/screenshots/` 并返回文件路径 `path`，
+不再回传 base64（如集成视觉模型需要像素，可自行读取返回的文件）；下载目录优先通过
+Chromium CDP 配置，并保留 Playwright download 事件持久化作为退路。`browser_session`、
 `vtable_drop_files` 接受工作区内相对或绝对路径，越出使用方项目工作区的路径会被拒绝。
 
 ## 项目结构
@@ -512,7 +515,7 @@ Qa-Automation-MCP/
        `page_box` 视口中心坐标。
 
 截图边界：`ui_screenshot` 只有在客户端明确调用时才执行页面截图，并保存到使用方项目
-工作区的 `.qa-automation/screenshots/`，同时返回文件路径和 base64 图像。普通点击
-不会隐式落盘；VTable 点击校验使用的微型图像只保留在内存。Playwright 页面截图通常
-不会修改 DOM 或滚动页面，但有头硬件加速模式仍可能发生短暂合成器同步；对 VTable
-点击请使用 `verify=False`，需要视觉诊断时再显式调用 `ui_screenshot`。
+工作区的 `.qa-automation/screenshots/`，响应只返回文件路径 `path`（不携带 base64）。
+普通点击不会隐式落盘；VTable 点击校验使用的微型图像只保留在内存。Playwright 页面
+截图通常不会修改 DOM 或滚动页面，但有头硬件加速模式仍可能发生短暂合成器同步；对
+VTable 点击请使用 `verify=False`，需要视觉诊断时再显式调用 `ui_screenshot`。

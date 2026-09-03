@@ -3,6 +3,7 @@
     "qa-automation": {
       "type": "stdio",
       "command": "uv",
+      "cwd": "${workspaceFolder}",
       "args": [
         "run",
         "--project",
@@ -16,6 +17,13 @@
         "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
         "--no-banner"
       ]
+    },
+    "tencent-docs": {
+      "type": "http",
+      "url": "https://docs.qq.com/openapi/mcp",
+      "headers": {
+        "Authorization": "54a4eac855de4696905b562a96e066ff"
+      }
     }
   }
 }

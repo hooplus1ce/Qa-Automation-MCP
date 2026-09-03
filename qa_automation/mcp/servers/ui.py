@@ -262,13 +262,15 @@ def create_server() -> FastMCP:
         timeout_ms: float = 3_000,
         max_bytes: int = 2_000_000,
     ) -> dict:
-        """截取指定 DOM 元素或顶层 viewport 区域并保存到工作区。
+        """截取指定 DOM 元素或顶层 viewport 区域，将图片保存到工作区并返回文件路径。
 
         元素定位顺序与 ui_interact 相同：CSS → AX role/name/description → XPath →
         text/placeholder。frame 未指定时优先活动 iframe。若没有可用定位器，可传
         x/y/width/height 使用顶层 viewport CSS 像素矩形；截图不会静默把 iframe 内坐标
-        当成顶层坐标。结果包含工作区截图路径、base64 图像、裁剪框、frame、定位来源和
-        摘要哈希；filename 只能指定截图目录内的文件名。
+        当成顶层坐标。截图会以 PNG/JPEG 文件保存到 .qa-automation/screenshots/，响应只
+        返回工作区文件路径（path）、裁剪框、frame、定位来源与摘要哈希，不再回传整图
+        base64，避免大图撑爆上下文；需要看像素内容时直接打开 path 对应文件即可。
+        filename 只能指定截图目录内的文件名。
         """
         return await automation.screenshot_element(
             role=role,

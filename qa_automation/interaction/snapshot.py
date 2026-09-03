@@ -394,6 +394,7 @@ async def _screenshot_element_impl(
     quality: int | None = None,
     timeout_ms: float = 3_000,
     max_bytes: int = 2_000_000,
+    include_base64: bool = False,
 ) -> dict[str, Any]:
     if image_format not in {"png", "jpeg"}:
         raise ValueError("image_format must be 'png' or 'jpeg'")
@@ -483,9 +484,8 @@ async def _screenshot_element_impl(
             "clip": {key: round(value, 2) for key, value in clip.items()},
             "path": str(output_path),
         }
-    return {
+    result: dict[str, Any] = {
         "status": "ok",
-        "image_base64": base64.b64encode(image).decode("ascii"),
         "mime_type": f"image/{image_format}",
         "byte_size": len(image),
         "digest": hashlib.sha256(image).hexdigest()[:16],
@@ -500,6 +500,9 @@ async def _screenshot_element_impl(
             "name": name,
         } if locator_source else None,
     }
+    if include_base64:
+        result["image_base64"] = base64.b64encode(image).decode("ascii")
+    return result
 
 
 async def screenshot_element(**kwargs: Any) -> dict[str, Any]:
