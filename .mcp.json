@@ -3,7 +3,6 @@
     "qa-automation": {
       "type": "stdio",
       "command": "uv",
-      "cwd": "${workspaceFolder}",
       "args": [
         "run",
         "--project",
