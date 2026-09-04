@@ -35,6 +35,70 @@ from .typewriter import (
 )
 
 
+async def _stable_locator_click(
+    page: Page,
+    target: Any,
+    *,
+    double_click: bool = False,
+    button: str = "left",
+    timeout_ms: float = 3_000,
+) -> None:
+    """Move once to a settled target, then click its final trusted coordinates."""
+    deadline = time.monotonic() + max(0.5, timeout_ms / 1000)
+    stable_box: dict[str, float] | None = None
+    for _ in range(4):
+        if time.monotonic() >= deadline:
+            break
+        box = await target.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            await asyncio.sleep(0.016)
+            continue
+        current = {key: float(box[key]) for key in ("x", "y", "width", "height")}
+        center_x = current["x"] + current["width"] / 2
+        center_y = current["y"] + current["height"] / 2
+        await _ensure_cursor_helper(page)
+        await _smooth_mouse_move_to(page, center_x, center_y)
+        settled_box = await target.bounding_box()
+        if not settled_box:
+            continue
+        settled = {
+            key: float(settled_box[key])
+            for key in ("x", "y", "width", "height")
+        }
+        if not all(abs(settled[key] - current[key]) <= 0.75 for key in current):
+            continue
+        stable_box = settled
+        break
+    if stable_box is None:
+        raise RuntimeError("target did not reach a stable visible position")
+    if hasattr(target, "is_enabled") and not await target.is_enabled():
+        raise RuntimeError("target is disabled")
+    x = stable_box["x"] + stable_box["width"] / 2
+    y = stable_box["y"] + stable_box["height"] / 2
+    if SHOW_CURSOR:
+        try:
+            await page.evaluate(
+                f"window.__qa_automation_update_cursor && "
+                f"window.__qa_automation_update_cursor({x:.1f}, {y:.1f}, true, true)"
+            )
+        except Exception:
+            pass
+    try:
+        if double_click:
+            await page.mouse.dblclick(x, y, button=button, delay=30)
+        else:
+            await page.mouse.click(x, y, button=button, delay=30)
+    finally:
+        if SHOW_CURSOR:
+            try:
+                await page.evaluate(
+                    "window.__qa_automation_hide_cursor && "
+                    "window.__qa_automation_hide_cursor(150)"
+                )
+            except Exception:
+                pass
+
+
 async def _perform_dom_action(
     page: Page,
     target_frame: Frame,
@@ -47,60 +111,31 @@ async def _perform_dom_action(
 ) -> dict[str, Any] | None:
     action = action.lower().strip()
     kwargs = {"timeout": timeout_ms}
-    center_x: float | None = None
-    center_y: float | None = None
-    if action in {"click", "dblclick", "rightclick", "hover"}:
+    if action in {"click", "dblclick", "rightclick"}:
         target = locator.first
-        try:
-            await target.scroll_into_view_if_needed(timeout=timeout_ms)
-            # 等待滚动及排版轻微稳定
-            await asyncio.sleep(0.04)
-            box = await target.bounding_box()
-            if not box:
-                await asyncio.sleep(0.04)
-                box = await target.bounding_box()
-            if box and box["width"] > 0 and box["height"] > 0:
-                center_x = float(box["x"]) + float(box["width"]) / 2
-                center_y = float(box["y"]) + float(box["height"]) / 2
-                await _ensure_cursor_helper(page)
-                # 光标平滑移动并等待停稳 (settle)
-                await _smooth_mouse_move_to(page, center_x, center_y)
-        except Exception:
-            pass
-    if action in {"click", "dblclick", "rightclick", "hover"}:
-        try:
-            target = locator.first
-            if action == "hover":
-                await target.hover(**kwargs)
-            else:
-                # 光标已平滑移动并在目标上停稳，此时触发点击按压反馈与涟漪
-                if SHOW_CURSOR and center_x is not None and center_y is not None:
-                    try:
-                        await page.evaluate(
-                            f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({center_x:.1f}, {center_y:.1f}, true, true)"
-                        )
-                    except Exception:
-                        pass
-                click_kwargs = dict(kwargs)
-                click_kwargs.setdefault(
-                    "delay", 30
-                )  # 真实物理点击持握时间，防止 0ms 瞬间抬起导致前端事件丢失
-                if action == "click":
-                    await target.click(**click_kwargs)
-                elif action == "dblclick":
-                    await target.dblclick(**kwargs)
-                elif action == "rightclick":
-                    await target.click(button="right", **click_kwargs)
-        finally:
-            if SHOW_CURSOR:
-                try:
-                    await page.evaluate(
-                        "window.__qa_automation_hide_cursor && window.__qa_automation_hide_cursor(150)"
-                    )
-                except Exception:
-                    pass
+        await target.scroll_into_view_if_needed(timeout=timeout_ms)
+        await asyncio.sleep(0.04)
+        await _stable_locator_click(
+            page,
+            target,
+            double_click=action == "dblclick",
+            button="right" if action == "rightclick" else "left",
+            timeout_ms=timeout_ms,
+        )
         return None
-    elif action in {"fill", "type"}:
+    if action == "hover":
+        target = locator.first
+        await target.scroll_into_view_if_needed(timeout=timeout_ms)
+        await asyncio.sleep(0.04)
+        box = await target.bounding_box()
+        if box and box["width"] > 0 and box["height"] > 0:
+            center_x = float(box["x"]) + float(box["width"]) / 2
+            center_y = float(box["y"]) + float(box["height"]) / 2
+            await _ensure_cursor_helper(page)
+            await _smooth_mouse_move_to(page, center_x, center_y)
+        await target.hover(**kwargs)
+        return None
+    if action in {"fill", "type"}:
         if value is None:
             raise ValueError(f"{action} requires value")
         if action == "fill":
@@ -162,7 +197,7 @@ async def _click_dom_impl(
         if description:
             kwargs["description"] = description
         locator = fr.get_by_role(role, **kwargs)
-        await locator.click(timeout=timeout_ms)
+        await _stable_locator_click(page, locator.first, timeout_ms=timeout_ms)
         return {
             "status": "clicked",
             "page_id": _page_id(page),

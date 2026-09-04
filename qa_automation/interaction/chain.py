@@ -210,6 +210,8 @@ async def _execute_one(action: str, item: dict) -> dict:
             button=str(item.get("button", "left")),
             verify=bool(item.get("verify", True)),
             observe_after=False,
+            frame=item.get("frame"),
+            table_index=item.get("table_index"),
         )
         return _trim_result(action, raw)
 
@@ -230,6 +232,8 @@ async def _execute_one(action: str, item: dict) -> dict:
             button=str(item.get("button", "left")),
             verify=bool(item.get("verify", True)),
             observe_after=False,
+            frame=item.get("frame"),
+            table_index=item.get("table_index"),
         )
         return _trim_result(action, raw)
 

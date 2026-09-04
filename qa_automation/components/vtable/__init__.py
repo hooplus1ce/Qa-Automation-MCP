@@ -61,6 +61,7 @@ async def _trusted_viewport_click(
     double_click: bool = False,
     button: str = "left",
     delay: float = 30.0,
+    point_resolver: Any | None = None,
 ) -> dict:
     try:
         x, y = float(x), float(y)
@@ -75,7 +76,12 @@ async def _trusted_viewport_click(
                 f"({viewport['width']:g} x {viewport['height']:g})"
             )
         await _ensure_cursor_helper(page)
-        await _smooth_mouse_move_to(page, x, y)
+        if point_resolver is not None:
+            refreshed = await point_resolver()
+            if refreshed:
+                x, y = float(refreshed["x"]), float(refreshed["y"])
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    raise ValueError("resolved coordinates must be finite numbers")
         if SHOW_CURSOR:
             try:
                 await page.evaluate(
@@ -142,9 +148,23 @@ async def _trusted_viewport_hover(
         return {"status": "failed", "reason": f"hover-error: {e}"}
 
 
-async def _do_click(page: Page, frame: Frame, x: float, y: float, *, double_click: bool, button: str) -> dict:
+async def _do_click(
+    page: Page,
+    frame: Frame,
+    x: float,
+    y: float,
+    *,
+    double_click: bool,
+    button: str,
+    point_resolver: Any | None = None,
+) -> dict:
     result = await _trusted_viewport_click(
-        page, x, y, double_click=double_click, button=button
+        page,
+        x,
+        y,
+        double_click=double_click,
+        button=button,
+        point_resolver=point_resolver,
     )
     if result["status"] == "failed":
         return result
@@ -166,15 +186,21 @@ async def _click_cell_impl(
     settle_ms: int = 300,
     max_results: int = OVERLAY_RESULT_LIMIT,
     headless: bool = True,
+    frame_name: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     if not 0 <= settle_ms <= OVERLAY_SETTLE_LIMIT_MS:
         raise ValueError(f"settle_ms must be between 0 and {OVERLAY_SETTLE_LIMIT_MS}")
     page = await _current_page_impl()
     installed = None
     frame_listener = None
-    frame = await vtable_frame(page)
+    frame = (
+        await resolve_frame(page, frame_name)
+        if frame_name is not None
+        else await vtable_frame(page)
+    )
     try:
-        await ensure_vtable(frame)
+        await ensure_vtable(frame, table_index)
     except Exception as e:
         return {
             "status": "failed",
@@ -260,24 +286,41 @@ async def _click_cell_impl(
 
     response: dict[str, Any]
     try:
-        result = await _do_click(page, frame, x, y, double_click=double_click, button=button)
+        result = await _do_click(
+            page,
+            frame,
+            x,
+            y,
+            double_click=double_click,
+            button=button,
+            point_resolver=lambda: cell_center(page, frame, col, row),
+        )
         if result["status"] == "failed":
             response = {**result, "col": col, "row": row}
         else:
-            landed = True
-            evidence: dict[str, Any] = {}
             if verify:
                 landed, evidence = await _verify_landed(
                     page, frame, before_sel, col, row, before_visual, before_screenshot
                 )
-                retries_used = 0
-                if not landed and VTABLE_VERIFICATION_STRATEGY.retry_count:
-                    await _do_click(page, frame, x, y, double_click=double_click, button=button)
-                    retries_used = 1
-                    landed, evidence = await _verify_landed(
-                        page, frame, before_sel, col, row, before_visual, before_screenshot
-                    )
-                evidence["retries_used"] = retries_used
+            else:
+                landed = True
+                evidence = {"landed": True, "verification_skipped": True}
+            retries_used = 0
+            if verify and not landed and VTABLE_VERIFICATION_STRATEGY.retry_count:
+                await _do_click(
+                    page,
+                    frame,
+                    x,
+                    y,
+                    double_click=double_click,
+                    button=button,
+                    point_resolver=lambda: cell_center(page, frame, col, row),
+                )
+                retries_used = 1
+                landed, evidence = await _verify_landed(
+                    page, frame, before_sel, col, row, before_visual, before_screenshot
+                )
+            evidence["retries_used"] = retries_used
 
             response = {
                 "status": "clicked" if landed else "unverified",
@@ -360,6 +403,8 @@ async def click_cell(
     settle_ms: int = 300,
     max_results: int = OVERLAY_RESULT_LIMIT,
     headless: bool = True,
+    frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     async with _action_lock:
         return await _click_cell_impl(
@@ -372,14 +417,26 @@ async def click_cell(
             settle_ms=settle_ms,
             max_results=max_results,
             headless=headless,
+            frame_name=frame,
+            table_index=table_index,
         )
 
 
-async def _cell_info_impl(col: int, row: int) -> dict:
+async def _cell_info_impl(
+    col: int,
+    row: int,
+    *,
+    frame_name: str | None = None,
+    table_index: int | None = None,
+) -> dict:
     page = await _current_page_impl()
-    frame = await vtable_frame(page)
+    frame = (
+        await resolve_frame(page, frame_name)
+        if frame_name is not None
+        else await vtable_frame(page)
+    )
     try:
-        await ensure_vtable(frame)
+        await ensure_vtable(frame, table_index)
     except Exception as e:
         return {
             "status": "failed",
@@ -387,6 +444,7 @@ async def _cell_info_impl(col: int, row: int) -> dict:
             "page_id": _page_id(page),
             "col": col,
             "row": row,
+            "table_index": table_index,
         }
 
     value = await frame.evaluate(
@@ -399,6 +457,7 @@ async def _cell_info_impl(col: int, row: int) -> dict:
         "status": "ok",
         "page_id": _page_id(page),
         "frame": await _frame_context_details(page, frame),
+        "table_index": table_index,
         "col": col,
         "row": row,
         "value": value,
@@ -409,9 +468,20 @@ async def _cell_info_impl(col: int, row: int) -> dict:
     }
 
 
-async def cell_info(col: int, row: int) -> dict:
+async def cell_info(
+    col: int,
+    row: int,
+    *,
+    frame: str | None = None,
+    table_index: int | None = None,
+) -> dict:
     async with _action_lock:
-        return await _cell_info_impl(col, row)
+        return await _cell_info_impl(
+            col,
+            row,
+            frame_name=frame,
+            table_index=table_index,
+        )
 
 
 async def click_vtable_cell_by_field(
@@ -424,10 +494,17 @@ async def click_vtable_cell_by_field(
     observe_after: bool = False,
     settle_ms: int = 300,
     max_results: int = OVERLAY_RESULT_LIMIT,
+    frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     """Resolve a business field/record through VTable APIs, then trusted-click it."""
     async with _action_lock:
-        resolved = await _resolve_vtable_cell_impl(field, record_index)
+        resolved = await _resolve_vtable_cell_impl(
+            field,
+            record_index,
+            frame=frame,
+            table_index=table_index,
+        )
         if resolved.get("status") != "ok":
             return resolved
         address = resolved["address"]
@@ -440,6 +517,8 @@ async def click_vtable_cell_by_field(
             observe_after=observe_after,
             settle_ms=settle_ms,
             max_results=max_results,
+            frame_name=frame,
+            table_index=table_index,
         )
         result["target"] = {
             "field": field,
@@ -447,35 +526,47 @@ async def click_vtable_cell_by_field(
             "col": int(address["col"]),
             "row": int(address["row"]),
             "resolved_by": resolved.get("resolved_by"),
+            "table_index": table_index,
         }
         if result.get("interaction"):
             result["interaction"]["target"].update(result["target"])
         return result
 
-
-async def _table_meta_impl(frame: str | None = None) -> dict:
+async def _table_meta_impl(
+    frame: str | None = None,
+    table_index: int | None = None,
+) -> dict:
     page = await _current_page_impl()
-    frame_obj = await resolve_frame(page, frame) if frame is not None else await vtable_frame(page)
+    frame_obj = (
+        await resolve_frame(page, frame)
+        if frame is not None
+        else await vtable_frame(page)
+    )
     try:
-        await ensure_vtable(frame_obj)
+        await ensure_vtable(frame_obj, table_index)
     except Exception as e:
         return {
             "status": "failed",
             "reason": f"vtable-not-bound: {e}",
             "page_id": _page_id(page),
+            "table_index": table_index,
         }
     meta = await frame_obj.evaluate(_wrap(TABLE_META))
     return {
         "status": "ok",
         "page_id": _page_id(page),
         "frame": await _frame_context_details(page, frame_obj),
+        "table_index": table_index,
         "meta": meta,
     }
 
 
-async def table_meta(frame: str | None = None) -> dict:
+async def table_meta(
+    frame: str | None = None,
+    table_index: int | None = None,
+) -> dict:
     async with _action_lock:
-        return await _table_meta_impl(frame=frame)
+        return await _table_meta_impl(frame=frame, table_index=table_index)
 
 
 async def _cells_read_impl(
@@ -484,16 +575,22 @@ async def _cells_read_impl(
     col1: int,
     row1: int,
     frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     page = await _current_page_impl()
-    frame_obj = await resolve_frame(page, frame) if frame is not None else await vtable_frame(page)
+    frame_obj = (
+        await resolve_frame(page, frame)
+        if frame is not None
+        else await vtable_frame(page)
+    )
     try:
-        await ensure_vtable(frame_obj)
+        await ensure_vtable(frame_obj, table_index)
     except Exception as e:
         return {
             "status": "failed",
             "reason": f"vtable-not-bound: {e}",
             "page_id": _page_id(page),
+            "table_index": table_index,
         }
     result = await frame_obj.evaluate(
         _wrap4(READ_CELLS),
@@ -503,6 +600,7 @@ async def _cells_read_impl(
         "status": "ok",
         "page_id": _page_id(page),
         "frame": await _frame_context_details(page, frame_obj),
+        "table_index": table_index,
         "range": result,
         "rows": len((result or {}).get("values", [])),
     }
@@ -514,13 +612,27 @@ async def cells_read(
     col1: int,
     row1: int,
     frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     async with _action_lock:
-        return await _cells_read_impl(col0, row0, col1, row1, frame=frame)
+        return await _cells_read_impl(
+            col0,
+            row0,
+            col1,
+            row1,
+            frame=frame,
+            table_index=table_index,
+        )
 
 
 async def _drop_files_impl(
-    col: int, row: int, files: list[str], *, data: dict[str, str] | None = None
+    col: int,
+    row: int,
+    files: list[str],
+    *,
+    data: dict[str, str] | None = None,
+    frame_name: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     if not files:
         raise ValueError("files must contain at least one workspace file")
@@ -529,9 +641,13 @@ async def _drop_files_impl(
         for path in files
     ]
     page = await _current_page_impl()
-    frame = await vtable_frame(page)
+    frame = (
+        await resolve_frame(page, frame_name)
+        if frame_name is not None
+        else await vtable_frame(page)
+    )
     try:
-        await ensure_vtable(frame)
+        await ensure_vtable(frame, table_index)
     except Exception as e:
         return {
             "status": "failed",
@@ -539,6 +655,7 @@ async def _drop_files_impl(
             "page_id": _page_id(page),
             "col": col,
             "row": row,
+            "table_index": table_index,
         }
     if not await ensure_cell_visible(page, frame, col, row):
         return {
@@ -574,9 +691,22 @@ async def _drop_files_impl(
         "position": {"x": x, "y": y},
     }
 
-
 async def drop_files(
-    col: int, row: int, files: list[str], *, data: dict[str, str] | None = None
+    col: int,
+    row: int,
+    files: list[str],
+    *,
+    data: dict[str, str] | None = None,
+    frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     async with _action_lock:
-        return await _drop_files_impl(col, row, files, data=data)
+        return await _drop_files_impl(
+            col,
+            row,
+            files,
+            data=data,
+            frame_name=frame,
+            table_index=table_index,
+        )
+

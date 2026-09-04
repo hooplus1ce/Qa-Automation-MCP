@@ -415,25 +415,41 @@ async def _start_browser_impl(headless: bool = True) -> dict:
 async def start_browser(headless: bool = True) -> dict:
     async with _action_lock:
         return await _start_browser_impl(headless=headless)
+def _normalize_cdp_url(cdp_url: str) -> str:
+    value = str(cdp_url).strip()
+    if not value:
+        raise ValueError("cdp_url must not be empty")
+    return value.rstrip("/")
+
 
 
 async def _connect_browser_impl(cdp_url: str = "http://127.0.0.1:9222") -> dict:
+    cdp_url = _normalize_cdp_url(cdp_url)
+
     if _state.browser is not None and _state.browser.is_connected():
         if _state.cdp and _state.cdp_url == cdp_url:
-            tabs = []
-            try:
-                if _state.browser.contexts:
-                    tabs = [p.url[:80] for p in _state.browser.contexts[0].pages]
-            except Exception:
-                pass
+            tabs = [
+                page.url[:120]
+                for context in _state.browser.contexts
+                for page in context.pages
+            ]
             return {
                 "status": "already-connected",
                 "cdp": cdp_url,
                 "browser": _state.browser.version,
+                "contexts": len(_state.browser.contexts),
                 "tabs": tabs,
             }
-        # 若先前连接的是非 CDP 浏览器(如 headless chromium)或不同的端点，先断开以切入目标 CDP
+        # 切换端点前释放当前连接；受管 Chrome 仍按 close 的既有语义清理。
         await _close_browser_impl()
+    elif _state.pw is not None:
+        # 处理浏览器已断开但 Playwright driver 尚未释放的半连接状态。
+        try:
+            await _state.pw.stop()
+        except Exception:
+            pass
+        _state.reset()
+
     if async_playwright is None:
         raise RuntimeError(PLAYWRIGHT_INSTALL_HINT)
 
@@ -441,45 +457,55 @@ async def _connect_browser_impl(cdp_url: str = "http://127.0.0.1:9222") -> dict:
     try:
         _state.browser = await _state.pw.chromium.connect_over_cdp(cdp_url)
     except Exception as exc:
-        await _state.pw.stop()
-        _state.pw = None
+        try:
+            await _state.pw.stop()
+        finally:
+            _state.pw = None
+            _state.browser = None
         raise RuntimeError(
             f"无法连接 CDP 浏览器 {cdp_url!r}。请确认 Chrome 已使用 "
             "--remote-debugging-port 启动，且端口可访问。原始错误: "
             f"{exc}"
         ) from exc
+
     download_config = await _configure_browser_downloads(_state.browser)
     _state.cdp = True
     _state.cdp_url = cdp_url
     _state.selected_page = None
-    _state.selected_context = _state.browser.contexts[0] if _state.browser.contexts else None
-    if _state.selected_context is not None:
-        _context_id(_state.selected_context, name="default")
-        _watch_download_context(_state.selected_context)
-        if SHOW_CURSOR:
-            try:
-                await _state.selected_context.add_init_script(_WIN_CURSOR_HELPER_SCRIPT)
-                for p in _state.selected_context.pages:
-                    if not p.url or p.url == "about:blank":
-                        continue
+    _state.selected_context = (
+        _state.browser.contexts[0] if _state.browser.contexts else None
+    )
+    for index, context in enumerate(_state.browser.contexts):
+        _context_id(context, name="default" if index == 0 else None)
+        _watch_download_context(context)
+        if not SHOW_CURSOR:
+            continue
+        try:
+            await context.add_init_script(_WIN_CURSOR_HELPER_SCRIPT)
+            for page in context.pages:
+                if page.url and page.url != "about:blank":
                     try:
-                        await asyncio.wait_for(p.evaluate(_WIN_CURSOR_HELPER_SCRIPT), timeout=1.0)
+                        await asyncio.wait_for(
+                            page.evaluate(_WIN_CURSOR_HELPER_SCRIPT), timeout=1.0
+                        )
                     except Exception:
                         pass
-            except Exception:
-                pass
-    tabs = []
-    try:
-        if _state.browser.contexts:
-            tabs = [p.url[:80] for p in _state.browser.contexts[0].pages]
-    except Exception:
-        pass
+        except Exception:
+            pass
+    tabs = [
+        page.url[:120]
+        for context in _state.browser.contexts
+        for page in context.pages
+    ]
     return {
         "status": "connected",
         "cdp": cdp_url,
-        "port": int(cdp_url.rsplit(":", 1)[-1].rstrip("/")) if ":" in cdp_url and cdp_url.rsplit(":", 1)[-1].rstrip("/").isdigit() else None,
+        "port": int(cdp_url.rsplit(":", 1)[-1])
+        if ":" in cdp_url and cdp_url.rsplit(":", 1)[-1].isdigit()
+        else None,
         "managed": False,
         "browser": _state.browser.version,
+        "contexts": len(_state.browser.contexts),
         "tabs": tabs,
         **download_config,
     }

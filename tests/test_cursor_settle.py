@@ -72,6 +72,33 @@ class CursorSettleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(press_duration, 20)
 
         await automation.close_browser()
+    async def test_dom_interact_rechecks_target_after_hover_layout_shift(self) -> None:
+        try:
+            await automation.start_browser(headless=True)
+        except Exception as exc:
+            raise unittest.SkipTest(f"Playwright browser unavailable: {exc}") from exc
+
+        page = await automation.current_page()
+        await page.set_content(
+            "<button id='moving' style='position:absolute;left:50px;top:50px;width:100px;height:40px'>"
+            "Click Me</button>"
+            "<script>"
+            "window.__clicks = 0;"
+            "const b = document.querySelector('#moving');"
+            "b.addEventListener('mouseenter', () => { b.style.left = '180px'; });"
+            "b.addEventListener('click', () => window.__clicks++);"
+            "</script>"
+        )
+
+        result = await automation.dom_interact(
+            "click",
+            css="#moving",
+            observe_after=False,
+        )
+
+        self.assertEqual(result["status"], "acted")
+        self.assertEqual(await page.evaluate("window.__clicks"), 1)
+        await automation.close_browser()
 
 
 if __name__ == "__main__":

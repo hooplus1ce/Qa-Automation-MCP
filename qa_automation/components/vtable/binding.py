@@ -105,6 +105,44 @@ async def resolve_frame(page: Page, frame: str | None) -> Frame:
 
 async def ensure_vtable(frame: Frame, table_index: int | None = None) -> None:
     await frame.wait_for_selector(".vtable", timeout=BIND_TIMEOUT_MS)
+    if table_index is not None:
+        if not isinstance(table_index, int) or table_index < 0:
+            raise ValueError("table_index must be a non-negative integer")
+        selected = await frame.evaluate(
+            """(index) => {
+              const root = document.querySelectorAll('.vtable')[index];
+              if (!root) return {exists: false, visible: false};
+              const style = getComputedStyle(root);
+              const rect = root.getBoundingClientRect();
+              return {
+                exists: true,
+                visible: style.display !== 'none' && style.visibility !== 'hidden' &&
+                  rect.width > 0 && rect.height > 0,
+              };
+            }""",
+            table_index,
+        )
+        if not selected.get("exists"):
+            raise ValueError(f"unknown table_index: {table_index}")
+        if not selected.get("visible"):
+            raise ValueError(f"table_index is not visible: {table_index}")
+    else:
+        selection = await frame.evaluate(
+            """() => Array.from(document.querySelectorAll('.vtable')).map((root, index) => {
+              const style = getComputedStyle(root);
+              const rect = root.getBoundingClientRect();
+              const modal = root.closest('.ant-modal[role="document"], .ant-modal-wrap[role="dialog"]');
+              return {
+                index,
+                visible: style.display !== 'none' && style.visibility !== 'hidden' &&
+                  rect.width > 0 && rect.height > 0,
+                modal: !!modal,
+              };
+            })"""
+        )
+        visible = [item for item in selection if item.get("visible")]
+        if len(visible) > 1 and not any(item.get("modal") for item in visible):
+            raise ValueError("multiple visible VTables; table_index is required")
     await frame.evaluate(
         """(targetIndex) => {
           if (Number.isInteger(targetIndex)) window.__vtable_target_index = targetIndex;
@@ -127,7 +165,8 @@ async def _vtable_directory(page: Page, frame: Frame) -> list[dict[str, Any]]:
             const rect = (canvas || root).getBoundingClientRect();
             const modal = root.closest('.ant-modal[role="document"], .ant-modal-wrap[role="dialog"]');
             const style = window.getComputedStyle(root);
-            const visible = style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            const visible = style.display !== 'none' && style.visibility !== 'hidden' &&
+              rect.width > 0 && rect.height > 0;
             return {
               table_index: index,
               table_id: `vtable-${index}`,
@@ -146,6 +185,8 @@ async def _vtable_directory(page: Page, frame: Frame) -> list[dict[str, Any]]:
     offset = await _frame_page_offset(page, frame)
     directory = []
     for item in payload:
+        if not item.get("visible"):
+            continue
         box = item["canvas_box"]
         directory.append(
             {
@@ -159,6 +200,53 @@ async def _vtable_directory(page: Page, frame: Frame) -> list[dict[str, Any]]:
             }
         )
     return directory
+
+
+async def _vtable_discover_impl(frame: str | None = None) -> dict:
+    """List visible VTable roots in one frame or across all current-page frames."""
+    page = await _current_page_impl()
+    frames = [await resolve_frame(page, frame)] if frame is not None else list(page.frames)
+    tables: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for candidate in frames:
+        try:
+            details = _frame_details(page, candidate)
+            frame_selector = (
+                details["frame_name"]
+                or details["frame_url"]
+                or (None if candidate == page.main_frame else "vtable")
+            )
+            for table in await _vtable_directory(page, candidate):
+                tables.append(
+                    {
+                        "frame": frame_selector,
+                        "frame_details": details,
+                        "table": table,
+                    }
+                )
+        except Exception as exc:
+            errors.append(
+                {
+                    "frame_id": _frame_details(page, candidate)["frame_id"],
+                    "reason": str(exc)[:200],
+                }
+            )
+    result: dict[str, Any] = {
+        "status": "ok",
+        "page_id": _page_id(page),
+        "tables": tables,
+        "count": len(tables),
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+async def discover_vtables(frame: str | None = None) -> dict:
+    async with _action_lock:
+        return await _vtable_discover_impl(frame=frame)
+
+
 
 
 async def cell_offset(frame: Frame) -> dict[str, float]:
@@ -243,13 +331,21 @@ async def ensure_cell_visible(page: Page, frame: Frame, col: int, row: int) -> b
     return await cell_visible(frame, col, row)
 
 async def _resolve_vtable_cell_impl(
-    field: str, record_index: int | list[int]
+    field: str,
+    record_index: int | list[int],
+    *,
+    frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     """Resolve a semantic VTable target without reading canvas DOM geometry."""
     page = await _current_page_impl()
-    frame = await vtable_frame(page)
+    frame_obj = (
+        await resolve_frame(page, frame)
+        if frame is not None
+        else await vtable_frame(page)
+    )
     try:
-        await ensure_vtable(frame)
+        await ensure_vtable(frame_obj, table_index)
     except Exception as exc:
         return {
             "status": "failed",
@@ -257,9 +353,11 @@ async def _resolve_vtable_cell_impl(
             "reason": f"vtable-not-bound: {exc}",
             "field": field,
             "record_index": record_index,
+            "frame": _frame_details(page, frame_obj),
+            "table_index": table_index,
         }
     try:
-        resolved = await frame.evaluate(
+        resolved = await frame_obj.evaluate(
             _wrap2(RESOLVE_CELL), [field, record_index]
         )
     except Exception as exc:
@@ -269,6 +367,7 @@ async def _resolve_vtable_cell_impl(
             "reason": f"vtable-address-error: {exc}",
             "field": field,
             "record_index": record_index,
+            "table_index": table_index,
         }
     if not resolved or not resolved.get("ok"):
         return {
@@ -278,10 +377,13 @@ async def _resolve_vtable_cell_impl(
             "field": field,
             "record_index": record_index,
             "address": (resolved or {}).get("address"),
+            "table_index": table_index,
         }
     col, row = int(resolved["col"]), int(resolved["row"])
-    in_viewport = await cell_visible(frame, col, row)
-    center = await cell_center(page, frame, col, row) if in_viewport else None
+    in_viewport = await cell_visible(frame_obj, col, row)
+    center = cell_center(page, frame_obj, col, row) if in_viewport else None
+    if center is not None:
+        center = await center
     return {
         "status": "ok",
         "page_id": _page_id(page),
@@ -294,12 +396,24 @@ async def _resolve_vtable_cell_impl(
         "resolved_by": resolved.get("method"),
         "in_viewport": in_viewport,
         "center": center,
-        "frame": _frame_details(page, frame),
+        "frame": _frame_details(page, frame_obj),
+        "table_index": table_index,
     }
 
 
 async def resolve_vtable_cell(
-    field: str, record_index: int | list[int]
+    field: str,
+    record_index: int | list[int],
+    *,
+    frame: str | None = None,
+    table_index: int | None = None,
 ) -> dict:
     async with _action_lock:
-        return await _resolve_vtable_cell_impl(field, record_index)
+        return await _resolve_vtable_cell_impl(
+            field,
+            record_index,
+            frame=frame,
+            table_index=table_index,
+        )
+
+

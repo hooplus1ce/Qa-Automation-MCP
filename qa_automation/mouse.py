@@ -75,6 +75,11 @@ def _build_cursor_helper_script() -> str:
     cursor.id = '__qa_automation_cursor__';
     document.documentElement.appendChild(cursor);
   }}
+  if (cursor.dataset.qaAutomationInstalled === '1' &&
+      window.__qa_automation_update_cursor && window.__qa_automation_glide_cursor) {{
+    return 'already-installed-win-cursor';
+  }}
+  cursor.dataset.qaAutomationInstalled = '1';
   cursor.innerHTML = '';
   cursor.style.cssText = `{cursor_css}`;
 

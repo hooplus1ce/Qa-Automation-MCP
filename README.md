@@ -93,20 +93,21 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `browser_connect` | 工具 | CDP 连接已有浏览器(默认 9222),复用已打开的页面 |
 | `browser_session` | 工具 | 管理隔离 BrowserContext 会话,支持账号 Cookie 环境切换与 storage state |
 | `browser_pages` / `browser_select_page` | 工具 | 列出并显式固定稳定 `page_id`,避免多标签页误操作 |
-| `vtable_cell_click` | 工具 | 点击 VTable 单元格:确定性坐标 + trusted 输入 + 回读验证 |
-| `vtable_cell_info` | 工具 | 读单元格值/类型/中心点/可见性,交互前后确认 |
-| `vtable_cell_resolve` / `vtable_cell_click_by_field` | 工具 | 用内部 API 将字段+记录索引解析为地址并 trusted 点击 |
-| `vtable_analysis` | 工具 | 一次读取列头/scenegraph 图标/值单元格交互和编辑器证据，返回顶层 viewport 坐标 |
+| `vtable_discover` | 工具 | 枚举可见 VTable，返回可复用的 `frame` 与 `table_index`，多表页面的必经第一步 |
+| `vtable_cell_click` | 工具 | 目标重新解析后的稳定 trusted 点击 + 回读验证 |
+| `vtable_cell_info` | 工具 | 读目标表单元格值/类型/中心点/可见性 |
+| `vtable_cell_resolve` / `vtable_cell_click_by_field` | 工具 | 指定表内用字段+记录索引解析地址并 trusted 点击 |
+| `vtable_analysis` | 工具 | 指定表一次读取列头/scenegraph 图标/有限值单元格的交互证据 |
 | `interaction_chain` | 工具 | 交互工具链：传 actions 一次性批量执行 N 个动作（1 次调用替代 N 次往返），链尾统一观察一次（浮层 + URL 变化）；不传时返回紧凑页面分析供 AI 规划 |
-| `ui_click` / `ui_interact` | 工具 | 统一页面交互：CSS → AX → XPath → 视口坐标，支持 AntD Portal 观察 |
+| `ui_click` / `ui_interact` | 工具 | 统一页面交互：CSS → AX → XPath → 视口坐标，点击前重测目标几何以防 hover 布局抖动 |
 | `ui_screenshot` | 工具 | 按元素定位器或顶层 viewport 矩形截取 PNG/JPEG 并保存到 `.qa-automation/screenshots/`，返回文件路径（不再回传整图 base64） |
 | `ui_page_context` / `ui_analyze_scope` | 工具 | 低 token 页面上下文与聚焦层控件分析 |
 | `overlay_scan` / `overlay_observe` | 工具 | 当前活动范围的浮层快照与事件监听 |
 | `ui_snapshot` | 工具 | aria 快照(mode='ai' + boxes):AI 的"语义之眼",含 [ref]/[box](支持 `frame`) |
 | `ui_profile` | 工具 | 返回当前 UI profile、定位器优先级和 VTable 验证策略 |
 | `automation_metrics` | 工具 | 返回工具调用耗时、响应体积和上下文 token 估算 |
-| `vtable_meta` / `vtable_read_cells` | 工具 | 表格元数据与矩形单元格批量读取 |
-| `vtable_drop_files` | 工具 | Locator.drop 精确拖放文件到目标单元格(Playwright 1.60+) |
+| `vtable_meta` / `vtable_read_cells` | 工具 | 指定表格元数据与矩形单元格批量读取 |
+| `vtable_drop_files` | 工具 | 指定单元格的 Locator.drop 文件拖放(Playwright 1.60+) |
 | `browser_close` | 工具 | 关闭 Playwright/受管 Chrome;外部 CDP 浏览器只断开连接 |
 | `vtable://js/index` | 资源 | JS 脚本目录(JSON) |
 | `vtable://js/{name}` | 资源 | 19 个 VTable JS 脚本(fast_bind、vtable_analysis、resolve_cell、read_cells …) |
@@ -165,25 +166,15 @@ async with Client(transport) as client:
 - **业务字段寻址**:`vtable_cell_resolve(field, record_index)` 优先调用
   `getCellAddrByFieldRecord`,旧版本才组合 `getTableIndexByField` 与
   `getTableIndexByRecordIndex`;`vtable_cell_click_by_field` 再用
-  `scrollToCell` / `getCellRelativeRect` 得到落点。整个链路不扫描 DOM 单元格,
-  AI 也不提供像素坐标。虚拟滚动产生的非有限几何和高 DPI canvas 尺寸已做防御。
-- **统一 VTable 分析与执行**:`vtable_analysis` 一次读取有限列头、已渲染的
-  `scenegraph.getCell` / `globalAABBBounds` 图标和值单元格。它还通过
-  `getEditor` 和 `editCellTrigger` 标示可点击单元格及单击是否会打开原生输入控件。
-  Playwright 将 VTable canvas 局部几何和 iframe 偏移换成顶层 viewport 坐标；把返回的
-  `geometry.point` 与 `analysis_id` 一起交给
-  `ui_interact(action="click", x=..., y=..., analysis_id=...)`。执行前会重新
-  核对页面、iframe、scroll 和 scenegraph 几何，陈旧坐标返回 `stale-coordinate`。
-  默认 `mode="interactive"` 只展开有交互证据的可见样本且不返回业务值；需要诊断时
-  才使用 `mode="full"`、`include_values=True` 或 `visible_only=False`。
-  同一活动 iframe 有多张可见表格时，首次调用只返回表格目录（`table_index`、位置、
-  有限列头）；下一次显式带入 `table_index`，从源头避免跨表坐标与无关数据进入上下文。
-  `customLayout/customRender` 只标为 candidate；只有 VTable 控件/editor 或
-  scenegraph 的明确功能、`cursor:pointer` 证据才标为 confirmed/clickable。
-  复选框等单元格内控件同样沿用“VTable API/scenegraph 取坐标 + 通用坐标点击”，
-  不另设控件专用点击工具。
-- **trusted 真实输入**:`page.mouse.click` 走真实输入管道(`isTrusted=true`),
-  React/AntD 的 hover/focus/click 行为与真人一致;不再派发合成事件。
+  `scrollToCell` / `getCellRelativeRect` 得到落点。整个链路不扫描 DOM 单元格。
+- **多表/iframe 显式寻址**:先调用 `vtable_discover(frame=...)`。每个 `tables[]` 项的
+  `frame` 是可直接传回其它 VTable 工具的 frame selector，`table.table_index` 是该 frame
+  内的索引；`frame_details` 仅供诊断。未指定索引时，只有唯一可见表或唯一模态框表可自动
+  绑定；并列可见表会明确返回 `table_index is required`，绝不猜第一张。`vtable_analysis`
+  同样受此约束，保证分析、读写、点击和文件拖放始终落在同一实例。
+- **稳定 trusted 输入**:`page.mouse.click` 走真实输入管道(`isTrusted=true`)。点击会先滚动
+  目标进入视口，连续采样其边界直到稳定，移动鼠标触发 hover 后重新读取最终几何，再点击
+  最终中心点；因此目标的 hover 动画、tooltip 或布局位移不会吞掉首次点击。
 - **可操作性等待**:等 `.vtable` 挂载、`window._vtable` 绑定、滚动到视口、
   等渲染帧后才点击。
 - **验证回路**:点击后依次检查选区变化、目标仍处于已选状态、编辑器、目标单元格

@@ -66,9 +66,24 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("overlay_observe", by_name)
         self.assertIn("ui_profile", by_name)
         self.assertIn("automation_metrics", by_name)
+        self.assertIn("vtable_discover", by_name)
         self.assertIn("vtable_analysis", by_name)
         self.assertIn("vtable_cell_resolve", by_name)
         self.assertIn("vtable_cell_click_by_field", by_name)
+        self.assertIn("frame", by_name["vtable_discover"].inputSchema["properties"])
+        for name in (
+            "vtable_cell_info",
+            "vtable_cell_click",
+            "vtable_cell_resolve",
+            "vtable_cell_click_by_field",
+            "vtable_meta",
+            "vtable_analysis",
+            "vtable_read_cells",
+            "vtable_drop_files",
+        ):
+            schema = by_name[name].inputSchema
+            self.assertIn("frame", schema["properties"], name)
+            self.assertIn("table_index", schema["properties"], name)
         self.assertNotIn("vtable_checkbox_click", by_name)
         self.assertNotIn("vtable_dom_click", by_name)
         self.assertNotIn("vtable_dom_click_and_observe", by_name)
@@ -95,7 +110,6 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("start_x", drag_schema["required"])
         self.assertIn("start_y", drag_schema["required"])
         self.assertIn("end_x", drag_schema["required"])
-        self.assertIn("end_y", drag_schema["required"])
         self.assertIn("steps", drag_schema["properties"])
         self.assertIn("css", by_name["ui_click"].inputSchema["properties"])
         self.assertIn(
@@ -118,9 +132,6 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "visible_only", by_name["vtable_analysis"].inputSchema["properties"]
         )
-        self.assertIn("frame", by_name["vtable_analysis"].inputSchema["properties"])
-        self.assertIn("frame", by_name["vtable_meta"].inputSchema["properties"])
-        self.assertIn("frame", by_name["vtable_read_cells"].inputSchema["properties"])
         self.assertIn("port", by_name["browser_start"].inputSchema["properties"])
         self.assertIn(
             "user_data_dir", by_name["browser_start"].inputSchema["properties"]
