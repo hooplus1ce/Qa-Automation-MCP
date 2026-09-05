@@ -41,6 +41,7 @@ from .browser import (
     launch_chrome,
     list_pages,
     open_url,
+    reset_viewport,
     select_page,
     set_page_preference_probe,
     start_browser,
@@ -161,6 +162,7 @@ from .mouse import (
     _last_mouse_point,
     _reset_last_mouse_point,
     _smooth_mouse_move_to,
+    _stable_viewport_click,
 )
 from .overlay import (
     _drain_overlay_observers,
@@ -236,6 +238,7 @@ __all__ = [
     "browser_session",
     "open_url",
     "browser_login",
+    "reset_viewport",
     # VTable
     "vtable_frame",
     "active_application_frame",

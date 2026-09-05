@@ -58,6 +58,7 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("browser_start", by_name)
         self.assertIn("browser_connect", by_name)
         self.assertIn("browser_session", by_name)
+        self.assertIn("browser_reset_viewport", by_name)
         self.assertIn("ui_click", by_name)
         self.assertIn("ui_interact", by_name)
         self.assertIn("ui_mouse_drag", by_name)
@@ -275,7 +276,13 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
             {"error": ""},
         ]
 
-        with patch("qa_automation.mcp.servers.tencent_docs._call_mcp_tool", mock_call):
+        with (
+            patch("qa_automation.mcp.servers.tencent_docs._call_mcp_tool", mock_call),
+            patch(
+                "qa_automation.mcp.servers.tencent_docs.resolve_tencent_docs_token",
+                return_value="test-token",
+            ),
+        ):
             async with Client(server.mcp) as client:
                 result = await client.call_tool(
                     "update_test_case_result",

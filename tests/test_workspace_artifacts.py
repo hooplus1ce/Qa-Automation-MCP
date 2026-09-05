@@ -162,6 +162,29 @@ class WorkspaceArtifactTests(unittest.IsolatedAsyncioTestCase):
             )
             output = Path(result["path"])
             self.assertEqual(output.read_bytes(), b"synthetic-png")
+    async def test_ui_screenshot_defaults_to_full_viewport_when_no_coords_or_locator(self) -> None:
+        with TemporaryDirectory() as directory, chdir(directory), patch.dict(
+            "os.environ",
+            {
+                "QA_AUTOMATION_WORKSPACE_ROOT": ".",
+                "QA_AUTOMATION_ARTIFACT_ROOT": ".qa-automation",
+            },
+        ):
+            frame = SimpleNamespace(name="", url="about:blank")
+            page = SimpleNamespace(main_frame=frame)
+            page.screenshot = AsyncMock(return_value=b"viewport-full-png")
+            with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=page)), \
+                 patch.object(snapshot, "_page_viewport_size", AsyncMock(return_value={"width": 1920, "height": 1080})):
+                result = await snapshot._screenshot_element_impl(
+                    filename="full_viewport.png",
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["clip"], {"x": 0.0, "y": 0.0, "width": 1920, "height": 1080})
+            page.screenshot.assert_awaited_once_with(
+                clip={"x": 0.0, "y": 0.0, "width": 1920, "height": 1080},
+                type="png",
+            )
 
     async def test_browser_download_uses_sanitized_workspace_filename(self) -> None:
         with TemporaryDirectory() as directory, chdir(directory), patch.dict(

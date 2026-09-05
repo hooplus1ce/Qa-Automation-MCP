@@ -21,9 +21,8 @@ from ..config import (
     ANALYSIS_MAX_AGE_SECONDS,
     OVERLAY_RESULT_LIMIT,
     OVERLAY_SETTLE_LIMIT_MS,
-    SHOW_CURSOR,
 )
-from ..mouse import _ensure_cursor_helper, _smooth_mouse_move_to
+from ..mouse import _ensure_cursor_helper, _smooth_mouse_move_to, _stable_viewport_click
 from .contract import _interaction_contract
 from .locator import _find_interaction_locator, _perform_antd_select
 from .snapshot import _focused_editable
@@ -43,60 +42,38 @@ async def _stable_locator_click(
     button: str = "left",
     timeout_ms: float = 3_000,
 ) -> None:
-    """Move once to a settled target, then click its final trusted coordinates."""
+    """Hover a visible locator, remeasure it, then click its final center."""
     deadline = time.monotonic() + max(0.5, timeout_ms / 1000)
-    stable_box: dict[str, float] | None = None
-    for _ in range(4):
-        if time.monotonic() >= deadline:
-            break
+    initial: dict[str, float] | None = None
+    while time.monotonic() < deadline:
         box = await target.bounding_box()
-        if not box or box["width"] <= 0 or box["height"] <= 0:
-            await asyncio.sleep(0.016)
-            continue
-        current = {key: float(box[key]) for key in ("x", "y", "width", "height")}
-        center_x = current["x"] + current["width"] / 2
-        center_y = current["y"] + current["height"] / 2
-        await _ensure_cursor_helper(page)
-        await _smooth_mouse_move_to(page, center_x, center_y)
-        settled_box = await target.bounding_box()
-        if not settled_box:
-            continue
-        settled = {
-            key: float(settled_box[key])
-            for key in ("x", "y", "width", "height")
-        }
-        if not all(abs(settled[key] - current[key]) <= 0.75 for key in current):
-            continue
-        stable_box = settled
-        break
-    if stable_box is None:
-        raise RuntimeError("target did not reach a stable visible position")
+        if box and box["width"] > 0 and box["height"] > 0:
+            initial = {key: float(box[key]) for key in ("x", "y", "width", "height")}
+            break
+        await asyncio.sleep(0.016)
+    if initial is None:
+        raise RuntimeError("target did not reach a visible position")
     if hasattr(target, "is_enabled") and not await target.is_enabled():
         raise RuntimeError("target is disabled")
-    x = stable_box["x"] + stable_box["width"] / 2
-    y = stable_box["y"] + stable_box["height"] / 2
-    if SHOW_CURSOR:
-        try:
-            await page.evaluate(
-                f"window.__qa_automation_update_cursor && "
-                f"window.__qa_automation_update_cursor({x:.1f}, {y:.1f}, true, true)"
-            )
-        except Exception:
-            pass
-    try:
-        if double_click:
-            await page.mouse.dblclick(x, y, button=button, delay=30)
-        else:
-            await page.mouse.click(x, y, button=button, delay=30)
-    finally:
-        if SHOW_CURSOR:
-            try:
-                await page.evaluate(
-                    "window.__qa_automation_hide_cursor && "
-                    "window.__qa_automation_hide_cursor(150)"
-                )
-            except Exception:
-                pass
+
+    async def final_point() -> dict[str, float]:
+        box = await target.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            raise RuntimeError("target became unavailable after hover")
+        return {
+            "x": float(box["x"]) + float(box["width"]) / 2,
+            "y": float(box["y"]) + float(box["height"]) / 2,
+        }
+
+    await _stable_viewport_click(
+        page,
+        initial["x"] + initial["width"] / 2,
+        initial["y"] + initial["height"] / 2,
+        double_click=double_click,
+        button=button,
+        point_resolver=final_point,
+        move_to=_smooth_mouse_move_to,
+    )
 
 
 async def _perform_dom_action(
@@ -112,28 +89,26 @@ async def _perform_dom_action(
     action = action.lower().strip()
     kwargs = {"timeout": timeout_ms}
     if action in {"click", "dblclick", "rightclick"}:
-        target = locator.first
-        await target.scroll_into_view_if_needed(timeout=timeout_ms)
+        await locator.scroll_into_view_if_needed(timeout=timeout_ms)
         await asyncio.sleep(0.04)
         await _stable_locator_click(
             page,
-            target,
+            locator,
             double_click=action == "dblclick",
             button="right" if action == "rightclick" else "left",
             timeout_ms=timeout_ms,
         )
         return None
     if action == "hover":
-        target = locator.first
-        await target.scroll_into_view_if_needed(timeout=timeout_ms)
+        await locator.scroll_into_view_if_needed(timeout=timeout_ms)
         await asyncio.sleep(0.04)
-        box = await target.bounding_box()
+        box = await locator.bounding_box()
         if box and box["width"] > 0 and box["height"] > 0:
             center_x = float(box["x"]) + float(box["width"]) / 2
             center_y = float(box["y"]) + float(box["height"]) / 2
             await _ensure_cursor_helper(page)
             await _smooth_mouse_move_to(page, center_x, center_y)
-        await target.hover(**kwargs)
+        await locator.hover(**kwargs)
         return None
     if action in {"fill", "type"}:
         if value is None:
@@ -156,7 +131,7 @@ async def _perform_dom_action(
         is_antd = False
         try:
             is_antd = bool(
-                await locator.first.evaluate(
+                await locator.evaluate(
                     "element => !!element.closest('.ant-select, .ant-cascader, .ant-tree-select')"
                 )
             )
@@ -164,11 +139,7 @@ async def _perform_dom_action(
             pass
         if is_antd:
             return await _perform_antd_select(
-                page,
-                target_frame,
-                locator,
-                value,
-                timeout_ms=timeout_ms,
+                page, target_frame, locator, value, timeout_ms=timeout_ms
             )
         await locator.select_option(value, **kwargs)
         return {"component": "native-select", "option": value}
@@ -193,11 +164,15 @@ async def _click_dom_impl(
         page = await _current_page_impl()
     try:
         fr = await resolve_frame(page, frame)
-        kwargs: dict[str, Any] = {"name": name} if name else {}
+        kwargs: dict[str, Any] = {"name": name, "exact": True} if name else {}
         if description:
             kwargs["description"] = description
-        locator = fr.get_by_role(role, **kwargs)
-        await _stable_locator_click(page, locator.first, timeout_ms=timeout_ms)
+        from .locator import _unique_visible_locator
+
+        locator = await _unique_visible_locator(fr.get_by_role(role, **kwargs), "ax-role")
+        if locator is None:
+            raise ValueError("target control not found in the selected page/frame scope")
+        await _stable_locator_click(page, locator, timeout_ms=timeout_ms)
         return {
             "status": "clicked",
             "page_id": _page_id(page),

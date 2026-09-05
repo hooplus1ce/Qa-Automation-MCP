@@ -12,6 +12,7 @@ from ...browser import (
     _action_lock,
     _current_page_impl,
     _frame_details,
+    _frame_id,
     _frame_page_offset,
     _page_id,
 )
@@ -91,16 +92,30 @@ async def resolve_frame(page: Page, frame: str | None) -> Frame:
         active = await active_application_frame(page)
         if active is not None:
             return active
-    for fr in list(page.frames):
-        if fr.name == frame:
-            return fr
-    for fr in list(page.frames):
-        if fr.name and frame in fr.name:
-            return fr
-    for fr in list(page.frames):
-        if frame in fr.url:
-            return fr
-    raise ValueError(f"未找到目标 frame: {frame!r}。可用 frame: {[f.name for f in page.frames]}")
+    frames = list(page.frames)
+    for candidate in frames:
+        if _frame_id(page, candidate) == frame:
+            return candidate
+    exact_name = [candidate for candidate in frames if candidate.name == frame]
+    if len(exact_name) == 1:
+        return exact_name[0]
+    partial_name = [
+        candidate for candidate in frames if candidate.name and frame in candidate.name
+    ]
+    if len(partial_name) == 1:
+        return partial_name[0]
+    url_matches = [candidate for candidate in frames if frame in candidate.url]
+    if len(url_matches) == 1:
+        return url_matches[0]
+    if len(exact_name) + len(partial_name) + len(url_matches) > 1:
+        raise ValueError(
+            f"ambiguous frame selector {frame!r}; use one frame_id: "
+            f"{[_frame_id(page, candidate) for candidate in frames]}"
+        )
+    raise ValueError(
+        f"未找到目标 frame: {frame!r}。可用 frame: "
+        f"{[_frame_id(page, candidate) for candidate in frames]}"
+    )
 
 
 async def ensure_vtable(frame: Frame, table_index: int | None = None) -> None:
@@ -211,11 +226,7 @@ async def _vtable_discover_impl(frame: str | None = None) -> dict:
     for candidate in frames:
         try:
             details = _frame_details(page, candidate)
-            frame_selector = (
-                details["frame_name"]
-                or details["frame_url"]
-                or (None if candidate == page.main_frame else "vtable")
-            )
+            frame_selector = details["frame_id"]
             for table in await _vtable_directory(page, candidate):
                 tables.append(
                     {

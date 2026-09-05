@@ -13,6 +13,29 @@ from ..components.vtable.binding import active_application_frame, resolve_frame
 from ..config import ACTIVE_PROFILE, LOCATOR_STRATEGY
 
 
+async def _unique_visible_locator(locator: Any, source: str) -> Any | None:
+    """Return the sole visible candidate or reject an ambiguous locator."""
+    visible: list[Any] = []
+    labels: list[str] = []
+    for index in range(await locator.count()):
+        candidate = locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            visible.append(candidate)
+            labels.append(" ".join((await candidate.inner_text()).split())[:80])
+        except Exception:
+            continue
+    if len(visible) == 1:
+        return visible[0]
+    if len(visible) > 1:
+        summary = [label or f"candidate-{index}" for index, label in enumerate(labels)]
+        raise ValueError(
+            f"ambiguous {source} locator: {len(visible)} visible matches: {summary[:20]}"
+        )
+    return None
+
+
 async def _find_interaction_locator(
     page: Page,
     *,
@@ -44,7 +67,7 @@ async def _find_interaction_locator(
         if css:
             available["css"] = candidate.locator(css)
         if role:
-            kwargs = {"name": name} if name else {}
+            kwargs = {"name": name, "exact": True} if name else {}
             if description:
                 kwargs["description"] = description
             available["ax-role"] = candidate.get_by_role(role, **kwargs)
@@ -61,10 +84,13 @@ async def _find_interaction_locator(
         ]
         for source, locator in locators:
             try:
-                if await locator.count():
-                    return locator, candidate, source
+                unique = await _unique_visible_locator(locator, source)
+            except ValueError:
+                raise
             except Exception:
                 continue
+            if unique is not None:
+                return unique, candidate, source
     raise ValueError("target control not found in the selected page/frame scope")
 
 

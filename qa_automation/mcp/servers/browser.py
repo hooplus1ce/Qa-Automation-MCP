@@ -55,7 +55,7 @@ def create_server() -> FastMCP:
     @mcp.tool()
     @instrument_tool
     async def browser_session(
-        action: Literal["list", "create", "select", "save", "close"] = "list",
+        action: Literal["list", "create", "select", "save", "close", "reset_viewport"] = "list",
         session_id: str | None = None,
         name: str | None = None,
         storage_state_path: str | None = None,
@@ -79,6 +79,17 @@ def create_server() -> FastMCP:
     async def browser_select_page(page_id: str) -> dict:
         """显式选中一个 page_id；后续页面、iframe、浮层和 VTable 工具固定使用该页。"""
         return await automation.select_page(page_id)
+
+    @mcp.tool()
+    @instrument_tool
+    async def browser_reset_viewport() -> dict:
+        """重置浏览器视口为全屏自然视口并清除任何残留的 CDP 设备模拟。
+
+        彻底清除 CDP 视口模拟导致的'右侧大片灰色/小视口冻结'现象，
+        恢复窗口最大化并向顶层及所有 iframe 广播 resize 事件，触发 VTable 与 Ant Design
+        等组件即刻重新自适应布局。
+        """
+        return await automation.reset_viewport()
 
     @mcp.tool()
     @instrument_tool

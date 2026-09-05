@@ -6,6 +6,7 @@ import json
 import os
 import unittest
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -349,6 +350,23 @@ class CdpProbeTests(unittest.IsolatedAsyncioTestCase):
         popen.assert_not_called()
 
 
+class TencentDocsTokenTests(unittest.TestCase):
+    def test_token_requires_explicit_configuration(self) -> None:
+        from qa_automation.config import resolve_tencent_docs_token
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "qa_automation.config.Path.home", return_value=Path("C:/qa-empty-home")
+        ), patch("qa_automation.config.Path.exists", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "TENCENT_DOCS_MCP_TOKEN"):
+                resolve_tencent_docs_token()
+
+    def test_token_reads_environment_variable(self) -> None:
+        from qa_automation.config import resolve_tencent_docs_token
+
+        with patch.dict(os.environ, {"TENCENT_DOCS_MCP_TOKEN": " test-token "}):
+            self.assertEqual(resolve_tencent_docs_token(), "test-token")
+
+
 class ProfileFallbackTests(unittest.TestCase):
     def test_unknown_profile_falls_back_with_warning(self) -> None:
         with patch.dict(os.environ, {"QA_AUTOMATION_PROFILE": "no-such-profile"}):
@@ -358,6 +376,49 @@ class ProfileFallbackTests(unittest.TestCase):
         self.assertEqual(profile.name, "aps-antd")
         self.assertTrue(any("no-such-profile" in str(item.message) for item in caught))
 
+
+class ViewportHealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reset_viewport_clears_metrics_and_returns_dims(self) -> None:
+        from unittest.mock import AsyncMock
+
+        import qa_automation.browser as b
+
+        mock_page = SimpleNamespace(is_closed=lambda: False)
+        with patch.object(b, "_current_page_impl", AsyncMock(return_value=mock_page)), \
+             patch.object(b, "_maximize_and_fill_viewport", AsyncMock()) as mock_fill, \
+             patch.object(b, "_page_viewport_size", AsyncMock(return_value={"width": 1920, "height": 1080})), \
+             patch.object(b, "_page_id", return_value="page_test_1"):
+            res = await b.reset_viewport()
+
+        mock_fill.assert_awaited_once_with(mock_page)
+        self.assertEqual(res["status"], "viewport-reset")
+        self.assertEqual(res["page_id"], "page_test_1")
+        self.assertEqual(res["viewport"], {"width": 1920, "height": 1080})
+
+    async def test_browser_session_accepts_reset_viewport_action(self) -> None:
+        from unittest.mock import AsyncMock
+
+        import qa_automation.browser as b
+
+        with patch.object(b, "_reset_viewport_impl", AsyncMock(return_value={"status": "viewport-reset"})) as mock_impl:
+            res = await b.browser_session(action="reset_viewport")
+
+        mock_impl.assert_awaited_once()
+        self.assertEqual(res["status"], "viewport-reset")
+
+    async def test_maximize_and_fill_viewport_safe_on_mock_or_closed(self) -> None:
+        import qa_automation.browser as b
+
+        # None page
+        await b._maximize_and_fill_viewport(None)
+
+        # Closed page
+        closed_page = SimpleNamespace(is_closed=lambda: True)
+        await b._maximize_and_fill_viewport(closed_page)
+
+        # Page without cdp session capability
+        plain_page = SimpleNamespace(is_closed=lambda: False)
+        await b._maximize_and_fill_viewport(plain_page)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

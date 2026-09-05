@@ -14,43 +14,58 @@ from ..browser import (
 from ..config import OVERLAY_RESULT_LIMIT
 
 _OVERLAY_PRIORITY = {
-    "dialog": 0,
-    "drawer": 1,
-    "dropdown": 2,
-    "popover": 3,
-    "notification": 4,
-    "overlay": 5,
+    "dropdown": 0,
+    "popover": 1,
+    "dialog": 2,
+    "drawer": 3,
+    "tooltip": 4,
+    "notification": 5,
+    "overlay": 6,
 }
 
 
-def _overlay_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+def _overlay_sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, int]:
     return (
         _OVERLAY_PRIORITY.get(str(item.get("kind", "overlay")), 9),
-        0 if item.get("visible", True) else 1,
-        str(item.get("timestamp", 0)),
+        0 if item.get("viewport_visible", item.get("visible", True)) else 1,
+        -int(item.get("overlay_depth", 0) or 0),
+        -int(item.get("z_index", 0) or 0),
+        -int(item.get("stack_order", 0) or 0),
     )
 
 
+def _overlay_entity_key(item: dict[str, Any]) -> tuple[str, str]:
+    frame_id = str(item.get("frame_id", ""))
+    identity = (
+        str(item.get("overlay_id", ""))
+        or str(item.get("identity", ""))
+        or str(item.get("selector", ""))
+        or str(item.get("fingerprint", ""))
+    )
+    return frame_id, identity
+
+
 def _dedupe_overlays(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the latest and most settled signal for each overlay fingerprint."""
+    """Keep the latest settled signal for each concrete overlay element."""
     latest: dict[tuple[str, str], dict[str, Any]] = {}
     for item in items:
-        text = str(item.get("text", "")).strip()
-        kind = str(item.get("kind", ""))
-        fid = str(item.get("frame_id", ""))
-        key = (fid, f"{kind}|{text}") if text else (fid, str(item.get("fingerprint", "")))
+        key = _overlay_entity_key(item)
         previous = latest.get(key)
         if previous is None:
             latest[key] = item
             continue
-        if item.get("visible", False) and not previous.get("visible", False) and item.get("event") != "removed":
+        if (
+            item.get("viewport_visible", item.get("visible", False))
+            and not previous.get("viewport_visible", previous.get("visible", False))
+            and item.get("event") != "removed"
+        ):
             latest[key] = item
         elif item.get("event") == "removed":
             latest[key] = item
         elif item.get("timestamp", 0) >= previous.get("timestamp", 0):
             prev_sel = str(previous.get("selector", ""))
             transitional = any(tok in prev_sel for tok in ("-enter", "-appear", "-leave"))
-            if transitional or (item.get("timestamp", 0) > previous.get("timestamp", 0)):
+            if transitional or item.get("timestamp", 0) > previous.get("timestamp", 0):
                 latest[key] = item
     return sorted(latest.values(), key=lambda item: item.get("timestamp", 0))
 
@@ -60,16 +75,16 @@ def _new_overlays(
     events: list[dict[str, Any]],
     current: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return new / changed overlays without hiding observer-only transient toast events."""
+    """Return changed overlay entities without hiding observer-only transient events."""
     before = {
-        (str(item.get("frame_id", "")), str(item.get("fingerprint", "")))
+        (_overlay_entity_key(item), str(item.get("fingerprint", "")))
         for item in baseline
     }
     candidates = [*events, *current]
     detected = [
         item
         for item in candidates
-        if (str(item.get("frame_id", "")), str(item.get("fingerprint", ""))) not in before
+        if (_overlay_entity_key(item), str(item.get("fingerprint", ""))) not in before
     ]
     return _dedupe_overlays(detected)
 
@@ -167,20 +182,26 @@ async def _enrich_overlay_items(
 
 
 async def _overlay_context(page: Page, items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return only the page/frame focus state needed for the next AI action."""
+    """Return the highest actionable APS layer for the next interaction."""
     from ..components.vtable.binding import active_application_frame
+
     active = await active_application_frame(page)
     active_info = await _frame_context_details(page, active) if active is not None else None
     active_id = active_info.get("frame_id", "") if active_info else ""
-    visible = [item for item in items if item.get("visible", True)]
     focus_candidates = [
-        item for item in visible
-        if item.get("kind") in {"dialog", "drawer", "dropdown", "popover", "notification"}
+        item
+        for item in items
+        if item.get("actionable", item.get("visible", True))
+        and item.get("kind") in {"dialog", "drawer", "dropdown", "popover"}
     ]
     focus = min(
         focus_candidates,
         key=lambda item: (
             0 if item.get("frame_id") == active_id else 1,
+            0 if item.get("contains_focus") else 1,
+            -int(item.get("overlay_depth", 0) or 0),
+            -int(item.get("z_index", 0) or 0),
+            -int(item.get("stack_order", 0) or 0),
             _OVERLAY_PRIORITY.get(str(item.get("kind")), 9),
         ),
         default=None,
@@ -199,14 +220,14 @@ async def _overlay_context(page: Page, items: list[dict[str, Any]]) -> dict[str,
 async def _scope_frame_ids(page: Page, scope: str) -> set[str] | None:
     if scope == "all":
         return None
-    from ..components.vtable.binding import active_application_frame
-    active = await active_application_frame(page)
-    if active is None:
-        return None
-    allowed = {_frame_id(page, page.main_frame)}
-    allowed.add(_frame_id(page, active))
     if scope not in {"active", "focused"}:
         raise ValueError("scope must be 'active' or 'all'")
+    from ..components.vtable.binding import active_application_frame
+
+    allowed = {_frame_id(page, page.main_frame)}
+    active = await active_application_frame(page)
+    if active is not None:
+        allowed.add(_frame_id(page, active))
     return allowed
 
 

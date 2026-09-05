@@ -107,12 +107,14 @@ def create_server() -> FastMCP:
     @mcp.tool()
     @instrument_tool
     async def overlay_scan(max_results: int = 20, scope: str = "active") -> dict:
-        """扫描当前页面范围内可见的 Ant Design Portal / ARIA 浮层。
+        """扫描 APS 页面当前可见的 Ant Design Portal / ARIA 浮层。
 
-        默认 scope=active 只扫描主文档和当前激活 iframe；scope=all 才扫描所有 iframe。
-        返回每个浮层的 kind、文本、role、定位摘要、可见性、box 以及所属 frame。
-        对短暂 message/toast，请改用 `ui_click` 或
-        `vtable_cell_click(observe_after=True)`，以免在单次静态扫描前消失。
+        默认 scope=active 只扫描主文档和当前激活 iframe；没有活动 iframe 时只扫描
+        主文档，scope=all 才扫描所有 iframe。返回 kind、文本、role、稳定 CSS selector、
+        overlay_id、可选 parent_overlay_id、rendered/viewport_visible/actionable 状态、
+        box/page_box 以及所属 frame。静态扫描不安装 MutationObserver。
+        对短暂 message/toast，请改用 ui_interact 或
+        vtable_cell_click(observe_after=True)。
         """
         return await automation.scan_overlays(max_results=max_results, scope=scope)
 
@@ -143,9 +145,10 @@ def create_server() -> FastMCP:
     async def overlay_observe(
         settle_ms: int = 300, stop: bool = True, max_results: int = 20
     ) -> dict:
-        """在限定窗口内收集 Ant Design Portal/ARIA 浮层事件，覆盖全部 iframe。
+        """在限定窗口内收集 APS Ant Design 浮层事件，覆盖全部 iframe。
 
-        适合已由其他工具或人工操作触发页面交互后的诊断；默认在取样后停止监听。
+        适合已由其他工具或人工操作触发页面后的诊断；默认取样后停止监听。
+        事件缓冲区溢出时返回 events_truncated 和 dropped_event_count。
         """
         return await automation.observe_overlays(
             settle_ms=settle_ms, stop=stop, max_results=max_results
@@ -228,8 +231,8 @@ def create_server() -> FastMCP:
         selector 非空时只快照该选择器命中的子树。
 
         frame=None → 主页面;frame="active" → 当前激活的 AntD Tab iframe;
-        frame="vtable" → 自动定位含表格的 iframe;
-        其它值按 iframe name 或 URL 子串匹配(如 "application" / "scm-spo")。
+        frame="vtable" → 自动定位含表格的 iframe;也可传 page_context、overlay 或
+        vtable_discover 返回的稳定 frame_id。深度最大为 8，快照最多返回 24,000 字符。
         """
         return await automation.dom_snapshot(
             selector=selector,
@@ -266,7 +269,8 @@ def create_server() -> FastMCP:
 
         元素定位顺序与 ui_interact 相同：CSS → AX role/name/description → XPath →
         text/placeholder。frame 未指定时优先活动 iframe。若没有可用定位器，可传
-        x/y/width/height 使用顶层 viewport CSS 像素矩形；截图不会静默把 iframe 内坐标
+        x/y/width/height 使用顶层 viewport CSS 像素矩形；不传定位器与坐标时默认捕获
+        当前完整视口（0,0 到 window.innerWidth/innerHeight）。截图不会静默把 iframe 内坐标
         当成顶层坐标。截图会以 PNG/JPEG 文件保存到 .qa-automation/screenshots/，响应只
         返回工作区文件路径（path）、裁剪框、frame、定位来源与摘要哈希，不再回传整图
         base64，避免大图撑爆上下文；需要看像素内容时直接打开 path 对应文件即可。

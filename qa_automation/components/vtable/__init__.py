@@ -22,7 +22,7 @@ from ...config import (
     SHOW_CURSOR,
     VTABLE_VERIFICATION_STRATEGY,
 )
-from ...mouse import _ensure_cursor_helper, _smooth_mouse_move_to
+from ...mouse import _ensure_cursor_helper, _smooth_mouse_move_to, _stable_viewport_click
 from ...workspace import resolve_workspace_path
 from .binding import (
     _resolve_vtable_cell_impl,
@@ -52,6 +52,9 @@ from .verification import (
     _verify_landed,
 )
 
+_MAX_READ_CELLS = 2_000
+
+
 
 async def _trusted_viewport_click(
     page: Page,
@@ -65,46 +68,24 @@ async def _trusted_viewport_click(
 ) -> dict:
     try:
         x, y = float(x), float(y)
-        if not math.isfinite(x) or not math.isfinite(y):
-            raise ValueError("coordinates must be finite numbers")
-        if button not in {"left", "middle", "right"}:
-            raise ValueError("button must be left, middle or right")
         viewport = await _page_viewport_size(page)
         if not (0 <= x < viewport["width"] and 0 <= y < viewport["height"]):
             raise ValueError(
                 f"point ({x:g}, {y:g}) is outside viewport "
                 f"({viewport['width']:g} x {viewport['height']:g})"
             )
-        await _ensure_cursor_helper(page)
-        if point_resolver is not None:
-            refreshed = await point_resolver()
-            if refreshed:
-                x, y = float(refreshed["x"]), float(refreshed["y"])
-                if not (math.isfinite(x) and math.isfinite(y)):
-                    raise ValueError("resolved coordinates must be finite numbers")
-        if SHOW_CURSOR:
-            try:
-                await page.evaluate(
-                    f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({x:.1f}, {y:.1f}, true, true)"
-                )
-            except Exception:
-                pass
-        try:
-            if double_click:
-                await page.mouse.dblclick(x, y, button=button)
-            else:
-                await page.mouse.click(x, y, button=button, delay=delay)
-        finally:
-            if SHOW_CURSOR:
-                try:
-                    await page.evaluate(
-                        "window.__qa_automation_hide_cursor && window.__qa_automation_hide_cursor(150)"
-                    )
-                except Exception:
-                    pass
+        point = await _stable_viewport_click(
+            page,
+            x,
+            y,
+            double_click=double_click,
+            button=button,
+            delay=delay,
+            point_resolver=point_resolver,
+        )
         return {
             "status": "ok",
-            "point": {"x": x, "y": y},
+            "point": point,
             "button": button,
             "double_click": double_click,
             "coordinate_space": "top-page-viewport-css-pixels",
@@ -298,6 +279,7 @@ async def _click_cell_impl(
         if result["status"] == "failed":
             response = {**result, "col": col, "row": row}
         else:
+            x, y = result["point"]["x"], result["point"]["y"]
             if verify:
                 landed, evidence = await _verify_landed(
                     page, frame, before_sel, col, row, before_visual, before_screenshot
@@ -568,7 +550,6 @@ async def table_meta(
     async with _action_lock:
         return await _table_meta_impl(frame=frame, table_index=table_index)
 
-
 async def _cells_read_impl(
     col0: int,
     row0: int,
@@ -577,6 +558,16 @@ async def _cells_read_impl(
     frame: str | None = None,
     table_index: int | None = None,
 ) -> dict:
+    if not all(isinstance(value, int) for value in (col0, row0, col1, row1)):
+        raise ValueError("cell range coordinates must be integers")
+    columns = abs(col1 - col0) + 1
+    rows = abs(row1 - row0) + 1
+    requested_cells = columns * rows
+    if requested_cells > _MAX_READ_CELLS:
+        raise ValueError(
+            f"requested {requested_cells} cells exceeds the {_MAX_READ_CELLS}-cell limit; "
+            "read a smaller range and paginate."
+        )
     page = await _current_page_impl()
     frame_obj = (
         await resolve_frame(page, frame)
@@ -603,6 +594,9 @@ async def _cells_read_impl(
         "table_index": table_index,
         "range": result,
         "rows": len((result or {}).get("values", [])),
+        "cells": requested_cells,
+        "limit": _MAX_READ_CELLS,
+        "truncated": False,
     }
 
 

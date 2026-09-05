@@ -492,6 +492,14 @@ async def _connect_browser_impl(cdp_url: str = "http://127.0.0.1:9222") -> dict:
                         pass
         except Exception:
             pass
+    if _state.selected_context and _state.selected_context.pages:
+        for p in _state.selected_context.pages:
+            if p.url and p.url != "about:blank":
+                try:
+                    await _maximize_and_fill_viewport(p)
+                    break
+                except Exception:
+                    pass
     tabs = [
         page.url[:120]
         for context in _state.browser.contexts
@@ -598,23 +606,77 @@ async def _wait_for_cdp(
 
 
 async def _maximize_and_fill_viewport(page: Page) -> None:
-    """Maximize the browser window and clear device metrics override to match window aspect ratio."""
+    """Maximize the browser window, clear emulated device metrics, and trigger relayout."""
+    if page is None:
+        return
+    try:
+        if page.is_closed():
+            return
+    except Exception:
+        return
+    try:
+        if not hasattr(page, "context") or not hasattr(page.context, "new_cdp_session"):
+            return
+    except Exception:
+        return
     try:
         cdp = await page.context.new_cdp_session(page)
         try:
-            target_info = await cdp.send("Target.getTargetInfo")
-            tid = target_info.get("targetInfo", {}).get("targetId")
-            if tid:
-                win = await cdp.send("Browser.getWindowForTarget", {"targetId": tid})
-                wid = win.get("windowId")
-                if wid is not None:
-                    await cdp.send(
-                        "Browser.setWindowBounds",
-                        {"windowId": wid, "bounds": {"windowState": "maximized"}},
-                    )
+            try:
+                target_info = await cdp.send("Target.getTargetInfo")
+                tid = target_info.get("targetInfo", {}).get("targetId")
+                if tid:
+                    win = await cdp.send("Browser.getWindowForTarget", {"targetId": tid})
+                    wid = win.get("windowId")
+                    if wid is not None:
+                        await cdp.send(
+                            "Browser.setWindowBounds",
+                            {"windowId": wid, "bounds": {"windowState": "maximized"}},
+                        )
+            except Exception:
+                pass
+
+            # Chromium EmulationHandler::ClearDeviceMetricsOverride 是 session-scoped 的。
+            # 若直接调 clearDeviceMetricsOverride，在未设置 override 的新 session 中是 no-op。
+            # 必须先调用 setDeviceMetricsOverride(width=0, height=0) 将 RenderWidgetHost
+            # 的尺寸重置回宿主窗口自然尺寸，再调用 clearDeviceMetricsOverride 彻底抹除。
+            await cdp.send(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": 0,
+                    "height": 0,
+                    "deviceScaleFactor": 0,
+                    "mobile": False,
+                },
+            )
             await cdp.send("Emulation.clearDeviceMetricsOverride")
         finally:
             await cdp.detach()
+    except Exception:
+        pass
+
+    try:
+        if getattr(page, "viewport_size", None) is not None:
+            actual = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+            if actual and actual.get("w") and actual.get("h"):
+                await page.set_viewport_size({"width": int(actual["w"]), "height": int(actual["h"])})
+    except Exception:
+        pass
+
+    try:
+        _relayout_js = """() => {
+            try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+            if (window._vtable && typeof window._vtable.resize === 'function') {
+                try { window._vtable.resize(); } catch (e) {}
+            }
+        }"""
+        await page.evaluate(_relayout_js)
+        for fr in getattr(page, "frames", []):
+            if fr != getattr(page, "main_frame", None):
+                try:
+                    await fr.evaluate(_relayout_js)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -941,6 +1003,10 @@ async def _select_page_impl(target: str | int) -> dict:
         await chosen.bring_to_front()
     except Exception:
         pass
+    try:
+        await _maximize_and_fill_viewport(chosen)
+    except Exception:
+        pass
     return {
         "status": "selected",
         "page_id": _page_id(chosen),
@@ -956,12 +1022,14 @@ async def select_page(target: str | int) -> dict:
 
 
 async def _browser_session_impl(
-    action: Literal["list", "create", "select", "save", "close"] = "list",
+    action: Literal["list", "create", "select", "save", "close", "reset_viewport"] = "list",
     *,
     session_id: str | None = None,
     name: str | None = None,
     storage_state_path: str | None = None,
 ) -> dict:
+    if action == "reset_viewport":
+        return await _reset_viewport_impl()
     current = await _current_page_impl()
     assert _state.browser is not None
     if action == "list":
@@ -1007,6 +1075,10 @@ async def _browser_session_impl(
                     ctx.pages[0] if ctx.pages else await ctx.new_page()
                 )
                 _select_page_object(_state.selected_page)
+                try:
+                    await _maximize_and_fill_viewport(_state.selected_page)
+                except Exception:
+                    pass
                 return {
                     "status": "selected",
                     "session_id": cur_id,
@@ -1049,7 +1121,7 @@ async def _browser_session_impl(
 
 
 async def browser_session(
-    action: Literal["list", "create", "select", "save", "close"] = "list",
+    action: Literal["list", "create", "select", "save", "close", "reset_viewport"] = "list",
     *,
     session_id: str | None = None,
     name: str | None = None,
@@ -1062,6 +1134,23 @@ async def browser_session(
             name=name,
             storage_state_path=storage_state_path,
         )
+
+
+async def _reset_viewport_impl() -> dict[str, Any]:
+    page = await _current_page_impl()
+    await _maximize_and_fill_viewport(page)
+    viewport = await _page_viewport_size(page)
+    return {
+        "status": "viewport-reset",
+        "page_id": _page_id(page),
+        "viewport": viewport,
+    }
+
+
+async def reset_viewport() -> dict[str, Any]:
+    """Reset browser viewport to full natural window and clear any emulated metrics."""
+    async with _action_lock:
+        return await _reset_viewport_impl()
 
 
 async def _open_url_impl(url: str, *, headless: bool = True) -> dict:

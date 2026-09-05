@@ -285,6 +285,59 @@ async def _smooth_mouse_move_to(
     _last_mouse_point = (target_x, target_y)
 
 
+async def _stable_viewport_click(
+    page: Page,
+    x: float,
+    y: float,
+    *,
+    double_click: bool = False,
+    button: str = "left",
+    delay: float = 30.0,
+    point_resolver: Any | None = None,
+    move_to: Any | None = None,
+) -> dict[str, float]:
+    """Hover a point to stability, resolve its final location, then trusted-click it."""
+    x, y = float(x), float(y)
+    if not (math.isfinite(x) and math.isfinite(y)):
+        raise ValueError("coordinates must be finite numbers")
+    if button not in {"left", "middle", "right"}:
+        raise ValueError("button must be left, middle or right")
+
+    await _ensure_cursor_helper(page)
+    await (move_to or _smooth_mouse_move_to)(page, x, y)
+    if point_resolver is not None:
+        refreshed = await point_resolver()
+        if not refreshed:
+            raise RuntimeError("target became unavailable after hover")
+        x, y = float(refreshed["x"]), float(refreshed["y"])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError("resolved coordinates must be finite numbers")
+
+    if SHOW_CURSOR:
+        try:
+            await page.evaluate(
+                f"window.__qa_automation_update_cursor && "
+                f"window.__qa_automation_update_cursor({x:.1f}, {y:.1f}, true, true)"
+            )
+        except Exception:
+            pass
+    try:
+        if double_click:
+            await page.mouse.dblclick(x, y, button=button, delay=delay)
+        else:
+            await page.mouse.click(x, y, button=button, delay=delay)
+    finally:
+        if SHOW_CURSOR:
+            try:
+                await page.evaluate(
+                    "window.__qa_automation_hide_cursor && "
+                    "window.__qa_automation_hide_cursor(150)"
+                )
+            except Exception:
+                pass
+    return {"x": x, "y": y}
+
+
 async def _mouse_drag_impl(
     page: Page,
     start_x: float,

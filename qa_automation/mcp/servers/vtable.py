@@ -15,7 +15,7 @@ def create_server() -> FastMCP:
     @mcp.tool()
     @instrument_tool
     async def vtable_discover(frame: str | None = None) -> dict:
-        """识别当前页面所有可见 VTable，并返回 frame 与 table_index。
+        """识别当前页面所有可见 VTable，并返回稳定 frame_id 及 table_index。
 
         后续所有 VTable 工具都应复用返回的 frame/table_index，避免多 iframe 或多表
         页面误绑定到第一张表。
@@ -154,7 +154,7 @@ def create_server() -> FastMCP:
         frame: str | None = None,
         table_index: int | None = None,
     ) -> dict:
-        """读取目标 VTable 矩形区域单元格值(行优先)。"""
+        """读取目标 VTable 矩形区域单元格值（最多 2,000 格，超限请分页）。"""
         return await automation.cells_read(
             col0,
             row0,

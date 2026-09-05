@@ -93,17 +93,17 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `browser_connect` | 工具 | CDP 连接已有浏览器(默认 9222),复用已打开的页面 |
 | `browser_session` | 工具 | 管理隔离 BrowserContext 会话,支持账号 Cookie 环境切换与 storage state |
 | `browser_pages` / `browser_select_page` | 工具 | 列出并显式固定稳定 `page_id`,避免多标签页误操作 |
-| `vtable_discover` | 工具 | 枚举可见 VTable，返回可复用的 `frame` 与 `table_index`，多表页面的必经第一步 |
-| `vtable_cell_click` | 工具 | 目标重新解析后的稳定 trusted 点击 + 回读验证 |
+| `vtable_discover` | 工具 | 枚举可见 VTable，返回稳定 `frame_id` 形式的可复用 `frame` 与 `table_index`，多表页面的必经第一步 |
+| `vtable_cell_click` | 工具 | hover 后重新解析目标中心点的稳定 trusted 点击 + 回读验证 |
 | `vtable_cell_info` | 工具 | 读目标表单元格值/类型/中心点/可见性 |
 | `vtable_cell_resolve` / `vtable_cell_click_by_field` | 工具 | 指定表内用字段+记录索引解析地址并 trusted 点击 |
 | `vtable_analysis` | 工具 | 指定表一次读取列头/scenegraph 图标/有限值单元格的交互证据 |
 | `interaction_chain` | 工具 | 交互工具链：传 actions 一次性批量执行 N 个动作（1 次调用替代 N 次往返），链尾统一观察一次（浮层 + URL 变化）；不传时返回紧凑页面分析供 AI 规划 |
-| `ui_click` / `ui_interact` | 工具 | 统一页面交互：CSS → AX → XPath → 视口坐标，点击前重测目标几何以防 hover 布局抖动 |
+| `ui_click` / `ui_interact` | 工具 | 统一页面交互：CSS → AX → XPath → 视口坐标；定位器匹配必须唯一且可见，点击前重测目标几何以防 hover 布局抖动 |
 | `ui_screenshot` | 工具 | 按元素定位器或顶层 viewport 矩形截取 PNG/JPEG 并保存到 `.qa-automation/screenshots/`，返回文件路径（不再回传整图 base64） |
 | `ui_page_context` / `ui_analyze_scope` | 工具 | 低 token 页面上下文与聚焦层控件分析 |
 | `overlay_scan` / `overlay_observe` | 工具 | 当前活动范围的浮层快照与事件监听 |
-| `ui_snapshot` | 工具 | aria 快照(mode='ai' + boxes):AI 的"语义之眼",含 [ref]/[box](支持 `frame`) |
+| `ui_snapshot` | 工具 | 有深度（最多 8）及 24,000 字符预算的 aria 快照(mode='ai' + boxes)，含 [ref]/[box]（支持 `frame`） |
 | `ui_profile` | 工具 | 返回当前 UI profile、定位器优先级和 VTable 验证策略 |
 | `automation_metrics` | 工具 | 返回工具调用耗时、响应体积和上下文 token 估算 |
 | `vtable_meta` / `vtable_read_cells` | 工具 | 指定表格元数据与矩形单元格批量读取 |
@@ -168,10 +168,11 @@ async with Client(transport) as client:
   `getTableIndexByRecordIndex`;`vtable_cell_click_by_field` 再用
   `scrollToCell` / `getCellRelativeRect` 得到落点。整个链路不扫描 DOM 单元格。
 - **多表/iframe 显式寻址**:先调用 `vtable_discover(frame=...)`。每个 `tables[]` 项的
-  `frame` 是可直接传回其它 VTable 工具的 frame selector，`table.table_index` 是该 frame
-  内的索引；`frame_details` 仅供诊断。未指定索引时，只有唯一可见表或唯一模态框表可自动
-  绑定；并列可见表会明确返回 `table_index is required`，绝不猜第一张。`vtable_analysis`
-  同样受此约束，保证分析、读写、点击和文件拖放始终落在同一实例。
+  `frame` 是稳定的 `frame_id`，可直接传回其它 VTable 工具；`table.table_index` 是该 frame
+  内的索引。名称/URL 选择器仅用于兼容性回退，多个候选会明确报歧义，绝不猜第一张。
+  未指定索引时，只有唯一可见表或唯一模态框表可自动绑定；并列可见表会明确返回
+  `table_index is required`。`vtable_analysis` 同样受此约束，保证分析、读写、点击和文件拖放
+  始终落在同一实例。
 - **稳定 trusted 输入**:`page.mouse.click` 走真实输入管道(`isTrusted=true`)。点击会先滚动
   目标进入视口，连续采样其边界直到稳定，移动鼠标触发 hover 后重新读取最终几何，再点击
   最终中心点；因此目标的 hover 动画、tooltip 或布局位移不会吞掉首次点击。
@@ -265,27 +266,28 @@ async with Client(transport) as client:
   toast 即使在动态二级模块中创建也能保留事件证据。跨域 iframe 无法执行同源
   DOM 观察脚本,会在 `observer_errors` 中明确返回。
   `ui_events` 保留已经消失的短生命周期浮层,`overlays` 是相对点击前新增或文本变化的
-  结果,`visible_overlays` 是结束时仍可见的结果。每项带 `frame_id` / `frame_url` /
-  `frame_name`、`scope`、`kind`、文本、ARIA role、稳定 selector、所属 frame 的
-  `box` 以及主页面 viewport 的 `page_box`。单独的 `overlay_scan` 只做当前
-  状态快照,不适合捕获瞬时 toast。
+  结果,`visible_overlays` 是结束时仍在 viewport 内的结果。每项带 `frame_id` /
+  `frame_url` / `frame_name`、`scope`、`kind`、文本、ARIA role、稳定 CSS selector、
+  `overlay_id`、可选 `parent_overlay_id`、所属 frame 的 `box` 以及主页面 viewport 的
+  `page_box`。`rendered`、`viewport_visible`、`actionable` 分别表示已布局、与 viewport
+  相交、可作为交互作用域；notification/tooltip 可被报告，但不会抢占 `focus_layer`。
+  单独的 `overlay_scan` 只做当前状态快照,不适合捕获瞬时 toast。
   VTable 内嵌搜索编辑器的多个 `.virtual-option` 会合并为一个 dropdown，携带
   `option_count` 与最多三个 `option_preview`，避免候选项逐条占用上下文。
-  `context.focus_layer` 会优先给出当前可交互的 Modal/Drawer/Dropdown/Popover;
-  下一次控件分析应优先限制在该浮层内。
+  `context.focus_layer` 只从可交互的 Modal/Drawer/Dropdown/Popover 中选择，并优先
+  当前焦点、嵌套深度、有效 z-index 和 DOM 堆叠顺序；下一次控件分析应优先限制在该浮层内。
 - **低 token 页面上下文**:`ui_page_context` 只返回 `page_id`、URL、标题、frame 摘要、
   活动 iframe、聚焦浮层和有限数量的可见 overlay。AI 每次交互前优先调用它,
-  下一步使用 `ui_analyze_scope`:Modal/Drawer/Dropdown/Popover 可见时只返回该
+  下一步使用 `ui_analyze_scope`:Modal/Drawer/Dropdown/Popover 可见且可交互时只返回该
   浮层内控件,否则只返回顶层当前文档与活动 iframe 的有限控件。只有诊断语义结构时
   才调用 `ui_snapshot`,避免反复传输无关 iframe 和整页 DOM。
-  `overlay_scan` 默认 `scope="active"` 只看主文档和活动 iframe;
-  没有活动 Tab iframe 结构时自动回退全量 frame,需要排查隐藏模块时可显式传
-  `scope="all"`。所有 overlay 工具支持 `max_results`,
-  默认最多返回 20 条。
-  AntD 表单控件优先携带其 `Form.Item` 标签；同类控件的回退 CSS 会附加 `>> nth=N`，
-  保证可直接用于严格定位。
+  `overlay_scan` 默认 `scope="active"` 只看主文档和活动 iframe；没有活动 Tab iframe
+  时只看主文档。需要排查隐藏模块时显式传 `scope="all"`。所有 overlay 工具支持
+  `max_results`,默认最多返回 20 条。
   `overlay_observe(stop=False)` 会在下一次 observe 调用时推进 baseline 并清空已读事件;
-  它适合连续诊断,而需要严格绑定“点击前/点击后”的场景应使用组合点击工具。
+  它适合连续诊断,而需要严格绑定“点击前/点击后”的场景应使用组合点击工具。事件缓冲区
+  溢出时返回 `events_truncated=true` 和 `dropped_event_count`，调用方不得把截断结果当作
+  完整事件流。
 - **浏览器生命周期**:优先调用 `browser_start(port=9222, headless=false)` 启动受管
   Chrome;它会创建隔离的临时 profile、等待 `/json/version` 就绪并自动接管。启动前会
   预检端口:端口已有可用 CDP 端点(提示改用 `browser_connect` 复用)、被非 Chrome

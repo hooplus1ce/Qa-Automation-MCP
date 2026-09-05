@@ -84,7 +84,9 @@ COMMON_OVERLAY_SELECTORS = (
 
 ANTD_CONTROL_SELECTOR = (
     ".ant-select,.ant-cascader,.ant-tree-select,.ant-picker,.ant-switch,"
-    ".ant-btn,.ant-checkbox-wrapper,.ant-radio-wrapper"
+    ".ant-btn,.ant-checkbox-wrapper,.ant-radio-wrapper,"
+    ".ant-dropdown-menu-item,.ant-select-item-option,.ant-cascader-menu-item,"
+    ".ant-select-tree-treenode"
 )
 
 PROFILES = {

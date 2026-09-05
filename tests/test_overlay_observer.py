@@ -817,6 +817,150 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(glide_x, 300.0, delta=2)
         self.assertAlmostEqual(glide_y, 200.0, delta=2)
 
+    async def test_static_scan_reads_current_dom_without_installing_observer(self) -> None:
+        await self.page.set_content(
+            "<div class='ant-popover' style='width:100px;height:40px'>First</div>"
+        )
+        first = await automation.scan_overlays(scope="all")
+        observer_alive = await self.page.evaluate(
+            "key => Boolean(window[key] && window[key].observer)",
+            automation.OVERLAY_OBSERVER_KEY,
+        )
+        await self.page.set_content(
+            "<div role='status' style='width:100px;height:40px'>Second</div>"
+        )
+        second = await automation.scan_overlays(scope="all")
+
+        self.assertEqual([item["text"] for item in first["overlays"]], ["First"])
+        self.assertFalse(observer_alive)
+        self.assertEqual([item["text"] for item in second["overlays"]], ["Second"])
+
+    async def test_active_scope_excludes_unrelated_iframe_without_active_module(self) -> None:
+        await self.page.set_content(
+            "<button>Top</button>"
+            "<iframe name='unrelated' "
+            "srcdoc=\"<div role='dialog' style='width:100px;height:40px'>Other</div>\">"
+            "</iframe>"
+        )
+        await self.page.locator("iframe").wait_for()
+        await self.page.wait_for_timeout(20)
+
+        result = await automation.scan_overlays(scope="active")
+
+        self.assertEqual(result["overlays"], [])
+
+    async def test_notification_is_reported_without_becoming_focus_layer(self) -> None:
+        await self.page.set_content(
+            "<button>Continue</button>"
+            "<div role='status' style='width:100px;height:40px'>Ready</div>"
+        )
+
+        result = await automation.scan_overlays(scope="all")
+
+        self.assertEqual(result["overlays"][0]["kind"], "notification")
+        self.assertIsNone(result["context"]["focus_layer"])
+
+    async def test_nested_dropdown_is_preserved_and_becomes_focus_layer(self) -> None:
+        await self.page.set_content(
+            "<div id='dialog' role='dialog' style='width:300px;height:200px'>"
+            "<button>Choose</button>"
+            "<div id='options' role='listbox' style='width:120px;height:80px'>"
+            "<div role='option'>Alpha</div></div></div>"
+        )
+
+        result = await automation.scan_overlays(scope="all")
+        by_kind = {item["kind"]: item for item in result["overlays"]}
+
+        self.assertEqual(set(by_kind), {"dialog", "dropdown"})
+        self.assertEqual(
+            by_kind["dropdown"]["parent_overlay_id"], by_kind["dialog"]["overlay_id"]
+        )
+        self.assertEqual(result["context"]["focus_layer"]["overlay_id"], by_kind["dropdown"]["overlay_id"])
+
+    async def test_topmost_popover_wins_over_dialog_by_stack(self) -> None:
+        await self.page.set_content(
+            "<div id='dialog' role='dialog' "
+            "style='position:fixed;z-index:100;width:300px;height:200px'>Dialog</div>"
+            "<div id='popover' class='ant-popover' "
+            "style='position:fixed;z-index:200;left:50px;top:50px;width:120px;height:60px'>"
+            "Popover</div>"
+        )
+
+        result = await automation.scan_overlays(scope="all")
+
+        self.assertEqual(result["context"]["focus_layer"]["selector"], "#popover")
+
+    async def test_equal_text_overlays_remain_distinct_with_unique_css(self) -> None:
+        await self.page.set_content(
+            "<div class='confirm' role='dialog' "
+            "style='position:fixed;width:100px;height:50px'>Confirm</div>"
+            "<div class='confirm' role='dialog' "
+            "style='position:fixed;left:120px;width:100px;height:50px'>Confirm</div>"
+        )
+
+        result = await automation.scan_overlays(scope="all")
+        dialogs = [item for item in result["overlays"] if item["kind"] == "dialog"]
+        selector_counts = await self.page.evaluate(
+            "selectors => selectors.map(selector => document.querySelectorAll(selector).length)",
+            [item["selector"] for item in dialogs],
+        )
+
+        self.assertEqual(len(dialogs), 2)
+        self.assertEqual(selector_counts, [1, 1])
+        self.assertEqual(len({item["overlay_id"] for item in dialogs}), 2)
+
+    async def test_scope_analysis_exposes_antd_dropdown_items(self) -> None:
+        await self.page.set_content(
+            "<div class='ant-select-dropdown' role='listbox' "
+            "style='width:180px;height:80px'>"
+            "<div class='ant-select-item-option'>East warehouse</div>"
+            "<div class='ant-select-item-option ant-select-item-option-disabled'>"
+            "West warehouse</div></div>"
+        )
+
+        result = await automation.analyze_scope(max_controls=10)
+        by_name = {item["name"]: item for item in result["controls"]}
+
+        self.assertEqual(result["scope"]["mode"], "focus_layer")
+        self.assertFalse(by_name["East warehouse"]["disabled"])
+        self.assertTrue(by_name["West warehouse"]["disabled"])
+
+    async def test_offscreen_overlay_is_rendered_but_not_viewport_visible(self) -> None:
+        await self.page.set_content(
+            "<div role='dialog' style='position:fixed;left:-5000px;top:0;"
+            "width:100px;height:50px'>Parked</div>"
+        )
+
+        result = await automation.scan_overlays(scope="all")
+
+        self.assertEqual(result["overlays"], [])
+        self.assertIsNone(result["context"]["focus_layer"])
+
+    async def test_observer_reports_event_buffer_truncation(self) -> None:
+        await self.page.set_content("<main>APS</main>")
+        armed = await automation.observe_overlays(settle_ms=0, stop=False)
+        self.assertEqual(armed["status"], "ok")
+        await self.page.evaluate(
+            """count => {
+              for (let i = 0; i < count; i++) {
+                const item = document.createElement('div');
+                item.id = `notice-${i}`;
+                item.className = 'ant-message-notice';
+                item.setAttribute('role', 'status');
+                item.textContent = `Notice ${i}`;
+                item.style.cssText =
+                  `position:fixed;left:${i % 10}px;top:${i % 10}px;width:80px;height:20px`;
+                document.body.append(item);
+              }
+            }""",
+            automation.OVERLAY_EVENT_LIMIT + 25,
+        )
+
+        result = await automation.observe_overlays(settle_ms=20, stop=True)
+
+        self.assertTrue(result["events_truncated"])
+        self.assertGreaterEqual(result["dropped_event_count"], 25)
+
     async def test_mouse_drag_dispatches_sequential_events_with_continuous_movement(self) -> None:
         await self.page.set_content(
             "<canvas id='drag-box' width='300' height='300' style='position:absolute;left:10px;top:10px;width:300px;height:300px;'></canvas>"

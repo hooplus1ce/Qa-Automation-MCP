@@ -100,6 +100,59 @@ class CursorSettleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await page.evaluate("window.__clicks"), 1)
         await automation.close_browser()
 
+    async def test_shared_viewport_click_rechecks_point_after_hover_layout_shift(self) -> None:
+        try:
+            await automation.start_browser(headless=True)
+        except Exception as exc:
+            raise unittest.SkipTest(f"Playwright browser unavailable: {exc}") from exc
+
+        page = await automation.current_page()
+        await page.set_content(
+            "<div id='target' style='position:absolute;left:50px;top:50px;width:100px;height:40px'>"
+            "<script>"
+            "const target = document.querySelector('#target');"
+            "window.__clicks = 0;"
+            "target.addEventListener('mouseenter', () => target.style.left = '180px');"
+            "target.addEventListener('click', () => window.__clicks++);"
+            "</script>"
+        )
+
+        async def resolve_point() -> dict[str, float]:
+            box = await page.locator("#target").bounding_box()
+            assert box is not None
+            return {
+                "x": box["x"] + box["width"] / 2,
+                "y": box["y"] + box["height"] / 2,
+            }
+
+        point = await automation._stable_viewport_click(
+            page, 100, 70, point_resolver=resolve_point
+        )
+
+        self.assertEqual(await page.evaluate("window.__clicks"), 1)
+        self.assertGreater(point["x"], 200)
+        await automation.close_browser()
+
+    async def test_semantic_click_rejects_ambiguous_visible_controls(self) -> None:
+        try:
+            await automation.start_browser(headless=True)
+        except Exception as exc:
+            raise unittest.SkipTest(f"Playwright browser unavailable: {exc}") from exc
+
+        page = await automation.current_page()
+        await page.set_content(
+            "<button>Save</button><button>Save</button>"
+            "<script>window.__clicks = 0; document.querySelectorAll('button').forEach("
+            "button => button.onclick = () => window.__clicks++);</script>"
+        )
+
+        result = await automation.click_dom("button", name="Save")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("ambiguous", result["reason"])
+        self.assertEqual(await page.evaluate("window.__clicks"), 0)
+        await automation.close_browser()
+
 
 if __name__ == "__main__":
     unittest.main()

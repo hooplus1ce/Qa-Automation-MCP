@@ -157,6 +157,8 @@ async def _drain_overlay_observers(
     baseline: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     stop_errors: list[dict[str, Any]] = []
+    events_truncated = False
+    dropped_event_count = 0
     if frame_listener is not None:
         await frame_listener.wait_pending()
         listener_events, listener_errors = frame_listener.take_buffers()
@@ -187,6 +189,8 @@ async def _drain_overlay_observers(
                 current.append({**_frame_details(page, frame), **item})
             for item in result.get("baseline", []):
                 baseline.append({**_frame_details(page, frame), **item})
+            events_truncated = events_truncated or bool(result.get("events_truncated"))
+            dropped_event_count += int(result.get("dropped_event_count", 0) or 0)
         except Exception as exc:
             error = {**_frame_details(page, frame), "reason": str(exc)[:500]}
             errors.append(error)
@@ -198,6 +202,8 @@ async def _drain_overlay_observers(
         "baseline": _dedupe_overlays(baseline),
         "errors": errors,
         "stop_errors": stop_errors,
+        "events_truncated": events_truncated,
+        "dropped_event_count": dropped_event_count,
     }
 
 
@@ -237,6 +243,8 @@ async def _finalize_overlay_observation(
                     {"reason": f"observer-drain-error: {exc}"},
                     *cleanup_errors,
                 ],
+                "events_truncated": False,
+                "dropped_event_count": 0,
                 "observer_cleanup_failed": bool(cleanup_errors),
             }
         )
@@ -278,6 +286,8 @@ async def _finalize_overlay_observation(
                 *drained["errors"],
                 *listener_errors,
             ],
+            "events_truncated": bool(drained["events_truncated"]),
+            "dropped_event_count": int(drained["dropped_event_count"]),
             "observer_cleanup_failed": bool(drained["stop_errors"] or listener_errors),
         }
     )
@@ -292,8 +302,10 @@ async def _scan_overlays_impl(
     errors: list[dict[str, Any]] = []
     for frame in list(page.frames):
         try:
-            res = await frame.evaluate(_overlay_script(_OVERLAY_OBSERVER_TEMPLATE, reset=False))
-            for item in res.get("baseline", []):
+            res = await frame.evaluate(
+                _overlay_script(_OVERLAY_OBSERVER_TEMPLATE, observe=False)
+            )
+            for item in res.get("current", []):
                 raw_items.append({**_frame_details(page, frame), **item})
         except Exception as exc:
             errors.append({**_frame_details(page, frame), "reason": str(exc)[:500]})
@@ -375,6 +387,8 @@ async def _observe_overlays_impl(
                 *drained["errors"],
                 *listener_errors,
             ],
+            "events_truncated": bool(drained["events_truncated"]),
+            "dropped_event_count": int(drained["dropped_event_count"]),
             "stopped": stop,
             "observer_cleanup_failed": bool(
                 stop and (drained["stop_errors"] or listener_errors)
@@ -392,6 +406,8 @@ async def _observe_overlays_impl(
             "reason": f"overlay-observe-error: {exc}",
             "page_id": _page_id(page),
             "observer_errors": cleanup_errors,
+            "events_truncated": False,
+            "dropped_event_count": 0,
             "observer_cleanup_failed": bool(cleanup_errors),
         }
 

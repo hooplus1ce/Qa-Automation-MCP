@@ -17,6 +17,7 @@ from ..browser import (
     _frame_id,
     _frame_page_offset,
     _page_id,
+    _page_viewport_size,
 )
 from ..components.vtable.binding import (
     active_application_frame,
@@ -126,6 +127,9 @@ _COMPACT_CONTROL_SCAN = r"""
     '[role="combobox"]',
     '[role="textbox"]',
     '[role="tab"]',
+    '[role="menuitem"]',
+    '[role="option"]',
+    '[role="treeitem"]',
     '.ant-select-selection',
     '.ant-pagination-item',
     '.ant-pagination-prev',
@@ -159,7 +163,14 @@ _COMPACT_CONTROL_SCAN = r"""
       css: selectorFor(el, scopeRoot === document.body ? null : scopeRoot),
       tag,
       input_type: el.getAttribute('type') || '',
-      disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('ant-btn-disabled')),
+      disabled: Boolean(
+        el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+        el.classList.contains('ant-btn-disabled') ||
+        el.classList.contains('ant-dropdown-menu-item-disabled') ||
+        el.classList.contains('ant-select-item-option-disabled') ||
+        el.classList.contains('ant-cascader-menu-item-disabled') ||
+        el.classList.contains('ant-select-tree-treenode-disabled')
+      ),
       readonly: Boolean(el.readOnly || el.getAttribute('aria-readonly') === 'true'),
       state: {
         ...(role === 'checkbox' || role === 'radio' ? { checked: Boolean(el.checked || el.getAttribute('aria-checked') === 'true') } : {}),
@@ -208,6 +219,10 @@ async def _focused_editable(page: Page) -> dict[str, Any] | None:
     return None
 
 
+_MAX_SNAPSHOT_DEPTH = 8
+_MAX_SNAPSHOT_CHARACTERS = 24_000
+
+
 async def _dom_snapshot_impl(
     *,
     selector: str | None = None,
@@ -220,15 +235,23 @@ async def _dom_snapshot_impl(
     target_frame = await resolve_frame(page, frame)
     target = target_frame.locator(selector) if selector else target_frame.locator(":root")
     kwargs: dict[str, Any] = {"mode": "ai" if ai_mode else "default", "boxes": bool(boxes)}
-    if depth is not None and depth > 0:
-        kwargs["depth"] = depth
+    requested_depth = depth if depth is not None and depth > 0 else None
+    if requested_depth is not None:
+        kwargs["depth"] = min(requested_depth, _MAX_SNAPSHOT_DEPTH)
     snapshot = await target.aria_snapshot(**kwargs)
+    truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+    if truncated:
+        snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
     return {
         "status": "ok",
         "selector": selector,
         "frame": frame,
         "mode": kwargs["mode"],
         "boxes": kwargs["boxes"],
+        "depth": kwargs.get("depth"),
+        "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
+        "truncated": truncated,
+        "character_limit": _MAX_SNAPSHOT_CHARACTERS,
         "snapshot": snapshot,
     }
 
@@ -266,7 +289,9 @@ async def _analyze_scope_impl(
     scope_selector = None
     mode = "active_application"
     if focus is not None:
-        target_frame = await resolve_frame(page, focus.get("frame_name") or focus.get("frame_id"))
+        target_frame = await resolve_frame(
+            page, focus.get("frame_id") or focus.get("frame_name")
+        )
         scope_selector = focus.get("selector")
         mode = "focus_layer"
 
@@ -423,9 +448,7 @@ async def _screenshot_element_impl(
             in_iframe=in_iframe,
             timeout_ms=timeout_ms,
         )
-    elif not coordinate_supplied:
-        raise ValueError("one locator or x/y/width/height viewport rectangle is required")
-    elif frame not in {None, "top", "main", "main_frame"}:
+    elif coordinate_supplied and frame not in {None, "top", "main", "main_frame"}:
         raise ValueError("viewport screenshot coordinates are top-page CSS pixels; omit frame")
 
     if locator is not None:
@@ -441,7 +464,7 @@ async def _screenshot_element_impl(
             "height": float(box["height"]) + padding * 2,
         }
         frame_details = _frame_details(page, target_frame)
-    else:
+    elif coordinate_supplied:
         clip = {
             "x": max(0.0, float(x)),
             "y": max(0.0, float(y)),
@@ -451,13 +474,30 @@ async def _screenshot_element_impl(
         if clip["width"] <= 0 or clip["height"] <= 0:
             raise ValueError("viewport screenshot width and height must be positive")
         frame_details = _frame_details(page, page.main_frame)
+    else:
+        # 既未提供定位器也未提供坐标时，默认捕获顶层视口完整画面，避免模型盲猜坐标导致视口失调
+        vp = await _page_viewport_size(page)
+        clip = {
+            "x": 0.0,
+            "y": 0.0,
+            "width": vp["width"],
+            "height": vp["height"],
+        }
+        frame_details = _frame_details(page, page.main_frame)
 
     screenshot_kwargs: dict[str, Any] = {"clip": clip, "type": image_format}
     if image_format == "jpeg" and quality is not None:
         if not 1 <= quality <= 100:
             raise ValueError("quality must be between 1 and 100")
         screenshot_kwargs["quality"] = quality
-    image = await page.screenshot(**screenshot_kwargs)
+    try:
+        image = await page.screenshot(**screenshot_kwargs)
+    finally:
+        try:
+            from ..browser import _maximize_and_fill_viewport
+            await _maximize_and_fill_viewport(page)
+        except Exception:
+            pass
     expected_extensions = {".png"} if image_format == "png" else {".jpg", ".jpeg"}
     requested_filename = filename
     if requested_filename:

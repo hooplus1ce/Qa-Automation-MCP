@@ -49,7 +49,7 @@ TENCENT_DOCS_MCP_URL = os.getenv("TENCENT_DOCS_MCP_URL", "https://docs.qq.com/op
 
 
 def resolve_tencent_docs_token() -> str:
-    """解析腾讯文档 MCP 访问凭证，优先环境变量，次选本地配置文件，最后回退默认 Token。"""
+    """Resolve the Tencent Docs MCP token from explicit local configuration."""
     token = os.getenv("TENCENT_DOCS_MCP_TOKEN")
     if token and token.strip():
         return token.strip()
@@ -74,7 +74,10 @@ def resolve_tencent_docs_token() -> str:
             except Exception:
                 pass
 
-    return "54a4eac855de4696905b562a96e066ff"
+    raise RuntimeError(
+        "Tencent Docs MCP token is not configured. Set TENCENT_DOCS_MCP_TOKEN "
+        "or configure it in the local MCP client settings."
+    )
 ACTIVE_PROFILE = active_profile()
 ACTIVE_IFRAME_SELECTOR = ACTIVE_PROFILE.active_iframe_selector
 ANTD_OVERLAY_SELECTOR = ",".join(ACTIVE_PROFILE.overlay_selectors)
