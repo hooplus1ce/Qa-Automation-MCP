@@ -9,3 +9,14 @@ dist/
 .zcode/
 .env.qa-automation
 .qa-automation/
+~$*.xlsx
+generate_*.py
+all_departments.json
+available_devices_latest.json
+backend_options.json
+cached_equipment_data.json
+devices_with_ids.json
+dict_values.json
+new_available_devices_167.json
+new_devices_data.json
+real_api_responses.json

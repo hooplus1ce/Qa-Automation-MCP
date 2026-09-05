@@ -1,4 +1,5 @@
 {
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
   "mcpServers": {
     "qa-automation": {
       "type": "stdio",
@@ -15,7 +16,8 @@
         "run",
         "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
         "--no-banner"
-      ]
+      ],
+      "enabled": true
     },
     "tencent-docs": {
       "type": "http",

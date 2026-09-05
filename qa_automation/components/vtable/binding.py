@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -305,8 +307,7 @@ async def ensure_cell_visible(page: Page, frame: Frame, col: int, row: int) -> b
             const t = window._vtable;
             if (!t) return false;
             if (typeof t.scrollToCell === 'function') {
-                t.scrollToCell(col, row);
-                t.scrollToCell({col, row});
+                t.scrollToCell({ col: Number(col), row: Number(row) });
             }
             const rect = t.getCellRelativeRect ? t.getCellRelativeRect(col, row) : null;
             if (rect) {
@@ -337,8 +338,13 @@ async def ensure_cell_visible(page: Page, frame: Frame, col: int, row: int) -> b
         }""",
         [col, row],
     )
-    for _ in range(SCROLL_WAIT_RAF):
-        await frame.evaluate(_wrap(WAIT_RENDER))
+    deadline = time.monotonic() + 0.35
+    while time.monotonic() < deadline:
+        for _ in range(SCROLL_WAIT_RAF):
+            await frame.evaluate(_wrap(WAIT_RENDER))
+        if await cell_visible(frame, col, row):
+            return True
+        await asyncio.sleep(0.03)
     return await cell_visible(frame, col, row)
 
 async def _resolve_vtable_cell_impl(

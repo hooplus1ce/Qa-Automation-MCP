@@ -53,7 +53,6 @@ _LOCATOR_KEYS = (
 
 #: Optional value/key plumbing for fill/type/press plus frame steering.
 _DOM_EXTRA_KEYS = ("value", "key", "frame", "timeout_ms", "expect_input", "in_iframe")
-
 _SUCCESS_STATUSES = frozenset({"acted", "clicked", "ok", "selected", "dragged", "waited"})
 
 
@@ -238,10 +237,13 @@ async def _execute_one(action: str, item: dict) -> dict:
         return _trim_result(action, raw)
 
     # Generic DOM actions via dom_interact; coordinate fallback is delegated
-    # inside the primitive (click/dblclick/rightclick/hover/fill/type support it).
     kwargs = _locator_kwargs(item)
+    kwargs.pop("settle_ms", None)
+    settle_ms = item.get("settle_ms")
+    if not isinstance(settle_ms, int) or settle_ms < 0:
+        settle_ms = 80
     raw = await automation.dom_interact(
-        action, observe_after=False, settle_ms=200, **kwargs
+        action, observe_after=False, settle_ms=settle_ms, **kwargs
     )
     return _trim_result(action, raw)
 

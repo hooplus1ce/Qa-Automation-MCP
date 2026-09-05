@@ -71,6 +71,11 @@ async def _find_interaction_locator(
             if description:
                 kwargs["description"] = description
             available["ax-role"] = candidate.get_by_role(role, **kwargs)
+            if role in {"combobox", "control", "select"} and name:
+                available["antd-form-item"] = candidate.locator(
+                    f".ant-form-item:has(.ant-form-item-label:has-text('{name}')), "
+                    f".ant-form-item:has-text('{name}')"
+                ).locator(".ant-select, .ant-cascader, .ant-tree-select")
         if xpath:
             available["xpath"] = candidate.locator(f"xpath={xpath}")
         if text:
@@ -95,11 +100,15 @@ async def _find_interaction_locator(
 
 
 async def _visible_antd_dropdown(target: Any) -> Any | None:
-    selector = ",".join(ACTIVE_PROFILE.dropdown_selectors)
-    locator = target.locator(selector)
+    selectors = [
+        f"{s}:not([class*='leave'])"
+        for s in ACTIVE_PROFILE.dropdown_selectors
+    ]
+    locator = target.locator(",".join(selectors))
     try:
-        for index in range(await locator.count() - 1, -1, -1):
-            candidate = locator.nth(index)
+        count = await locator.count()
+        if count > 0:
+            candidate = locator.last
             if await candidate.is_visible():
                 return candidate
     except Exception:
@@ -121,7 +130,12 @@ async def _click_unique_antd_option(
         except Exception:
             visible = []
         if len(visible) == 1:
-            await visible[0].click(timeout=timeout_ms)
+            target_el = visible[0]
+            try:
+                await target_el.scroll_into_view_if_needed(timeout=min(1000, timeout_ms))
+                await target_el.click(timeout=timeout_ms)
+            except Exception:
+                await target_el.click(timeout=timeout_ms, force=True)
             return {"match": "exact-role", "role": role, "text": option_text}
         if len(visible) > 1:
             raise ValueError(
@@ -144,7 +158,12 @@ async def _click_unique_antd_option(
 
     exact = [item for item in visible_candidates if item[1] == option_text]
     if len(exact) == 1:
-        await exact[0][0].click(timeout=timeout_ms)
+        target_el = exact[0][0]
+        try:
+            await target_el.scroll_into_view_if_needed(timeout=min(1000, timeout_ms))
+            await target_el.click(timeout=timeout_ms)
+        except Exception:
+            await target_el.click(timeout=timeout_ms, force=True)
         return {"match": "exact-text", "text": exact[0][1]}
     if len(exact) > 1:
         raise ValueError(
@@ -154,7 +173,12 @@ async def _click_unique_antd_option(
 
     partial = [item for item in visible_candidates if option_text in item[1]]
     if len(partial) == 1:
-        await partial[0][0].click(timeout=timeout_ms)
+        target_el = partial[0][0]
+        try:
+            await target_el.scroll_into_view_if_needed(timeout=min(1000, timeout_ms))
+            await target_el.click(timeout=timeout_ms)
+        except Exception:
+            await target_el.click(timeout=timeout_ms, force=True)
         return {"match": "partial-text", "text": partial[0][1]}
     if len(partial) > 1:
         raise ValueError(
@@ -195,6 +219,7 @@ async def _perform_antd_select(
     if target_frame != page.main_frame:
         targets.append(page.main_frame)
     deadline = time.monotonic() + max(0.2, timeout_ms / 1000)
+    typed_search = False
     while time.monotonic() < deadline:
         for target in targets:
             dropdown = await _visible_antd_dropdown(target)
@@ -217,5 +242,15 @@ async def _perform_antd_select(
                     "trigger_text_after": after_text,
                     "portal_frame": _frame_details(page, target),
                 }
+            if not typed_search:
+                search_field = first.locator(".ant-select-search__field")
+                try:
+                    if await search_field.count() > 0 and await search_field.first.is_visible():
+                        await search_field.first.fill(option_text)
+                        typed_search = True
+                        await page.wait_for_timeout(250)
+                        break
+                except Exception:
+                    pass
         await page.wait_for_timeout(100)
     raise ValueError(f"AntD option not found: {option_text!r}")
