@@ -81,6 +81,14 @@ _COMPACT_CONTROL_SCAN = r"""
       const text = trim(label ? (label.innerText || label.textContent) : '');
       if (text) return text;
     }
+    const treeNode = el.closest ? el.closest('.ant-tree-treenode, li, .ant-checkbox-wrapper, label') : null;
+    if (treeNode) {
+      const titleEl = treeNode.querySelector('.ant-tree-title, .ant-checkbox + span');
+      const text = trim(titleEl ? (titleEl.innerText || titleEl.textContent) : '');
+      if (text) return text;
+      const nodeText = trim(treeNode.innerText || treeNode.textContent);
+      if (nodeText) return nodeText;
+    }
     return trim(el.innerText || el.textContent);
   };
 
@@ -130,6 +138,9 @@ _COMPACT_CONTROL_SCAN = r"""
     '[role="menuitem"]',
     '[role="option"]',
     '[role="treeitem"]',
+    '.ant-checkbox',
+    '.ant-tree-checkbox',
+    '.ant-switch',
     '.ant-select-selection',
     '.ant-pagination-item',
     '.ant-pagination-prev',
@@ -145,7 +156,11 @@ _COMPACT_CONTROL_SCAN = r"""
     if (!isVisible(el)) continue;
     const tag = el.tagName.toLowerCase();
     const explicitRole = el.getAttribute('role');
+    const isAntCheckbox = el.classList.contains('ant-checkbox') || el.classList.contains('ant-tree-checkbox');
+    const isAntSwitch = el.classList.contains('ant-switch');
     const role = explicitRole || (
+      isAntCheckbox ? 'checkbox' :
+      isAntSwitch ? 'switch' :
       tag === 'button' ? 'button' :
       tag === 'select' ? 'combobox' :
       tag === 'textarea' ? 'textbox' :
@@ -166,14 +181,31 @@ _COMPACT_CONTROL_SCAN = r"""
       disabled: Boolean(
         el.disabled || el.getAttribute('aria-disabled') === 'true' ||
         el.classList.contains('ant-btn-disabled') ||
+        el.classList.contains('ant-checkbox-disabled') ||
+        el.classList.contains('ant-tree-checkbox-disabled') ||
+        el.classList.contains('ant-switch-disabled') ||
         el.classList.contains('ant-dropdown-menu-item-disabled') ||
         el.classList.contains('ant-select-item-option-disabled') ||
         el.classList.contains('ant-cascader-menu-item-disabled') ||
-        el.classList.contains('ant-select-tree-treenode-disabled')
+        el.classList.contains('ant-select-tree-treenode-disabled') ||
+        Boolean(el.closest && el.closest('.ant-checkbox-wrapper-disabled, .ant-tree-treenode-disabled'))
       ),
       readonly: Boolean(el.readOnly || el.getAttribute('aria-readonly') === 'true'),
       state: {
-        ...(role === 'checkbox' || role === 'radio' ? { checked: Boolean(el.checked || el.getAttribute('aria-checked') === 'true') } : {}),
+        ...(role === 'checkbox' || role === 'radio' || role === 'switch' ? {
+          checked: Boolean(
+            el.checked ||
+            el.getAttribute('aria-checked') === 'true' ||
+            el.classList.contains('ant-checkbox-checked') ||
+            el.classList.contains('ant-tree-checkbox-checked') ||
+            el.classList.contains('ant-switch-checked') ||
+            (el.closest && (
+              el.closest('.ant-checkbox-checked') ||
+              el.closest('.ant-tree-checkbox-checked') ||
+              el.closest('.ant-checkbox-wrapper-checked')
+            ))
+          )
+        } : {}),
         ...(role === 'combobox' ? { expanded: Boolean(el.getAttribute('aria-expanded') === 'true' || el.closest('.ant-select-open')) } : {}),
       },
       box: {
@@ -234,6 +266,36 @@ async def _dom_snapshot_impl(
     page = await _current_page_impl()
     target_frame = await resolve_frame(page, frame)
     target = target_frame.locator(selector) if selector else target_frame.locator(":root")
+    try:
+        await target_frame.evaluate("""() => {
+            const checkboxes = document.querySelectorAll('.ant-checkbox, .ant-tree-checkbox');
+            for (const el of checkboxes) {
+                if (!el.getAttribute('role')) el.setAttribute('role', 'checkbox');
+                const checked = el.classList.contains('ant-checkbox-checked') ||
+                                el.classList.contains('ant-tree-checkbox-checked') ||
+                                Boolean(el.closest && el.closest('.ant-checkbox-wrapper-checked'));
+                el.setAttribute('aria-checked', checked ? 'true' : 'false');
+                if (el.classList.contains('ant-checkbox-disabled') || el.classList.contains('ant-tree-checkbox-disabled')) {
+                    el.setAttribute('aria-disabled', 'true');
+                }
+                if (!el.getAttribute('aria-label')) {
+                    const parent = el.closest('.ant-tree-treenode, li, .ant-checkbox-wrapper, label');
+                    if (parent) {
+                        const title = parent.querySelector('.ant-tree-title, .ant-checkbox + span');
+                        const text = (title ? (title.innerText || title.textContent) : (parent.innerText || parent.textContent) || '').trim();
+                        if (text) el.setAttribute('aria-label', text);
+                    }
+                }
+            }
+            const switches = document.querySelectorAll('.ant-switch');
+            for (const el of switches) {
+                if (!el.getAttribute('role')) el.setAttribute('role', 'switch');
+                const checked = el.classList.contains('ant-switch-checked');
+                el.setAttribute('aria-checked', checked ? 'true' : 'false');
+            }
+        }""")
+    except Exception:
+        pass
     kwargs: dict[str, Any] = {"mode": "ai" if ai_mode else "default", "boxes": bool(boxes)}
     requested_depth = depth if depth is not None and depth > 0 else None
     if requested_depth is not None:

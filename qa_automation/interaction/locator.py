@@ -76,6 +76,13 @@ async def _find_interaction_locator(
                     f".ant-form-item:has(.ant-form-item-label:has-text('{name}')), "
                     f".ant-form-item:has-text('{name}')"
                 ).locator(".ant-select, .ant-cascader, .ant-tree-select")
+            if role in {"checkbox", "control"} and name:
+                available["antd-checkbox"] = candidate.locator(
+                    f"label.ant-checkbox-wrapper:has-text('{name}'), "
+                    f"li:has-text('{name}') .ant-tree-checkbox, "
+                    f".ant-tree-treenode:has-text('{name}') .ant-tree-checkbox, "
+                    f".ant-checkbox-wrapper:has-text('{name}') .ant-checkbox"
+                )
         if xpath:
             available["xpath"] = candidate.locator(f"xpath={xpath}")
         if text:

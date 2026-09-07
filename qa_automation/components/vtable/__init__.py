@@ -430,7 +430,38 @@ async def _cell_info_impl(
         }
 
     value = await frame.evaluate(
-        f"() => {{ const t = window._vtable; return t ? t.getCellValue({col}, {row}) : null; }}"
+        f"""() => {{
+            const t = window._vtable;
+            if (!t) return null;
+            if (t.scenegraph && typeof t.scenegraph.getCell === 'function') {{
+                try {{
+                    const cell = t.scenegraph.getCell({col}, {row});
+                    if (cell) {{
+                        let sgText = null;
+                        const walk = (n) => {{
+                            if (sgText !== null) return;
+                            if (n.attribute && n.attribute.text !== undefined && n.attribute.text !== null) {{
+                                let raw = n.attribute.text;
+                                if (typeof raw === 'object' && raw !== null) raw = raw.text !== undefined ? raw.text : '';
+                                if (typeof raw === 'string' || typeof raw === 'number') {{
+                                    sgText = String(raw);
+                                    return;
+                                }}
+                            }}
+                            if (n.children && n.children.length) {{
+                                for (let i = 0; i < n.children.length; i++) {{
+                                    walk(n.children[i]);
+                                    if (sgText !== null) return;
+                                }}
+                            }}
+                        }};
+                        walk(cell);
+                        if (sgText !== null && sgText !== undefined) return sgText;
+                    }}
+                }} catch (_) {{}}
+            }}
+            return t.getCellValue ? t.getCellValue({col}, {row}) : null;
+        }}"""
     )
     center = await cell_center(page, frame, col, row)
     visible = await cell_visible(frame, col, row)

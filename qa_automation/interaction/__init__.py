@@ -121,10 +121,25 @@ async def _perform_dom_action(
         if key is None:
             raise ValueError("press requires key")
         await locator.press(key, **kwargs)
-    elif action == "check":
-        await locator.check(**kwargs)
-    elif action == "uncheck":
-        await locator.uncheck(**kwargs)
+    elif action in {"check", "uncheck"}:
+        try:
+            if action == "check":
+                await locator.check(**kwargs)
+            else:
+                await locator.uncheck(**kwargs)
+        except Exception:
+            is_checked = await locator.evaluate("""
+                el => el.classList.contains('ant-checkbox-checked') ||
+                      el.classList.contains('ant-tree-checkbox-checked') ||
+                      el.classList.contains('ant-switch-checked') ||
+                      el.getAttribute('aria-checked') === 'true' ||
+                      Boolean(el.closest && (
+                          el.closest('.ant-checkbox-wrapper-checked') ||
+                          el.closest('.ant-tree-checkbox-checked')
+                      ))
+            """)
+            if (action == "check" and not is_checked) or (action == "uncheck" and is_checked):
+                await _stable_locator_click(page, locator, timeout_ms=timeout_ms)
     elif action == "select":
         if value is None:
             raise ValueError("select requires value")

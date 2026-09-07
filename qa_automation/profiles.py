@@ -12,8 +12,9 @@ class LocatorStrategy:
     order: tuple[str, ...] = (
         "css",
         "ax-role",
-        "antd-form-item",
         "xpath",
+        "antd-checkbox",
+        "antd-form-item",
         "text",
         "placeholder",
         "coordinate",

@@ -456,12 +456,48 @@ return (function(col0, row0, col1, row1){
   const minRow = Math.min(row0, row1), maxRow = Math.max(row0, row1);
   // 行优先 2D 矩阵:values[r-minRow][c-minCol] = {v, err},坐标由 min*/索引推导,
   // 避免每格重复输出 c/r(省 ~15% 体积)
+  const extractSgText = (cell) => {
+    if (!cell) return null;
+    let textVal = null;
+    const walk = (n) => {
+      if (textVal !== null) return;
+      if (n.attribute && n.attribute.text !== undefined && n.attribute.text !== null) {
+        let raw = n.attribute.text;
+        if (typeof raw === 'object' && raw !== null) raw = raw.text !== undefined ? raw.text : '';
+        if (typeof raw === 'string' || typeof raw === 'number') {
+          textVal = String(raw);
+          return;
+        }
+      }
+      if (n.children && n.children.length) {
+        for (let i = 0; i < n.children.length; i++) {
+          walk(n.children[i]);
+          if (textVal !== null) return;
+        }
+      }
+    };
+    walk(cell);
+    return textVal;
+  };
   const values = [];
   for (let r = minRow; r <= maxRow; r++) {
     const line = [];
     for (let c = minCol; c <= maxCol; c++) {
       let v = null, err = null;
-      try { v = t.getCellValue ? t.getCellValue(c, r) : null; }
+      try {
+        let sgText = null;
+        if (t.scenegraph && typeof t.scenegraph.getCell === 'function') {
+          try {
+            const cell = t.scenegraph.getCell(c, r);
+            sgText = extractSgText(cell);
+          } catch (_) {}
+        }
+        if (sgText !== null && sgText !== undefined) {
+          v = sgText;
+        } else {
+          v = t.getCellValue ? t.getCellValue(c, r) : null;
+        }
+      }
       catch (e) { err = String(e); }
       line.push({ v, err });
     }

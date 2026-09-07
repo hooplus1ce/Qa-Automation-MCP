@@ -420,5 +420,23 @@ class ViewportHealthTests(unittest.IsolatedAsyncioTestCase):
         plain_page = SimpleNamespace(is_closed=lambda: False)
         await b._maximize_and_fill_viewport(plain_page)
 
+
+class AntdCheckboxSupportTests(unittest.TestCase):
+    def test_compact_control_scan_includes_antd_checkbox_selectors(self) -> None:
+        from qa_automation.interaction.snapshot import _COMPACT_CONTROL_SCAN
+
+        self.assertIn(".ant-checkbox", _COMPACT_CONTROL_SCAN)
+        self.assertIn(".ant-tree-checkbox", _COMPACT_CONTROL_SCAN)
+        self.assertIn(".ant-switch", _COMPACT_CONTROL_SCAN)
+        self.assertIn("ant-checkbox-checked", _COMPACT_CONTROL_SCAN)
+        self.assertIn("ant-tree-checkbox-checked", _COMPACT_CONTROL_SCAN)
+        self.assertIn("ant-switch-checked", _COMPACT_CONTROL_SCAN)
+
+    def test_locator_strategy_includes_antd_checkbox(self) -> None:
+        from qa_automation.profiles import LocatorStrategy
+
+        strategy = LocatorStrategy()
+        self.assertIn("antd-checkbox", strategy.order)
+        self.assertTrue(strategy.order.index("antd-checkbox") > strategy.order.index("css"))
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
