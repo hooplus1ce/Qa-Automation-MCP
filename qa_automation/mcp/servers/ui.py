@@ -222,6 +222,10 @@ def create_server() -> FastMCP:
         depth: int = 6,
         boxes: bool = True,
         ai_mode: bool = True,
+        nth: int | None = None,
+        visible_only: bool = False,
+        max_elements: int = 5,
+        timeout: float = 3.0,
     ) -> dict:
         """抓取页面 aria 快照(mode='ai' + boxes),给 AI 一张"语义之眼"。
 
@@ -229,6 +233,14 @@ def create_server() -> FastMCP:
         视口坐标)喂给 AI。VTable 本体是 canvas(单元格不进 a11y 树,仍走确定性几何定位),
         但工具栏/弹窗/编辑器输入框都在树里 —— 交互前先读快照,再决定点哪个。
         selector 非空时只快照该选择器命中的子树。
+
+        优化与容错特性：
+        1. 智能多元素匹配（彻底消除 strict mode violation 报错）：
+           当 selector 命中多个元素（如 AntD 多个弹窗/Tab 栏/逗号联合选择器）时，
+           自动遍历快照前 max_elements 个元素，并标注匹配序号、可见性与对应的 `>> nth=X` 定位路径。
+        2. 支持 nth 参数：可直接传入 0-based 序号选取目标元素（如 nth=0 或 nth=1）。
+        3. 支持 visible_only：为 True 时自动过滤隐藏/未渲染元素，只快照当前真实可见的元素。
+        4. 超时与容错：selector 未命中时在 timeout 内等待后优雅返回 not_found 状态，避免长时间挂死。
 
         frame=None → 主页面;frame="active" → 当前激活的 AntD Tab iframe;
         frame="vtable" → 自动定位含表格的 iframe;也可传 page_context、overlay 或
@@ -240,6 +252,10 @@ def create_server() -> FastMCP:
             depth=depth,
             boxes=boxes,
             ai_mode=ai_mode,
+            nth=nth,
+            visible_only=visible_only,
+            max_elements=max_elements,
+            timeout=timeout,
         )
 
     @mcp.tool()

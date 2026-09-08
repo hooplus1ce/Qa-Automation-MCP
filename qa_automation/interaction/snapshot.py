@@ -262,10 +262,13 @@ async def _dom_snapshot_impl(
     depth: int | None = None,
     boxes: bool = True,
     ai_mode: bool = True,
+    nth: int | None = None,
+    visible_only: bool = False,
+    max_elements: int = 5,
+    timeout: float = 3.0,
 ) -> dict:
     page = await _current_page_impl()
     target_frame = await resolve_frame(page, frame)
-    target = target_frame.locator(selector) if selector else target_frame.locator(":root")
     try:
         await target_frame.evaluate("""() => {
             const checkboxes = document.querySelectorAll('.ant-checkbox, .ant-tree-checkbox');
@@ -296,25 +299,243 @@ async def _dom_snapshot_impl(
         }""")
     except Exception:
         pass
+
     kwargs: dict[str, Any] = {"mode": "ai" if ai_mode else "default", "boxes": bool(boxes)}
     requested_depth = depth if depth is not None and depth > 0 else None
     if requested_depth is not None:
         kwargs["depth"] = min(requested_depth, _MAX_SNAPSHOT_DEPTH)
-    snapshot = await target.aria_snapshot(**kwargs)
-    truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+
+    # 1. No selector: snapshot frame root
+    if not selector:
+        target = target_frame.locator(":root")
+        snapshot = await target.aria_snapshot(**kwargs)
+        truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+        if truncated:
+            snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+        return {
+            "status": "ok",
+            "selector": selector,
+            "frame": frame,
+            "mode": kwargs["mode"],
+            "boxes": kwargs["boxes"],
+            "depth": kwargs.get("depth"),
+            "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
+            "truncated": truncated,
+            "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "snapshot": snapshot,
+        }
+
+    # 2. Selector provided: construct locator with error handling
+    try:
+        target = target_frame.locator(selector)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "selector": selector,
+            "frame": frame,
+            "error": f"Invalid selector syntax: {exc}",
+            "snapshot": "",
+        }
+
+    # Wait briefly for dynamic elements if timeout > 0
+    if timeout > 0:
+        try:
+            await target.first.wait_for(state="attached", timeout=int(timeout * 1000))
+        except Exception:
+            pass
+
+    try:
+        total_count = await target.count()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "selector": selector,
+            "frame": frame,
+            "error": f"Failed evaluating selector count: {exc}",
+            "snapshot": "",
+        }
+
+    if total_count == 0:
+        return {
+            "status": "not_found",
+            "selector": selector,
+            "frame": frame,
+            "match_count": 0,
+            "snapshot": "",
+            "message": f"Selector '{selector}' did not match any elements in frame '{frame or 'active'}'.",
+        }
+
+    # 3. Explicit nth target requested
+    if nth is not None:
+        matched_loc = target.nth(nth)
+        try:
+            vis = await matched_loc.is_visible()
+        except Exception:
+            vis = False
+
+        try:
+            snapshot = await matched_loc.aria_snapshot(**kwargs)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "selector": selector,
+                "nth": nth,
+                "frame": frame,
+                "match_count": total_count,
+                "error": f"Failed capturing snapshot for '{selector} >> nth={nth}': {exc}",
+                "snapshot": "",
+            }
+
+        truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+        if truncated:
+            snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+
+        return {
+            "status": "ok",
+            "selector": selector,
+            "nth": nth,
+            "frame": frame,
+            "match_count": total_count,
+            "visible": vis,
+            "mode": kwargs["mode"],
+            "boxes": kwargs["boxes"],
+            "depth": kwargs.get("depth"),
+            "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
+            "truncated": truncated,
+            "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "snapshot": snapshot,
+        }
+
+    # 4. Single element match
+    if total_count == 1:
+        matched_loc = target.first
+        try:
+            vis = await matched_loc.is_visible()
+        except Exception:
+            vis = False
+
+        if visible_only and not vis:
+            return {
+                "status": "not_visible",
+                "selector": selector,
+                "frame": frame,
+                "match_count": 1,
+                "visible": False,
+                "snapshot": "",
+                "message": f"Selector '{selector}' matched 1 element, but it is not visible (visible_only=True).",
+            }
+
+        try:
+            snapshot = await matched_loc.aria_snapshot(**kwargs)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "selector": selector,
+                "frame": frame,
+                "match_count": 1,
+                "error": f"Failed capturing snapshot: {exc}",
+                "snapshot": "",
+            }
+
+        truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+        if truncated:
+            snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+
+        return {
+            "status": "ok",
+            "selector": selector,
+            "frame": frame,
+            "match_count": 1,
+            "visible": vis,
+            "mode": kwargs["mode"],
+            "boxes": kwargs["boxes"],
+            "depth": kwargs.get("depth"),
+            "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
+            "truncated": truncated,
+            "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "snapshot": snapshot,
+        }
+
+    # 5. Multiple elements match (gracefully handle without strict mode violation)
+    matched_items: list[dict[str, Any]] = []
+    for i in range(total_count):
+        loc = target.nth(i)
+        try:
+            vis = await loc.is_visible()
+        except Exception:
+            vis = False
+        matched_items.append({"index": i, "locator": loc, "visible": vis})
+
+    if visible_only:
+        candidates = [item for item in matched_items if item["visible"]]
+        if not candidates:
+            return {
+                "status": "not_visible",
+                "selector": selector,
+                "frame": frame,
+                "match_count": total_count,
+                "visible_count": 0,
+                "snapshot": "",
+                "message": f"Selector '{selector}' matched {total_count} elements, but none are visible (visible_only=True).",
+            }
+    else:
+        candidates = matched_items
+
+    cap = max(1, max_elements)
+    elements_to_snapshot = candidates[:cap]
+    snapshot_parts: list[str] = []
+    metadata_elements: list[dict[str, Any]] = []
+
+    for item in elements_to_snapshot:
+        idx = item["index"]
+        vis = item["visible"]
+        loc = item["locator"]
+        nth_selector = f"{selector} >> nth={idx}"
+        vis_tag = "visible" if vis else "hidden"
+        try:
+            part = await loc.aria_snapshot(**kwargs)
+            header = f"/* Match {idx + 1} of {total_count} ({vis_tag}): {nth_selector} */\n"
+            snapshot_parts.append(header + part)
+            metadata_elements.append({
+                "index": idx,
+                "visible": vis,
+                "selector": nth_selector,
+            })
+        except Exception as exc:
+            snapshot_parts.append(f"/* Match {idx + 1} of {total_count} ({vis_tag}): error capturing snapshot ({exc}) */")
+            metadata_elements.append({
+                "index": idx,
+                "visible": vis,
+                "selector": nth_selector,
+                "error": str(exc),
+            })
+
+    if total_count > len(elements_to_snapshot):
+        remaining = total_count - len(elements_to_snapshot)
+        snapshot_parts.append(
+            f"/* Note: Selector matched {total_count} elements. Displayed {len(elements_to_snapshot)}. "
+            f"Use 'nth' parameter or append '>> nth=X' to inspect remaining {remaining} elements. */"
+        )
+
+    combined_snapshot = "\n\n".join(snapshot_parts)
+    truncated = len(combined_snapshot) > _MAX_SNAPSHOT_CHARACTERS
     if truncated:
-        snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+        combined_snapshot = combined_snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+
     return {
         "status": "ok",
         "selector": selector,
         "frame": frame,
+        "match_count": total_count,
+        "shown_count": len(elements_to_snapshot),
+        "matched_elements": metadata_elements,
         "mode": kwargs["mode"],
         "boxes": kwargs["boxes"],
         "depth": kwargs.get("depth"),
         "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
         "truncated": truncated,
         "character_limit": _MAX_SNAPSHOT_CHARACTERS,
-        "snapshot": snapshot,
+        "snapshot": combined_snapshot,
     }
 
 
@@ -325,6 +546,10 @@ async def dom_snapshot(
     depth: int | None = None,
     boxes: bool = True,
     ai_mode: bool = True,
+    nth: int | None = None,
+    visible_only: bool = False,
+    max_elements: int = 5,
+    timeout: float = 3.0,
 ) -> dict:
     async with _action_lock:
         return await _dom_snapshot_impl(
@@ -333,6 +558,10 @@ async def dom_snapshot(
             depth=depth,
             boxes=boxes,
             ai_mode=ai_mode,
+            nth=nth,
+            visible_only=visible_only,
+            max_elements=max_elements,
+            timeout=timeout,
         )
 
 
