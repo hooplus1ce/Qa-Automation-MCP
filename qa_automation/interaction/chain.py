@@ -193,6 +193,7 @@ async def _execute_one(action: str, item: dict) -> dict:
             button=str(item.get("button", "left")),
             hold_ms=int(item.get("hold_ms", 80)),
             observe_after=False,
+            visual_ghost=bool(item.get("visual_ghost", True)),
         )
         return _trim_result(action, raw)
 

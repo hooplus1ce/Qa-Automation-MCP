@@ -73,6 +73,7 @@ def create_server() -> FastMCP:
         settle_ms: int = 200,
         observe_after: bool = False,
         max_results: int = 20,
+        visual_ghost: bool = True,
     ) -> dict:
         """模拟真实鼠标拖拽轨迹将目标对象从起始位置平移至目标位置。
 
@@ -102,6 +103,7 @@ def create_server() -> FastMCP:
             settle_ms=settle_ms,
             observe_after=observe_after,
             max_results=max_results,
+            visual_ghost=visual_ghost,
         )
 
     @mcp.tool()

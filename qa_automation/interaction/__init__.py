@@ -584,6 +584,7 @@ async def mouse_drag(
     settle_ms: int = 200,
     observe_after: bool = False,
     max_results: int = OVERLAY_RESULT_LIMIT,
+    visual_ghost: bool = True,
 ) -> dict[str, Any]:
     """Execute a realistic physical mouse drag from (start_x, start_y) to (end_x, end_y)."""
     async with _action_lock:
@@ -614,6 +615,7 @@ async def mouse_drag(
                 button=button,
                 hold_ms=hold_ms,
                 settle_ms=settle_ms,
+                visual_ghost=visual_ghost,
             )
             result["page_id"] = _page_id(page)
         finally:

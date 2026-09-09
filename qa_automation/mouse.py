@@ -13,6 +13,7 @@ from .config import (
     _CURSOR_WIDTH,
     _EMBEDDED_CURSOR_DATA_URL,
     SHOW_CURSOR,
+    SHOW_DRAG_GHOST,
 )
 
 if TYPE_CHECKING:
@@ -205,6 +206,94 @@ def _build_cursor_helper_script() -> str:
 
 _WIN_CURSOR_HELPER_SCRIPT = _build_cursor_helper_script()
 
+_GHOST_START_SCRIPT = """([localX, localY]) => {
+    let target = document.elementFromPoint(localX, localY);
+    if (!target) return false;
+    let draggable = target.closest('[draggable="true"]') ||
+                    target.closest('.pro-approval-flow-panel-item, [class*="node"], [class*="card"], [class*="item"], button, [role="button"]');
+    let el = draggable || target;
+    if (!el || el === document.body || el === document.documentElement) return false;
+
+    const rect = el.getBoundingClientRect();
+    const existing = document.getElementById('__qa_automation_drag_ghost__');
+    if (existing) {
+        try { existing.remove(); } catch (e) {}
+    }
+
+    let ghost;
+    if (el instanceof SVGElement && !(el instanceof SVGSVGElement)) {
+        const svgWrapper = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svgWrapper.setAttribute('width', String(rect.width));
+        svgWrapper.setAttribute('height', String(rect.height));
+        svgWrapper.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
+        const clonedG = el.cloneNode(true);
+        clonedG.removeAttribute('transform');
+        svgWrapper.appendChild(clonedG);
+        ghost = document.createElement('div');
+        ghost.appendChild(svgWrapper);
+    } else {
+        ghost = el.cloneNode(true);
+    }
+
+    ghost.id = '__qa_automation_drag_ghost__';
+    ghost.style.cssText = `
+        position: fixed !important;
+        left: ${rect.left}px !important;
+        top: ${rect.top}px !important;
+        width: ${rect.width}px !important;
+        height: ${rect.height}px !important;
+        margin: 0 !important;
+        pointer-events: none !important;
+        z-index: 2147483645 !important;
+        opacity: 0.92 !important;
+        background: #ffffff !important;
+        border: 2px solid #1890ff !important;
+        border-radius: 6px !important;
+        transform-origin: ${localX - rect.left}px ${localY - rect.top}px !important;
+        transform: scale(1.05) !important;
+        box-shadow: 0 14px 36px rgba(24, 144, 255, 0.38), 0 4px 12px rgba(0, 0, 0, 0.18) !important;
+        transition: transform 0.05s linear, opacity 0.2s ease !important;
+        user-select: none !important;
+    `;
+    document.body.appendChild(ghost);
+
+    window.__qa_automation_ghost_state = {
+        offsetX: localX - rect.left,
+        offsetY: localY - rect.top
+    };
+    return true;
+}"""
+
+_GHOST_UPDATE_SCRIPT = """([x, y]) => {
+    const ghost = document.getElementById('__qa_automation_drag_ghost__');
+    const state = window.__qa_automation_ghost_state;
+    if (!ghost || !state) return false;
+    ghost.style.left = (x - state.offsetX) + 'px';
+    ghost.style.top = (y - state.offsetY) + 'px';
+    return true;
+}"""
+
+_GHOST_FINISH_SCRIPT = """([endX, endY]) => {
+    const ghost = document.getElementById('__qa_automation_drag_ghost__');
+    if (!ghost) return false;
+    ghost.style.transition = 'transform 0.32s cubic-bezier(0.2, 0, 0, 1), opacity 0.32s ease-out';
+    ghost.style.transform = 'scale(0.88)';
+    ghost.style.opacity = '0';
+    setTimeout(() => {
+        try { ghost.remove(); } catch(e) {}
+    }, 350);
+    delete window.__qa_automation_ghost_state;
+    return true;
+}"""
+
+_GHOST_CLEANUP_SCRIPT = """() => {
+    const ghost = document.getElementById('__qa_automation_drag_ghost__');
+    if (ghost) {
+        try { ghost.remove(); } catch (e) {}
+    }
+    delete window.__qa_automation_ghost_state;
+}"""
+
 
 async def _ensure_cursor_helper(page: Page) -> None:
     """Ensure the Windows-style virtual mouse cursor helper is installed on the page."""
@@ -349,6 +438,7 @@ async def _mouse_drag_impl(
     button: str = "left",
     hold_ms: int = 80,
     settle_ms: int = 200,
+    visual_ghost: bool = True,
 ) -> dict[str, Any]:
     """Physically drag from start to end with sequential events and cursor feedback."""
     global _last_mouse_point
@@ -385,78 +475,120 @@ async def _mouse_drag_impl(
         pass
 
     try:
-        # 检查起点和终点是否位于 HTML5 Draggable DOM 元素上（包括跨 iframe）
+        ghost_frame = None
+        ghost_offset = {"x": 0.0, "y": 0.0}
+        if SHOW_DRAG_GHOST and visual_ghost:
+            try:
+                from .browser import _frame_page_offset
+
+                # 仅在当前视口真实可见的子 iframe 中匹配，排查后台非激活 Tab
+                for fr in page.frames:
+                    if fr == page.main_frame:
+                        continue
+                    try:
+                        handle = await fr.frame_element()
+                        if not await handle.is_visible():
+                            continue
+                    except Exception:
+                        continue
+                    offset = await _frame_page_offset(page, fr)
+                    lx = start_x - offset["x"]
+                    ly = start_y - offset["y"]
+                    has_target = await fr.evaluate(
+                        """([x, y]) => {
+                            let el = document.elementFromPoint(x, y);
+                            if (!el || el === document.body || el === document.documentElement) return false;
+                            if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') return false;
+                            return true;
+                        }""",
+                        [lx, ly],
+                    )
+                    if has_target:
+                        ghost_frame = fr
+                        ghost_offset = offset
+                        break
+                if ghost_frame is None:
+                    ghost_frame = page.main_frame
+                    ghost_offset = {"x": 0.0, "y": 0.0}
+
+                local_sx = start_x - ghost_offset["x"]
+                local_sy = start_y - ghost_offset["y"]
+                started = await ghost_frame.evaluate(_GHOST_START_SCRIPT, [local_sx, local_sy])
+                if not started:
+                    ghost_frame = None
+            except Exception:
+                ghost_frame = None
+
+        # 检查起点和终点是否位于 HTML5 Draggable DOM 元素上（包括跨 iframe，仅在禁用视觉 Ghost 时尝试直达）
         html5_dragged = False
-        try:
-            from .browser import _frame_page_offset
+        if not visual_ghost:
+            try:
+                from .browser import _frame_page_offset
 
-            for fr in page.frames:
-                offset = await _frame_page_offset(page, fr)
-                local_sx = start_x - offset["x"]
-                local_sy = start_y - offset["y"]
-                local_ex = end_x - offset["x"]
-                local_ey = end_y - offset["y"]
+                for fr in page.frames:
+                    offset = await _frame_page_offset(page, fr)
+                    local_sx = start_x - offset["x"]
+                    local_sy = start_y - offset["y"]
+                    local_ex = end_x - offset["x"]
+                    local_ey = end_y - offset["y"]
 
-                src_handle = await fr.evaluate_handle(
-                    """([sx, sy]) => {
-                    let el = document.elementFromPoint(sx, sy);
-                    while (el && el !== document.body && el !== document.documentElement) {
-                        if (el.getAttribute && (el.getAttribute('draggable') === 'true' || el.hasAttribute('draggable'))) {
-                            return el;
+                    src_handle = await fr.evaluate_handle(
+                        """([sx, sy]) => {
+                        let el = document.elementFromPoint(sx, sy);
+                        while (el && el !== document.body && el !== document.documentElement) {
+                            if (el.getAttribute && (el.getAttribute('draggable') === 'true' || el.hasAttribute('draggable'))) {
+                                return el;
+                            }
+                            el = el.parentElement;
                         }
-                        el = el.parentElement;
-                    }
-                    return null;
-                }""",
-                    [local_sx, local_sy],
-                )
+                        return null;
+                    }""",
+                        [local_sx, local_sy],
+                    )
 
-                dst_handle = await fr.evaluate_handle(
-                    """([ex, ey]) => {
-                    let el = document.elementFromPoint(ex, ey);
-                    while (el && el !== document.body && el !== document.documentElement) {
-                        if (el.getAttribute && (el.getAttribute('draggable') === 'true' || el.hasAttribute('draggable'))) {
-                            return el;
+                    dst_handle = await fr.evaluate_handle(
+                        """([ex, ey]) => {
+                        let el = document.elementFromPoint(ex, ey);
+                        while (el && el !== document.body && el !== document.documentElement) {
+                            if (el.getAttribute && (el.getAttribute('draggable') === 'true' || el.hasAttribute('draggable'))) {
+                                return el;
+                            }
+                            el = el.parentElement;
                         }
-                        el = el.parentElement;
-                    }
-                    return null;
-                }""",
-                    [local_ex, local_ey],
-                )
+                        return null;
+                    }""",
+                        [local_ex, local_ey],
+                    )
 
-                src_elem = src_handle.as_element()
-                dst_elem = dst_handle.as_element()
+                    src_elem = src_handle.as_element()
+                    dst_elem = dst_handle.as_element()
 
-                if src_elem and dst_elem and src_elem != dst_elem:
-                    # 1. 虚拟光标平滑移动至起点并按下
-                    if SHOW_CURSOR:
-                        try:
-                            await page.evaluate(
-                                f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({start_x:.1f}, {start_y:.1f}, true, true)"
-                            )
-                        except Exception:
-                            pass
+                    if src_elem and dst_elem and src_elem != dst_elem:
+                        if SHOW_CURSOR:
+                            try:
+                                await page.evaluate(
+                                    f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({start_x:.1f}, {start_y:.1f}, true, true)"
+                                )
+                            except Exception:
+                                pass
 
-                    # 2. 驱动 Playwright 原生元素拖放会话（触发 Chromium DragController，产生真实半透明镜像与屏幕重排）
-                    await src_elem.drag_to(dst_elem, timeout=5000)
+                        await src_elem.drag_to(dst_elem, timeout=5000)
 
-                    # 3. 虚拟光标平滑移动至终点并释放
-                    if SHOW_CURSOR:
-                        try:
-                            await page.evaluate(
-                                f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({end_x:.1f}, {end_y:.1f}, false, false)"
-                            )
-                        except Exception:
-                            pass
+                        if SHOW_CURSOR:
+                            try:
+                                await page.evaluate(
+                                    f"window.__qa_automation_update_cursor && window.__qa_automation_update_cursor({end_x:.1f}, {end_y:.1f}, false, false)"
+                                )
+                            except Exception:
+                                pass
 
-                    _last_mouse_point = (end_x, end_y)
-                    html5_dragged = True
-                    break
-        except Exception:
-            pass
+                        _last_mouse_point = (end_x, end_y)
+                        html5_dragged = True
+                        break
+            except Exception:
+                pass
 
-        # 若非 HTML5 Draggable（如 Canvas VTable 列表头、滑块），走高精度 60fps 物理鼠标平滑轨迹
+        # 若非直达（如 Canvas VTable 列表头、滑块或启用视觉 Ghost），走高精度 60fps 物理鼠标平滑轨迹
         if not html5_dragged:
             # 1. 鼠标平滑移动至起点并按下左键 (mouse.down)
             if SHOW_CURSOR:
@@ -489,6 +621,13 @@ async def _mouse_drag_impl(
                         )
                     except Exception:
                         pass
+                if ghost_frame is not None:
+                    try:
+                        local_cx = curr_x - ghost_offset["x"]
+                        local_cy = curr_y - ghost_offset["y"]
+                        await ghost_frame.evaluate(_GHOST_UPDATE_SCRIPT, [local_cx, local_cy])
+                    except Exception:
+                        pass
 
                 await page.mouse.move(curr_x, curr_y)
                 await asyncio.sleep(0.016)
@@ -497,6 +636,14 @@ async def _mouse_drag_impl(
             if hold_ms > 0:
                 await asyncio.sleep(hold_ms / 1000)
             await page.mouse.up(button=button)
+
+            if ghost_frame is not None:
+                try:
+                    local_ex = end_x - ghost_offset["x"]
+                    local_ey = end_y - ghost_offset["y"]
+                    await ghost_frame.evaluate(_GHOST_FINISH_SCRIPT, [local_ex, local_ey])
+                except Exception:
+                    pass
 
             if SHOW_CURSOR:
                 try:
@@ -507,6 +654,11 @@ async def _mouse_drag_impl(
                     pass
             _last_mouse_point = (end_x, end_y)
     finally:
+        if ghost_frame is not None:
+            try:
+                await ghost_frame.evaluate(_GHOST_CLEANUP_SCRIPT)
+            except Exception:
+                pass
         if cdp is not None:
             try:
                 await cdp.detach()
@@ -531,4 +683,5 @@ async def _mouse_drag_impl(
         "button": button,
         "channel": "cdp" if cdp is not None else "playwright-mouse",
         "coordinate_space": "top-page-viewport-css-pixels",
+        "visual_ghost": ghost_frame is not None,
     }
