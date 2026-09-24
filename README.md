@@ -109,6 +109,14 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `vtable_meta` / `vtable_read_cells` | 工具 | 指定表格元数据与矩形单元格批量读取 |
 | `vtable_drop_files` | 工具 | 指定单元格的 Locator.drop 文件拖放(Playwright 1.60+) |
 | `browser_close` | 工具 | 关闭 Playwright/受管 Chrome;外部 CDP 浏览器只断开连接 |
+| `tencent_sheet_connect` | 工具 | 连接并绑定腾讯文档在线表格或多维智能表格（亦支持 `testcase_connect` 别名） |
+| `tencent_sheet_list_sheets` | 工具 | 列出当前表格中的所有可见子表清单及各子表规模（亦支持 `testcase_list_sheets` 别名） |
+| `tencent_sheet_get_row` | 工具 | 根据行主键（或物理行号）精确定位并提取整行全部列字段数据（亦支持 `testcase_get` 别名） |
+| `tencent_sheet_query_rows` | 工具 | 多维度组合条件、全文关键字与列过滤器检索表格行（亦支持 `testcase_query` 别名） |
+| `tencent_sheet_update_row` | 工具 | 向表格指定行原子回写更新任意表头列字段（亦支持 `testcase_update_result` 别名） |
+| `tencent_sheet_batch_update` | 工具 | 批量回写多行表格数据（防限流核心引擎，单次原子提交；亦支持 `testcase_batch_update_results` 别名） |
+| `tencent_sheet_read_cells` | 工具 | 读取表格原始单元格切片与 CSV 数据（带网格边界保护；亦支持 `testcase_read_cells` 别名） |
+| `update_test_case_result` | 工具 | 单条回写指定用例的测试结果、执行人与执行时间（兼容历史接口） |
 | `vtable://js/index` | 资源 | JS 脚本目录(JSON) |
 | `vtable://js/{name}` | 资源 | 19 个 VTable JS 脚本(fast_bind、vtable_analysis、resolve_cell、read_cells …) |
 

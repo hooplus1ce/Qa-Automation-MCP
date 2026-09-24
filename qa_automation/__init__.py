@@ -42,6 +42,7 @@ from .browser import (
     list_pages,
     open_url,
     reset_viewport,
+    inject_cookies,
     select_page,
     set_page_preference_probe,
     start_browser,
@@ -200,6 +201,27 @@ from .overlay.scripts import (
     _overlay_arm_script,
     _overlay_script,
 )
+from .tencent_sheet import (
+    SheetBatchUpdateResult,
+    SheetConnectResult,
+    SheetQueryResult,
+    SheetRowDetail,
+    SheetUpdateResult,
+    TencentDocError,
+    TencentDocSheetClient,
+    TencentSheetClient,
+    TencentSheetManager,
+    TestCaseBatchUpdateResult,
+    TestCaseConnectResult,
+    TestCaseDetail,
+    TestCaseManager,
+    TestCaseQueryResult,
+    TestCaseUpdateResult,
+    normalize_header,
+    parse_file_id,
+    tencent_sheet_manager,
+    testcase_manager,
+)
 
 
 async def _vtable_page_preference_probe(page: Any) -> bool:
@@ -239,6 +261,7 @@ __all__ = [
     "open_url",
     "browser_login",
     "reset_viewport",
+    "inject_cookies",
     # VTable
     "vtable_frame",
     "active_application_frame",
@@ -271,4 +294,24 @@ __all__ = [
     "typewriter_fill",
     "typewriter_type",
     "typewriter_keyboard_type",
+    # Tencent Docs & Sheet Management
+    "TencentDocError",
+    "TencentSheetClient",
+    "TencentDocSheetClient",
+    "TencentSheetManager",
+    "TestCaseManager",
+    "tencent_sheet_manager",
+    "testcase_manager",
+    "parse_file_id",
+    "normalize_header",
+    "SheetConnectResult",
+    "TestCaseConnectResult",
+    "SheetRowDetail",
+    "TestCaseDetail",
+    "SheetQueryResult",
+    "TestCaseQueryResult",
+    "SheetUpdateResult",
+    "TestCaseUpdateResult",
+    "SheetBatchUpdateResult",
+    "TestCaseBatchUpdateResult",
 ]

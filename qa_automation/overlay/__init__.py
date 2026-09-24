@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import weakref
 from typing import TYPE_CHECKING, Any
@@ -16,6 +17,9 @@ from ..browser import (
     _page_id,
 )
 from ..config import (
+    OVERLAY_ADAPTIVE_SETTLE,
+    OVERLAY_PROBE_MS,
+    OVERLAY_QUIET_MS,
     OVERLAY_RESULT_LIMIT,
     OVERLAY_SETTLE_LIMIT_MS,
 )
@@ -37,6 +41,7 @@ from .scripts import (
     _OVERLAY_DEADLINE_VAR,
     _OVERLAY_DRAIN_TEMPLATE,
     _OVERLAY_OBSERVER_TEMPLATE,
+    _adaptive_settle_script,
     _overlay_arm_script,
     _overlay_script,
 )
@@ -70,6 +75,79 @@ async def _arm_overlay_init_script(
         await page.evaluate(script)
     except Exception:
         pass
+
+
+async def _await_overlay_settle(page: Page, settle_ms: int) -> dict[str, Any]:
+    """自适应差分收敛：等"变更发生 → 安静 quiet_ms → 无 loading"，而不是盲等固定时长。
+
+    边界（刻意保守，保证既有"观察窗口"语义不退化）：
+      * 窗口内没有观察到任何 DOM 变更 → 等满 settle_ms（晚到的浮层照样能抓到）；
+      * 有变更但一直不安静（动画/轮询在持续改 DOM）→ 等满 settle_ms；
+      * 只在"确实变更过 + 静默 quiet_ms + 无 loading 骨架"时才提前收口。
+    settle_ms 始终是硬上限，永远不会比改造前等得更久。
+    """
+    settle_ms = int(settle_ms)
+    if settle_ms <= 0:
+        return {
+            "settle_ms": settle_ms,
+            "settle_elapsed_ms": 0,
+            "settle_mode": "disabled",
+            "settle_observed_mutations": False,
+        }
+    if not OVERLAY_ADAPTIVE_SETTLE:
+        await page.wait_for_timeout(settle_ms)
+        return {
+            "settle_ms": settle_ms,
+            "settle_elapsed_ms": settle_ms,
+            "settle_mode": "fixed",
+            "settle_observed_mutations": False,
+        }
+
+    script = _adaptive_settle_script(settle_ms, OVERLAY_QUIET_MS, OVERLAY_PROBE_MS)
+    started = time.monotonic()
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+
+    probes: list[dict[str, Any]] = []
+    if frames:
+        try:
+            # 各 frame 的收敛探针并行跑：墙钟耗时取最慢的那个，而不是所有 frame 之和。
+            gathered = await asyncio.wait_for(
+                asyncio.gather(
+                    *(frame.evaluate(script) for frame in frames),
+                    return_exceptions=True,
+                ),
+                timeout=(settle_ms / 1000.0) + 1.5,
+            )
+        except Exception:
+            gathered = ()
+        probes = [item for item in gathered if isinstance(item, dict)]
+
+    modes = {str(item.get("mode") or "") for item in probes}
+    observed = any(bool(item.get("observed_mutations")) for item in probes)
+    elapsed = int((time.monotonic() - started) * 1000)
+
+    if "converged" in modes:
+        mode = "converged"
+    elif "settled" in modes:
+        # 观察窗口已被真正消费（页面内自轮询已等满 settle_ms），无需 Python 侧再补一段。
+        mode = "settled"
+        elapsed = max(elapsed, settle_ms)
+    else:
+        # 探针不可用（mock 页面/无 observer/整帧超时）→ 退回改造前的固定等待，
+        # 保证任何环境下都不出现"等待被静默跳过"的行为回归。
+        await page.wait_for_timeout(settle_ms)
+        mode = "fixed"
+        elapsed = settle_ms
+
+    return {
+        "settle_ms": settle_ms,
+        "settle_elapsed_ms": elapsed,
+        "settle_mode": mode,
+        "settle_observed_mutations": observed,
+    }
 
 
 async def _install_overlay_observer_in_frame(
@@ -232,6 +310,7 @@ async def _finalize_overlay_observation(
         )
         response.update(
             {
+                **(installed.get("settle") or {}),
                 "settle_ms": settle_ms,
                 "baseline": installed.get("baseline", []),
                 "ui_events": [],
@@ -269,6 +348,7 @@ async def _finalize_overlay_observation(
     )
     response.update(
         {
+            **(installed.get("settle") or {}),
             "settle_ms": settle_ms,
             "baseline": (
                 await _enrich_overlay_items(
@@ -351,8 +431,7 @@ async def _observe_overlays_impl(
         installed = await _install_overlay_observers(page, reset=False)
         installed["frame_listener"] = frame_listener
         installed["reused"] = installed.get("reused", False) or listener_reused
-        if settle_ms:
-            await page.wait_for_timeout(settle_ms)
+        settle_info = await _await_overlay_settle(page, settle_ms)
         drained = await _drain_overlay_observers(
             page, stop=stop, frame_listener=frame_listener
         )
@@ -373,7 +452,7 @@ async def _observe_overlays_impl(
         )
         return {
             "status": "ok",
-            "settle_ms": settle_ms,
+            **settle_info,
             "baseline": await _enrich_overlay_items(
                 page, baseline, max_results=max_results, geometry=geometry
             ),
@@ -483,8 +562,8 @@ async def _click_dom_and_observe_impl(
                 timeout_ms=timeout_ms,
                 page=page,
             )
-        if response.get("status") == "clicked" and settle_ms:
-            await page.wait_for_timeout(settle_ms)
+        # 点击已落地:交给页内自适应收敛探针决定何时收口（settle_ms 仍为硬上限）
+        installed["settle"] = await _await_overlay_settle(page, settle_ms)
     except Exception as exc:
         response = {
             "status": "failed",

@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import weakref
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -31,10 +32,18 @@ from .config import (
     NAV_TIMEOUT_MS,
     PLAYWRIGHT_INSTALL_HINT,
     SHOW_CURSOR,
+    credential_missing_message,
+    resolve_login_credentials,
 )
 from .mouse import _WIN_CURSOR_HELPER_SCRIPT, _reset_last_mouse_point
 from .workspace import artifact_dir, artifact_file, resolve_workspace_path
 
+from .auth import (
+    build_cookies_to_inject,
+    extract_parent_domain,
+    recognize_captcha_digits,
+    scm_api_login,
+)
 
 @dataclass
 class _BrowserState:
@@ -291,11 +300,29 @@ def _frame_name_url(frame: Frame) -> tuple[str, str]:
     return name, url
 
 
-def _frame_details(page: Page, frame: Frame) -> dict[str, Any]:
+def _compact_frame_url(url: str, *, limit: int = 140) -> str:
+    """砍掉查询串并按需截断路径。
+
+    为什么要砍：APS 这类 iframe 套壳应用把整坨业务参数挂在 src 上，实测单条
+    `frame_url` 达 380 字符 ≈ 110 token（15 个 id + 15 个 roleCode）。而它是
+    **每个**工具的响应都要回显一遍的字段——实测占识别轮总 token 的 22%
+    （`ui_page_context` 单工具 44%、`vtable_cell_info` 查一个单元格 43%）。
+
+    消费侧只需要路径来判定"这是哪个功能模块"（tests/e2e 就是按
+    `/cleanChangeover` 这类路径子串判定的），查询串无任何代码读取。
+    """
+    if not url:
+        return ""
+    base = url.split("?", 1)[0].split("#", 1)[0]
+    return base if len(base) <= limit else base[:limit] + "…"
+
+
+def _frame_details(page: Page, frame: Frame, *, full_url: bool = False) -> dict[str, Any]:
+    """frame 的紧凑描述。默认只回路径；`full_url=True` 才带完整 src。"""
     name, url = _frame_name_url(frame)
     return {
         "frame_id": _frame_id(page, frame),
-        "frame_url": url,
+        "frame_url": url if full_url else _compact_frame_url(url),
         "frame_name": name,
     }
 
@@ -336,8 +363,10 @@ async def _page_viewport_size(page: Page) -> dict[str, float]:
     return {"width": width, "height": height}
 
 
-async def _frame_context_details(page: Page, frame: Frame) -> dict[str, Any]:
-    details: dict[str, Any] = _frame_details(page, frame)
+async def _frame_context_details(
+    page: Page, frame: Frame, *, full_url: bool = False
+) -> dict[str, Any]:
+    details: dict[str, Any] = _frame_details(page, frame, full_url=full_url)
     if frame == page.main_frame:
         return details
     try:
@@ -605,80 +634,284 @@ async def _wait_for_cdp(
 
 
 
-async def _maximize_and_fill_viewport(page: Page) -> None:
-    """Maximize the browser window, clear emulated device metrics, and trigger relayout."""
-    if page is None:
-        return
+_CLIP_LOCK_TOLERANCE_PX = 1.0
+
+
+async def _read_viewport_or_none(page: Page) -> dict[str, float] | None:
+    """读取 window.innerWidth/innerHeight;取不到或非正数时返回 None(不抛错)。
+
+    与 _page_viewport_size 的区别:后者在视口不可用时会抛 ValueError,用于业务坐标
+    换算;这里只服务于复位校验,失败必须降级成 None 而不是打断调用方。
+    """
     try:
-        if page.is_closed():
-            return
+        size = await page.evaluate(
+            "() => ({w: Number(window.innerWidth), h: Number(window.innerHeight)})"
+        )
     except Exception:
-        return
+        return None
     try:
-        if not hasattr(page, "context") or not hasattr(page.context, "new_cdp_session"):
-            return
+        width = float(size["w"])
+        height = float(size["h"])
     except Exception:
-        return
+        return None
+    if (
+        not math.isfinite(width)
+        or not math.isfinite(height)
+        or width <= 0
+        or height <= 0
+    ):
+        return None
+    return {"w": width, "h": height}
+
+
+async def _cdp_window_bounds(cdp: Any) -> tuple[int | None, dict[str, Any] | None]:
+    """读出该 page 所属窗口的 windowId 与 bounds;任一步失败都返回 (None, None)。"""
+    try:
+        target_info = await cdp.send("Target.getTargetInfo")
+        target_id = (target_info or {}).get("targetInfo", {}).get("targetId")
+        if not target_id:
+            return None, None
+        window = await cdp.send("Browser.getWindowForTarget", {"targetId": target_id})
+    except Exception:
+        return None, None
+    window_id = (window or {}).get("windowId")
+    if window_id is None:
+        return None, None
+    bounds = (window or {}).get("bounds")
+    return int(window_id), dict(bounds) if isinstance(bounds, dict) else None
+
+
+def _same_size(
+    measured: dict[str, float] | None,
+    other: tuple[float, float] | None,
+    tolerance: float = _CLIP_LOCK_TOLERANCE_PX,
+) -> bool:
+    """两个尺寸是否在 Chromium 回读舍入容差内相等。"""
+    if not measured or not other:
+        return False
+    try:
+        width = float(other[0])
+        height = float(other[1])
+    except Exception:
+        return False
+    return (
+        abs(measured["w"] - width) <= tolerance
+        and abs(measured["h"] - height) <= tolerance
+    )
+
+
+def _looks_like_clip_lock(
+    measured: dict[str, float] | None,
+    clip_size: tuple[float, float] | None,
+    expected_size: tuple[float, float] | None = None,
+) -> bool:
+    """视口是否仍等于「刚才那次截图的 clip 尺寸」——命中即说明 emulation 残留没清掉。
+
+    必须传 expected_size(截图前的视口尺寸):全视口截图的 clip 本来就等于自然视口,
+    只看 clip 会把正常结果误判成残留,并白白多跑一轮复位。
+    """
+    if not _same_size(measured, clip_size):
+        return False
+    if not clip_size:
+        return False
+    try:
+        if float(clip_size[0]) <= 0 or float(clip_size[1]) <= 0:
+            return False
+    except Exception:
+        return False
+    return not _same_size(measured, expected_size)
+
+
+async def _capture_window_bounds(page: Page) -> dict[str, Any] | None:
+    """截图前留档窗口 bounds(含 windowState),供异常中断后原样还原。"""
+    if page is None or not hasattr(page, "context"):
+        return None
     try:
         cdp = await page.context.new_cdp_session(page)
+    except Exception:
+        return None
+    try:
+        _window_id, bounds = await _cdp_window_bounds(cdp)
+        return bounds
+    finally:
         try:
-            try:
-                target_info = await cdp.send("Target.getTargetInfo")
-                tid = target_info.get("targetInfo", {}).get("targetId")
-                if tid:
-                    win = await cdp.send("Browser.getWindowForTarget", {"targetId": tid})
-                    wid = win.get("windowId")
-                    if wid is not None:
-                        await cdp.send(
-                            "Browser.setWindowBounds",
-                            {"windowId": wid, "bounds": {"windowState": "maximized"}},
-                        )
-            except Exception:
-                pass
+            await cdp.detach()
+        except Exception:
+            pass
+
+
+async def _relayout_after_viewport_change(page: Page) -> None:
+    """向顶层与全部 iframe 广播 resize,并顺带唤醒 VTable 自适应布局。"""
+    relayout_js = """() => {
+        try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+        if (window._vtable && typeof window._vtable.resize === 'function') {
+            try { window._vtable.resize(); } catch (e) {}
+        }
+    }"""
+    try:
+        await page.evaluate(relayout_js)
+    except Exception:
+        pass
+    for frame in getattr(page, "frames", []):
+        if frame == getattr(page, "main_frame", None):
+            continue
+        try:
+            await frame.evaluate(relayout_js)
+        except Exception:
+            pass
+
+
+async def _restore_window_and_viewport(
+    page: Page,
+    *,
+    restore_bounds: dict[str, Any] | None = None,
+    clip_size: tuple[float, float] | None = None,
+    expected_size: tuple[float, float] | None = None,
+    attempts: int = 2,
+) -> dict[str, Any]:
+    """把窗口 + 视口从「窗口被最小化 / 截图临时 emulation 残留」里救回来。
+
+    真机 APS 复现的两条动因(必须同时处理,缺一不可):
+
+    1. 截图 clip 的 emulation 残留。Playwright 的 page.screenshot(clip=...) 会让
+       Chromium 临时下发 Emulation.setDeviceMetricsOverride 把视口撑到 clip 尺寸;
+       正常结束 Chromium 会自行还原,但该次截图一旦在默认 3s 超时处被中断
+       (渲染器卡住 / 窗口最小化),override 就残留在 RenderWidgetHost 上,
+       页面视口被锁成元素尺寸(实测 900x383、715x270),此后 vtable / 浮层 / 点击
+       坐标全部错位。
+
+    2. 最小化窗口无法直接最大化。Chromium 不接受 minimized -> maximized 的直接
+       跳变,只发 maximized 是 no-op,必须 minimized -> normal -> maximized。
+       窗口停在最小化时 innerWidth/innerHeight 也是不可信值。
+
+    因此这里显式补 normal 中转,并在清理 emulation 后用 innerWidth/innerHeight
+    回读校验:一旦发现视口仍等于 clip_size,判定复位失败并重试一轮。
+
+    Args:
+        restore_bounds: 截图前留档的窗口 bounds,normal 中转时用于避免窗口跳位
+        clip_size: 本次截图的 (width, height),用于识别 emulation 残留
+        expected_size: 截图前的视口尺寸;与 clip_size 相等时不再判为残留
+            (全视口截图本就如此,否则会误报)
+        attempts: 最大尝试轮数(默认 2)
+
+    Returns:
+        {"attempts", "window_state", "viewport", "clip_lock_detected"}
+    """
+    report: dict[str, Any] = {
+        "attempts": 0,
+        "window_state": None,
+        "viewport": None,
+        "clip_lock_detected": False,
+    }
+    if page is None:
+        return report
+    try:
+        if page.is_closed():
+            return report
+    except Exception:
+        return report
+    try:
+        if not hasattr(page, "context") or not hasattr(page.context, "new_cdp_session"):
+            return report
+    except Exception:
+        return report
+
+    measured: dict[str, float] | None = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        report["attempts"] = attempt
+        try:
+            cdp = await page.context.new_cdp_session(page)
+        except Exception:
+            break
+        try:
+            window_id, bounds = await _cdp_window_bounds(cdp)
+            state = (bounds or {}).get("windowState")
+
+            # minimized -> normal -> maximized:直接跳 maximized 在 Chromium 上是 no-op
+            if window_id is not None and state == "minimized":
+                normal_bounds: dict[str, Any] = {"windowState": "normal"}
+                for key in ("left", "top", "width", "height"):
+                    if restore_bounds and restore_bounds.get(key) is not None:
+                        normal_bounds[key] = restore_bounds[key]
+                try:
+                    await cdp.send(
+                        "Browser.setWindowBounds",
+                        {"windowId": window_id, "bounds": normal_bounds},
+                    )
+                    await asyncio.sleep(0.05)
+                    state = "normal"
+                except Exception:
+                    pass
+
+            if window_id is not None and state != "maximized":
+                try:
+                    await cdp.send(
+                        "Browser.setWindowBounds",
+                        {"windowId": window_id, "bounds": {"windowState": "maximized"}},
+                    )
+                    state = "maximized"
+                except Exception:
+                    pass
+            report["window_state"] = state
 
             # Chromium EmulationHandler::ClearDeviceMetricsOverride 是 session-scoped 的。
             # 若直接调 clearDeviceMetricsOverride，在未设置 override 的新 session 中是 no-op。
             # 必须先调用 setDeviceMetricsOverride(width=0, height=0) 将 RenderWidgetHost
             # 的尺寸重置回宿主窗口自然尺寸，再调用 clearDeviceMetricsOverride 彻底抹除。
-            await cdp.send(
-                "Emulation.setDeviceMetricsOverride",
-                {
-                    "width": 0,
-                    "height": 0,
-                    "deviceScaleFactor": 0,
-                    "mobile": False,
-                },
-            )
-            await cdp.send("Emulation.clearDeviceMetricsOverride")
+            try:
+                await cdp.send(
+                    "Emulation.setDeviceMetricsOverride",
+                    {
+                        "width": 0,
+                        "height": 0,
+                        "deviceScaleFactor": 0,
+                        "mobile": False,
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                await cdp.send("Emulation.clearDeviceMetricsOverride")
+            except Exception:
+                pass
         finally:
-            await cdp.detach()
-    except Exception:
-        pass
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
 
-    try:
-        if getattr(page, "viewport_size", None) is not None:
-            actual = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
-            if actual and actual.get("w") and actual.get("h"):
-                await page.set_viewport_size({"width": int(actual["w"]), "height": int(actual["h"])})
-    except Exception:
-        pass
+        measured = await _read_viewport_or_none(page)
+        if measured and getattr(page, "viewport_size", None) is not None:
+            # 只在 Playwright 自己托管视口时回写,并重新采样(override 可能刚被抹掉)
+            try:
+                await page.set_viewport_size(
+                    {"width": int(measured["w"]), "height": int(measured["h"])}
+                )
+            except Exception:
+                pass
+            measured = await _read_viewport_or_none(page)
+        report["viewport"] = (
+            {"width": int(measured["w"]), "height": int(measured["h"])} if measured else None
+        )
+        if not _looks_like_clip_lock(measured, clip_size, expected_size):
+            break
+        if attempt < attempts:
+            await asyncio.sleep(0.15)
 
-    try:
-        _relayout_js = """() => {
-            try { window.dispatchEvent(new Event('resize')); } catch (e) {}
-            if (window._vtable && typeof window._vtable.resize === 'function') {
-                try { window._vtable.resize(); } catch (e) {}
-            }
-        }"""
-        await page.evaluate(_relayout_js)
-        for fr in getattr(page, "frames", []):
-            if fr != getattr(page, "main_frame", None):
-                try:
-                    await fr.evaluate(_relayout_js)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    report["clip_lock_detected"] = _looks_like_clip_lock(
+        measured, clip_size, expected_size
+    )
+    await _relayout_after_viewport_change(page)
+    return report
+
+
+async def _maximize_and_fill_viewport(page: Page) -> dict[str, Any]:
+    """Maximize the browser window, clear emulated device metrics, and trigger relayout.
+
+    Returns:
+        复位报告,见 :func:`_restore_window_and_viewport`。
+    """
+    return await _restore_window_and_viewport(page)
 
 async def _launch_chrome_impl(
     port: int = 9222,
@@ -1138,12 +1371,18 @@ async def browser_session(
 
 async def _reset_viewport_impl() -> dict[str, Any]:
     page = await _current_page_impl()
-    await _maximize_and_fill_viewport(page)
+    report = await _maximize_and_fill_viewport(page)
+    if not isinstance(report, dict):
+        report = {}
     viewport = await _page_viewport_size(page)
     return {
         "status": "viewport-reset",
         "page_id": _page_id(page),
         "viewport": viewport,
+        "window_state": report.get("window_state"),
+        "attempts": report.get("attempts"),
+        # restored=False 表示清理后视口仍停在上次截图 clip 的尺寸上,调用方应重试
+        "restored": not report.get("clip_lock_detected", False),
     }
 
 
@@ -1178,6 +1417,11 @@ def _recognize_captcha_with_ai(image_bytes: bytes) -> str | None:
     import urllib.request
 
     b64_img = base64.b64encode(image_bytes).decode("ascii")
+    # 0. Local ddddocr fast check (0-latency, 100% offline for 4-digit numeric captchas)
+    local_code = recognize_captcha_digits(image_bytes)
+    if local_code:
+        return local_code
+
 
     # 1. Check local OCR service if running (e.g. localhost:17521)
     for ocr_url in ("http://127.0.0.1:17521/ocr", "http://localhost:17521/ocr"):
@@ -1241,16 +1485,35 @@ def _recognize_captcha_with_ai(image_bytes: bytes) -> str | None:
 
 
 async def _browser_login_impl(
-    username: str = "pingxiang",
-    password: str = "Ac123456",
+    username: str | None = None,
+    password: str | None = None,
     *,
-    url: str = "https://demo18-scm.hoolinks.com/static/admin/",
+    url: str | None = None,
     captcha: str | None = None,
     max_retries: int = 3,
 ) -> dict[str, Any]:
-    """Log in to the APS system, automatically handling login state, expired dialog, and captcha."""
-    import base64
+    """Log in to the APS system, automatically handling login state, expired dialog, and captcha.
 
+    凭据不再写死为默认参数：显式传参优先，否则回落 QA_AUTOMATION_LOGIN_USER /
+    _PASSWORD / QA_AUTOMATION_APS_URL（见 config.resolve_login_credentials）。
+    """
+    import base64
+    from urllib.parse import urlsplit
+
+    username, password, url = resolve_login_credentials(username, password, url)
+    if not username or not password:
+        return {
+            "status": "config_missing",
+            "reason": credential_missing_message(user=bool(username), password=bool(password)),
+        }
+    if not url:
+        return {
+            "status": "config_missing",
+            "reason": "未配置目标站点：请设置 QA_AUTOMATION_APS_URL 或在调用时传 url。",
+        }
+
+    # 站点归属判定从配置推导，不再硬编码某个环境的域名
+    target_host = urlsplit(url).netloc
     if _state.browser is None or not _state.browser.is_connected():
         # Try connecting to port 9222 first; if not available, launch a new browser
         try:
@@ -1263,7 +1526,8 @@ async def _browser_login_impl(
 
     # Check if we need to navigate
     curr_url = page.url or ""
-    if not curr_url or curr_url == "about:blank" or curr_url.startswith("chrome://") or "demo18-scm" not in curr_url:
+    on_target = bool(target_host) and target_host in (urlsplit(curr_url).netloc or "")
+    if not curr_url or curr_url == "about:blank" or curr_url.startswith("chrome://") or not on_target:
         await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         await page.wait_for_timeout(1000)
 
@@ -1284,11 +1548,52 @@ async def _browser_login_impl(
             "url": page.url,
             "title": (await page.title())[:200],
         }
+    # Fast path: Try direct SCM API authentication & cookie injection
+    try:
+        api_res = await scm_api_login(
+            url,
+            username,
+            password,
+            captcha=captcha,
+            max_retries=max_retries,
+        )
+        if api_res.get("status") == "captcha-needed":
+            return {
+                "status": "captcha-needed",
+                "page_id": _page_id(page),
+                "captcha_image_path": api_res.get("captcha_image_path"),
+                "captcha_image_base64": api_res.get("captcha_image_base64"),
+                "username": username,
+                "message": api_res.get("message"),
+            }
 
-    # If on admin root but not logged in, navigate to login page
-    if "login" not in page.url and await page.locator("input[placeholder='请输入账号']").count() == 0:
-        await page.goto("https://demo18-scm.hoolinks.com/static/admin/login", wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await page.wait_for_timeout(500)
+        if api_res.get("ok") and api_res.get("cookies_to_inject"):
+            ctx = page.context
+            await ctx.add_cookies(api_res["cookies_to_inject"])
+            admin_url = url
+            if "/login" in admin_url:
+                admin_url = admin_url.split("/login")[0]
+            if not admin_url.endswith("/"):
+                admin_url += "/"
+            if "static/admin" not in admin_url and "scm" not in admin_url:
+                admin_url = f"{urlsplit(url).scheme}://{target_host}/static/admin/"
+
+            await page.goto(admin_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            await page.wait_for_timeout(600)
+            if "login" not in page.url:
+                return {
+                    "status": "logged-in",
+                    "method": "api-fast-path" if not captcha else "api-pending-captcha-resolved",
+                    "page_id": _page_id(page),
+                    "username": username,
+                    "token": api_res.get("token"),
+                    "url": page.url,
+                    "title": (await page.title())[:200],
+                }
+    except Exception:
+        pass
+
+
 
     # Wait for login form inputs to be ready
     user_input = page.locator("input[placeholder='请输入账号']").first
@@ -1321,7 +1626,12 @@ async def _browser_login_impl(
             if await img_loc.count() > 0:
                 captcha_file = artifact_dir("screenshots") / "captcha_login.png"
                 captcha_file.parent.mkdir(parents=True, exist_ok=True)
-                img_bytes = await img_loc.first.screenshot(path=str(captcha_file))
+                # 元素截图同样走 clip;登录前若把视口锁成验证码图尺寸,后续填表全错位
+                window_before = await _capture_window_bounds(page)
+                try:
+                    img_bytes = await img_loc.first.screenshot(path=str(captcha_file))
+                finally:
+                    await _restore_window_and_viewport(page, restore_bounds=window_before)
                 b64_captcha = base64.b64encode(img_bytes).decode("ascii")
 
                 # Attempt AI vision recognition
@@ -1335,7 +1645,7 @@ async def _browser_login_impl(
                     "captcha_image_path": str(captcha_file) if captcha_file else None,
                     "captcha_image_base64": b64_captcha,
                     "username": username,
-                    "message": "已截取图形验证码图片。请使用 inspect_image 工具识别验证码字符，并再次调用 browser_login(captcha=...) 完成登录。",
+                    "message": "本地 OCR 识别验证码失败，已将验证码图片发送到平台。当前 Agent 的多模态模型可直接观察识别此验证码，然后调用 browser_login(username=..., password=..., captcha='...') 完成登录。",
                 }
 
         # Fill captcha
@@ -1388,14 +1698,18 @@ async def _browser_login_impl(
 
 
 async def browser_login(
-    username: str = "pingxiang",
-    password: str = "Ac123456",
+    username: str | None = None,
+    password: str | None = None,
     *,
-    url: str = "https://demo18-scm.hoolinks.com/static/admin/",
+    url: str | None = None,
     captcha: str | None = None,
     max_retries: int = 3,
 ) -> dict[str, Any]:
-    """统一登录工具: 针对新建浏览器会话/登录过期自动登录 APS 系统。"""
+    """统一登录工具: 针对新建浏览器会话/登录过期自动登录 APS 系统。
+
+    账号密码来自显式传参或环境变量（QA_AUTOMATION_LOGIN_USER/_PASSWORD），
+    不支持代码内默认值——工具签名的默认值会进 inputSchema 并每轮下发给模型。
+    """
     async with _action_lock:
         return await _browser_login_impl(
             username=username,
@@ -1403,4 +1717,89 @@ async def browser_login(
             url=url,
             captcha=captcha,
             max_retries=max_retries,
+        )
+
+
+async def _inject_cookies_impl(
+    cookies: list[dict[str, Any]] | None = None,
+    token: str | None = None,
+    *,
+    navigate_to: str | None = None,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    """向当前浏览器上下文快速注入 Cookies / Access-Token 凭据，并可按需跳转或刷新目标页面。"""
+    page = await _current_page_impl()
+    ctx = page.context
+
+    current_url = page.url or ""
+    effective_host = ""
+    if navigate_to:
+        effective_host = urlsplit(navigate_to).netloc
+    elif current_url and current_url != "about:blank":
+        effective_host = urlsplit(current_url).netloc
+
+    cookies_to_add: list[dict[str, Any]] = []
+
+    # 1. 处理传入的 cookies 列表
+    if cookies:
+        for c in cookies:
+            cookie_dict = dict(c)
+            if not cookie_dict.get("domain"):
+                if domain:
+                    cookie_dict["domain"] = domain
+                elif effective_host:
+                    cookie_dict["domain"] = effective_host
+            if not cookie_dict.get("path"):
+                cookie_dict["path"] = "/"
+            cookies_to_add.append(cookie_dict)
+
+    # 2. 处理传入的 token
+    if token:
+        token_cookies = build_cookies_to_inject(
+            cookies_dict={},
+            token=token,
+            target_host=effective_host or domain or "",
+        )
+        cookies_to_add.extend(token_cookies)
+
+    if not cookies_to_add:
+        return {
+            "status": "error",
+            "page_id": _page_id(page),
+            "reason": "未提供任何有效的 cookies 或 token",
+        }
+
+    await ctx.add_cookies(cookies_to_add)
+
+    # 3. 按需导航或刷新
+    if navigate_to:
+        await page.goto(navigate_to, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(500)
+    elif current_url and current_url != "about:blank":
+        await page.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(500)
+
+    return {
+        "status": "ok",
+        "page_id": _page_id(page),
+        "injected_count": len(cookies_to_add),
+        "url": page.url,
+        "title": (await page.title())[:200],
+    }
+
+
+async def inject_cookies(
+    cookies: list[dict[str, Any]] | None = None,
+    token: str | None = None,
+    *,
+    navigate_to: str | None = None,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    """向当前浏览器上下文快速注入 Cookies / Access-Token 凭据，并可按需跳转或刷新目标页面。"""
+    async with _action_lock:
+        return await _inject_cookies_impl(
+            cookies=cookies,
+            token=token,
+            navigate_to=navigate_to,
+            domain=domain,
         )

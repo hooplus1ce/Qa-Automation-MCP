@@ -7,14 +7,14 @@
       "args": [
         "run",
         "--project",
-        "D:/Developer/Hoolinks/Qa-Automation-MCP",
+        "<QA_AUTOMATION_MCP_仓库绝对路径>",
         "--extra",
         "browser",
         "--env-file",
-        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation",
+        "<QA_AUTOMATION_MCP_仓库绝对路径>/.env.qa-automation",
         "fastmcp",
         "run",
-        "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
+        "<QA_AUTOMATION_MCP_仓库绝对路径>/fastmcp.json",
         "--no-banner"
       ],
       "enabled": true
@@ -23,7 +23,7 @@
       "type": "http",
       "url": "https://docs.qq.com/openapi/mcp",
       "headers": {
-        "Authorization": "f7718e8d1f0c433eb9387eb896b52dfa"
+        "Authorization": "<在此填入腾讯文档令牌>"
       }
     }
   }

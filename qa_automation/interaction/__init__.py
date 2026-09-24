@@ -434,8 +434,11 @@ async def _dom_interact_impl(
             }
             if action_detail:
                 response["action_detail"] = action_detail
-        if observe_after and settle_ms:
-            await page.wait_for_timeout(settle_ms)
+        if observe_after and settle_ms and installed is not None:
+            # 动作已落地:交给页内自适应收敛探针决定何时收口(settle_ms 仍为硬上限)
+            from ..overlay import _await_overlay_settle
+
+            installed["settle"] = await _await_overlay_settle(page, settle_ms)
         if expect_input:
             focused_after = await _focused_editable(page)
             verified = bool(focused_after and focused_after != focused_before)

@@ -320,7 +320,10 @@ async def _click_cell_impl(
             if evidence.get("inline_editor"):
                 response["inline_editor"] = evidence["inline_editor"]
         if observe_after and settle_ms:
-            await page.wait_for_timeout(settle_ms)
+            # 单元格点击已落地:交给页内自适应收敛探针决定何时收口
+            from ...overlay import _await_overlay_settle
+
+            installed["settle"] = await _await_overlay_settle(page, settle_ms)
     except Exception as exc:
         response = {
             "status": "failed",

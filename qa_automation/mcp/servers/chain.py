@@ -39,6 +39,14 @@ def create_server() -> FastMCP:
         失败语义:单步硬超时(默认 5000ms,超时记该步失败);stop_on_error=True(默认)
         时首个失败动作终止链条(整体 status="failed",executed 停在失败前成功数);
         False 时收集失败继续(整体 status="partial" 或 "executed")。
+
+        Args:
+            goal: 本轮自然语言意图；当前实现未消费该参数，仅作调用方自述，不传无影响
+            actions: 按序执行的动作数组，每项形如 {"action": "...", 对应原语字段}；action 合法值见上文，字段名与 ui_interact/ui_mouse_drag/vtable_cell_click 一致；空数组直接判 failed
+            mode: 仅在不传 actions 时生效：auto（默认）=返回紧凑页面分析；manual=无 actions 时判 failed；传了 actions 则整个被忽略
+            max_actions: 最多执行前几条动作（默认 10，钳到 1–100）；超出部分不执行且 truncated=true
+            stop_on_error: True（默认）首个失败即断链；False 跑完剩余动作，失败信息逐条保留
+            include_analysis: 纯分析模式下是否内联 analysis 与 page_context（默认 True）；False 只回状态骨架，最省 token
         """
         if actions is not None:
             if not actions:

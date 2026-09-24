@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -11,6 +13,7 @@ if TYPE_CHECKING:
 
 from ..browser import (
     _action_lock,
+    _capture_window_bounds,
     _current_page_impl,
     _frame_context_details,
     _frame_details,
@@ -18,6 +21,8 @@ from ..browser import (
     _frame_page_offset,
     _page_id,
     _page_viewport_size,
+    _read_viewport_or_none,
+    _restore_window_and_viewport,
 )
 from ..components.vtable.binding import (
     active_application_frame,
@@ -254,6 +259,107 @@ async def _focused_editable(page: Page) -> dict[str, Any] | None:
 _MAX_SNAPSHOT_DEPTH = 8
 _MAX_SNAPSHOT_CHARACTERS = 24_000
 
+# aria 树里不承担语义的纯结构节点。它们在 AntD/React 页面上数量极大，
+# 且没有可访问名时对模型判断"能点什么"零贡献。
+_ANONYMOUS_ROLES = frozenset(
+    {
+        "generic",
+        "list",
+        "listitem",
+        "paragraph",
+        "emphasis",
+        "strong",
+        "superscript",
+        "subscript",
+        "presentation",
+        "none",
+        "group",
+    }
+)
+
+_NODE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<dash>-)\s*(?P<role>[A-Za-z_][A-Za-z0-9_-]*)"
+    r"(?:\s+\"(?P<name>[^\"]*)\")?(?P<rest>.*)$"
+)
+
+
+def prune_anonymous_branches(snapshot: str) -> tuple[str, dict[str, int]]:
+    """删掉"自己没名字、后代也全都没名字"的结构包装子树。
+
+    实测动因（真机 APS 角色详情页，frame=null 的顶层快照）：
+        nodes=181  matched=164  NAMED=37  unnamed=127  chars=12,601
+        角色分布 generic=103  listitem=44  —— 127 个无名节点换来的只有 37 个有名字
+    即 3.4k token 里约七成是 `- listitem [ref=e15] [cursor=pointer] [box=0,50,170,38]`
+    这种重复骨架。判据只删"整棵子树都没有可访问名"的节点，因此带名字的
+    叶子（按钮/链接/输入框）必然保留，不会把可行动目标剪掉。
+
+    Returns:
+        (裁剪后的快照, {"removed_nodes": n, "kept_named": n, "kept_total": n})
+    """
+    lines = snapshot.split("\n")
+    parsed: list[tuple[int, int, str, str, bool]] = []  # indent, 行号, role, name, 是否节点行
+    for idx, line in enumerate(lines):
+        if not line.strip():
+            parsed.append((-1, idx, "", "", False))
+            continue
+        m = _NODE_RE.match(line)
+        if m:
+            indent = len(m.group("indent").expandtabs(2))
+            parsed.append((indent, idx, m.group("role").lower(), m.group("name") or "", True))
+        else:
+            # 非节点行（如 `text:` 续行）跟随其父节点的去留
+            parsed.append((-2, idx, "", "", False))
+
+    # 每行的子树结束位置：下一个 indent <= 本行 indent 的行
+    n = len(parsed)
+    subtree_end = [n] * n
+    stack: list[int] = []
+    for i, (indent, _idx, _role, _name, _is_node) in enumerate(parsed):
+        if indent < 0:
+            continue
+        while stack and parsed[stack[-1]][0] >= indent:
+            stack.pop()
+        if stack:
+            subtree_end[stack[-1]] = i
+        stack.append(i)
+    for i in range(len(parsed) - 1, -1, -1):
+        if parsed[i][0] >= 0:
+            subtree_end[i] = min(subtree_end[i], n)
+
+    # 自顶向下决定去留：一个节点可剪 <=> 角色属于噪声集 且 自身无名 且 子树内无任何有名节点
+    def subtree_has_name(start: int, end: int) -> bool:
+        return any(parsed[j][0] >= 0 and parsed[j][3] for j in range(start, end))
+
+    drop = [False] * n
+    out_lines: list[str] = []
+    removed = kept_named = kept_total = 0
+    i = 0
+    while i < n:
+        if drop[i]:
+            i += 1
+            continue
+        indent, _idx, role, name, is_node = parsed[i]
+        if not is_node:
+            out_lines.append(lines[i])
+            i += 1
+            continue
+        if name:
+            kept_named += 1
+        kept_total += 1
+        if role in _ANONYMOUS_ROLES and not name and not subtree_has_name(i, subtree_end[i]):
+            removed += subtree_end[i] - i
+            for j in range(i, subtree_end[i]):
+                drop[j] = True
+            i += 1
+            continue
+        out_lines.append(lines[i])
+        i += 1
+
+    stats = {"removed_nodes": removed, "kept_named": kept_named, "kept_total": kept_total}
+    if removed == 0:
+        return snapshot, stats
+    return "\n".join(out_lines), stats
+
 
 async def _dom_snapshot_impl(
     *,
@@ -266,9 +372,26 @@ async def _dom_snapshot_impl(
     visible_only: bool = False,
     max_elements: int = 5,
     timeout: float = 3.0,
+    prune_noise: bool = True,
 ) -> dict:
     page = await _current_page_impl()
     target_frame = await resolve_frame(page, frame)
+    scope_resolved = "main_document" if frame is None else frame
+    # 默认作用域改为"激活的业务 iframe"，而非顶层文档。
+    # 实测（iframe 套壳的 APS，同页同刻 A/B）：默认拍顶层文档 1,734 tok 里 106 行仅
+    # 14 行有可访问名，全是侧边栏骨架；改拍激活模块后 452 tok、有名行占比反而从
+    # 13% 升到 39% —— 更省且更有用。显式 frame='main' 仍可回顶层。
+    # 仍先经 resolve_frame 再升级，保留它作为可替换接缝。
+    if frame is None:
+        active = await active_application_frame(page)
+        if active is not None:
+            target_frame = active
+            scope_resolved = "active_iframe"
+    try:
+        snapshot_frame_ref = _frame_details(page, target_frame).get("frame_id")
+    except Exception:
+        # frame 元信息只是响应里的定位辅助字段，取不到不该让整次快照失败
+        snapshot_frame_ref = None
     try:
         await target_frame.evaluate("""() => {
             const checkboxes = document.querySelectorAll('.ant-checkbox, .ant-tree-checkbox');
@@ -309,6 +432,10 @@ async def _dom_snapshot_impl(
     if not selector:
         target = target_frame.locator(":root")
         snapshot = await target.aria_snapshot(**kwargs)
+        raw_chars = len(snapshot)
+        prune_stats: dict[str, int] = {}
+        if prune_noise:
+            snapshot, prune_stats = prune_anonymous_branches(snapshot)
         truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
         if truncated:
             snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
@@ -316,13 +443,23 @@ async def _dom_snapshot_impl(
             "status": "ok",
             "selector": selector,
             "frame": frame,
+            "scope": scope_resolved,
+            "frame_id": snapshot_frame_ref,
             "mode": kwargs["mode"],
             "boxes": kwargs["boxes"],
             "depth": kwargs.get("depth"),
             "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
             "truncated": truncated,
             "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "noise_pruned": prune_stats.get("removed_nodes", 0) > 0,
+            "prune_stats": {**prune_stats, "raw_chars": raw_chars, "chars": len(snapshot)}
+            if prune_noise
+            else None,
             "snapshot": snapshot,
+            "hint": None
+            if not prune_noise
+            else "已剪除无名结构包装子树；需要原始 aria 树时传 prune_noise=false，"
+                 "需要业务表格数据请改用 vtable_*（canvas 不进 aria 树）",
         }
 
     # 2. Selector provided: construct locator with error handling
@@ -550,6 +687,7 @@ async def dom_snapshot(
     visible_only: bool = False,
     max_elements: int = 5,
     timeout: float = 3.0,
+    prune_noise: bool = True,
 ) -> dict:
     async with _action_lock:
         return await _dom_snapshot_impl(
@@ -562,6 +700,7 @@ async def dom_snapshot(
             visible_only=visible_only,
             max_elements=max_elements,
             timeout=timeout,
+            prune_noise=prune_noise,
         )
 
 
@@ -709,6 +848,7 @@ async def _screenshot_element_impl(
     filename: str | None = None,
     quality: int | None = None,
     timeout_ms: float = 3_000,
+    screenshot_timeout_ms: float = 15_000,
     max_bytes: int = 2_000_000,
     include_base64: bool = False,
 ) -> dict[str, Any]:
@@ -781,14 +921,40 @@ async def _screenshot_element_impl(
         if not 1 <= quality <= 100:
             raise ValueError("quality must be between 1 and 100")
         screenshot_kwargs["quality"] = quality
+    # 截图前留档窗口态。Chromium 会为 clip 截图临时下发 device-metrics override 把视口
+    # 撑到 clip 尺寸，正常结束会自行还原；但该次截图一旦被中断（超时 / 窗口最小化），
+    # override 会残留在 RenderWidgetHost 上，页面视口被锁成元素尺寸（实测 900x383、715x270），
+    # 之后 vtable、浮层、点击的坐标全部错位。所以这里给截图本身套一层硬超时，
+    # 并在 finally 里无条件按 clip 尺寸做复位校验（命中残留会重试一轮）。
+    window_before = await _capture_window_bounds(page)
+    viewport_before = await _read_viewport_or_none(page)
+    clip_size = (float(clip["width"]), float(clip["height"]))
+    expected_size = (
+        (viewport_before["w"], viewport_before["h"]) if viewport_before else None
+    )
+    viewport_guard: dict[str, Any] | None = None
     try:
-        image = await page.screenshot(**screenshot_kwargs)
+        image = await asyncio.wait_for(
+            page.screenshot(**screenshot_kwargs),
+            timeout=max(0.5, float(screenshot_timeout_ms) / 1000),
+        )
+    except TimeoutError as exc:
+        raise TimeoutError(
+            "截图在 "
+            f"{float(screenshot_timeout_ms):.0f}ms 内未返回"
+            f"(裁剪框 {clip_size[0]:.0f}x{clip_size[1]:.0f})。"
+            "已执行窗口与视口复位，可重试或缩小截图范围。"
+        ) from exc
     finally:
         try:
-            from ..browser import _maximize_and_fill_viewport
-            await _maximize_and_fill_viewport(page)
+            viewport_guard = await _restore_window_and_viewport(
+                page,
+                restore_bounds=window_before,
+                clip_size=clip_size,
+                expected_size=expected_size,
+            )
         except Exception:
-            pass
+            viewport_guard = None
     expected_extensions = {".png"} if image_format == "png" else {".jpg", ".jpeg"}
     requested_filename = filename
     if requested_filename:
@@ -831,6 +997,14 @@ async def _screenshot_element_impl(
             "name": name,
         } if locator_source else None,
     }
+    if viewport_guard:
+        result["viewport_guard"] = {
+            # False = 清理后视口仍等于本次 clip 尺寸，说明 emulation 残留没清掉
+            "restored": not viewport_guard.get("clip_lock_detected", False),
+            "window_state": viewport_guard.get("window_state"),
+            "viewport": viewport_guard.get("viewport"),
+            "attempts": viewport_guard.get("attempts"),
+        }
     if include_base64:
         result["image_base64"] = base64.b64encode(image).decode("ascii")
     return result
@@ -852,14 +1026,16 @@ async def _page_context_impl(*, max_results: int = 10) -> dict:
     frames = list(page.frames)
     frame_items = []
     for frame in frames[: max(1, int(max_results))]:
+        is_active = active is not None and frame == active
+        if is_active:
+            # 活动 frame 由下面的 active_iframe 完整描述一次即可；这里只留引用，
+            # 否则同一坨 frame_url 会在一次 ui_page_context 里重复出现两次。
+            frame_items.append(
+                {**_frame_details(page, frame), "scope": "active_iframe", "described_in": "active_iframe"}
+            )
+            continue
         detail = await _frame_context_details(page, frame)
-        detail["scope"] = (
-            "active_iframe"
-            if active is not None and frame == active
-            else "top_document"
-            if frame == page.main_frame
-            else "iframe"
-        )
+        detail["scope"] = "top_document" if frame == page.main_frame else "iframe"
         frame_items.append(detail)
     overlays = await _scan_overlays_impl(max_results=max_results, scope="active")
     return {
@@ -870,7 +1046,9 @@ async def _page_context_impl(*, max_results: int = 10) -> dict:
         "title": title,
         "frame_count": len(frames),
         "active_iframe": (
-            await _frame_context_details(page, active) if active is not None else None
+            await _frame_context_details(page, active, full_url=True)
+            if active is not None
+            else None
         ),
         "frames": frame_items,
         "focus_layer": overlays.get("context", {}).get("focus_layer"),

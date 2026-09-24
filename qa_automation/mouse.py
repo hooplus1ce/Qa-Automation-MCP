@@ -206,82 +206,102 @@ def _build_cursor_helper_script() -> str:
 
 _WIN_CURSOR_HELPER_SCRIPT = _build_cursor_helper_script()
 
-_GHOST_START_SCRIPT = """([localX, localY]) => {
-    let target = document.elementFromPoint(localX, localY);
+_GHOST_START_SCRIPT = r"""([localX, localY]) => {
+    const target = document.elementFromPoint(localX, localY);
     if (!target) return false;
-    let draggable = target.closest('[draggable="true"]') ||
+    const draggable = target.closest('[draggable="true"]') ||
                     target.closest('.pro-approval-flow-panel-item, [class*="node"], [class*="card"], [class*="item"], button, [role="button"]');
-    let el = draggable || target;
+    const el = draggable || target;
     if (!el || el === document.body || el === document.documentElement) return false;
 
-    const rect = el.getBoundingClientRect();
     const existing = document.getElementById('__qa_automation_drag_ghost__');
     if (existing) {
         try { existing.remove(); } catch (e) {}
     }
 
-    let ghost;
-    if (el instanceof SVGElement && !(el instanceof SVGSVGElement)) {
-        const svgWrapper = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-        svgWrapper.setAttribute('width', String(rect.width));
-        svgWrapper.setAttribute('height', String(rect.height));
-        svgWrapper.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
-        const clonedG = el.cloneNode(true);
-        clonedG.removeAttribute('transform');
-        svgWrapper.appendChild(clonedG);
-        ghost = document.createElement('div');
-        ghost.appendChild(svgWrapper);
-    } else {
-        ghost = el.cloneNode(true);
-    }
+    // 轻量卡片式拖影（对齐 DrissionPage-MCP cursor.py 的 __dp_drag_ghost__）：
+    // 旧版 el.cloneNode(true) 会把整棵子树（含内联样式、事件属性、视频/画布节点）
+    // 复制进 DOM，在复杂业务页面上既卡顿又会重复触发懒加载；卡片只带一段短标签。
+    const label = (() => {
+        const raw = String(
+            el.getAttribute('data-label') || el.getAttribute('title') || el.getAttribute('aria-label') ||
+            el.innerText || el.textContent || el.tagName.toLowerCase()
+        ).replace(/[ \t\n\r]+/g, ' ').trim();
+        return raw.slice(0, 24) || el.tagName.toLowerCase();
+    })();
+    const theme = '#1890ff';
+    const ghost = document.createElement('div');
 
     ghost.id = '__qa_automation_drag_ghost__';
-    ghost.style.cssText = `
-        position: fixed !important;
-        left: ${rect.left}px !important;
-        top: ${rect.top}px !important;
-        width: ${rect.width}px !important;
-        height: ${rect.height}px !important;
-        margin: 0 !important;
-        pointer-events: none !important;
-        z-index: 2147483645 !important;
-        opacity: 0.92 !important;
-        background: #ffffff !important;
-        border: 2px solid #1890ff !important;
-        border-radius: 6px !important;
-        transform-origin: ${localX - rect.left}px ${localY - rect.top}px !important;
-        transform: scale(1.05) !important;
-        box-shadow: 0 14px 36px rgba(24, 144, 255, 0.38), 0 4px 12px rgba(0, 0, 0, 0.18) !important;
-        transition: transform 0.05s linear, opacity 0.2s ease !important;
-        user-select: none !important;
-    `;
-    document.body.appendChild(ghost);
+    ghost.style.cssText = [
+        'position: fixed !important',
+        'left: 0 !important',
+        'top: 0 !important',
+        'margin: 0 !important',
+        'pointer-events: none !important',
+        'z-index: 2147483645 !important',
+        'background: rgba(255, 255, 255, 0.95) !important',
+        'backdrop-filter: blur(6px) !important',
+        'border: 2px solid ' + theme + ' !important',
+        'box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2), 0 2px 10px rgba(24, 144, 255, 0.3) !important',
+        'border-radius: 6px !important',
+        'padding: 8px 18px !important',
+        'font-size: 13px !important',
+        'font-weight: 600 !important',
+        'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important',
+        'color: #1f1f1f !important',
+        'display: flex !important',
+        'align-items: center !important',
+        'gap: 8px !important',
+        'transform-origin: top left !important',
+        'transition: opacity 0.2s ease-out, transform 0.05s linear !important',
+        'opacity: 0 !important',
+        'user-select: none !important'
+    ].join('; ');
+    const badge = '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:'
+        + theme + ';box-shadow:0 0 6px ' + theme + ';"></span>';
+    // 标签一律走 textContent 注入,绝不拼接进 innerHTML——避免把页面文本当 HTML 解析
+    const textNode = document.createElement('span');
+    textNode.textContent = label;
+    ghost.innerHTML = badge;
+    ghost.appendChild(textNode);
+    document.documentElement.appendChild(ghost);
 
-    window.__qa_automation_ghost_state = {
-        offsetX: localX - rect.left,
-        offsetY: localY - rect.top
+    // 卡片稳定贴在虚拟光标右下角 (+14, +14),与光标 helper 的 renderPos 同源偏移
+    const dx = 14;
+    const dy = 14;
+    const follow = (x, y) => {
+        ghost.style.transform = 'translate3d(' + (x + dx) + 'px, ' + (y + dy) + 'px, 0) rotate(2deg) scale(1.02)';
     };
+    follow(localX, localY);
+    requestAnimationFrame(() => { ghost.style.opacity = '1'; });
+
+    window.__qa_automation_ghost_state = { dx: dx, dy: dy };
     return true;
 }"""
 
-_GHOST_UPDATE_SCRIPT = """([x, y]) => {
+_GHOST_UPDATE_SCRIPT = r"""([x, y]) => {
     const ghost = document.getElementById('__qa_automation_drag_ghost__');
     const state = window.__qa_automation_ghost_state;
     if (!ghost || !state) return false;
-    ghost.style.left = (x - state.offsetX) + 'px';
-    ghost.style.top = (y - state.offsetY) + 'px';
+    // transform + translate3d 交给合成层,避免每帧改 left/top 触发布局回流
+    ghost.style.transform =
+        'translate3d(' + (x + state.dx) + 'px, ' + (y + state.dy) + 'px, 0) rotate(2deg) scale(1.02)';
     return true;
 }"""
 
-_GHOST_FINISH_SCRIPT = """([endX, endY]) => {
+_GHOST_FINISH_SCRIPT = r"""([endX, endY]) => {
     const ghost = document.getElementById('__qa_automation_drag_ghost__');
     if (!ghost) return false;
-    ghost.style.transition = 'transform 0.32s cubic-bezier(0.2, 0, 0, 1), opacity 0.32s ease-out';
-    ghost.style.transform = 'scale(0.88)';
+    const state = window.__qa_automation_ghost_state || {dx: 14, dy: 14};
+    ghost.style.transition =
+        'transform 0.25s cubic-bezier(0.1, 0.8, 0.2, 1), opacity 0.22s ease-out';
+    ghost.style.transform =
+        'translate3d(' + (endX + state.dx) + 'px, ' + (endY + state.dy) + 'px, 0) rotate(2deg) scale(0.68)';
     ghost.style.opacity = '0';
     setTimeout(() => {
         try { ghost.remove(); } catch(e) {}
-    }, 350);
+    }, 260);
     delete window.__qa_automation_ghost_state;
     return true;
 }"""

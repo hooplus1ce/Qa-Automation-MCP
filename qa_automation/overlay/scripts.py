@@ -8,6 +8,8 @@ from ..config import (
     ANTD_OVERLAY_SELECTOR,
     OVERLAY_EVENT_LIMIT,
     OVERLAY_OBSERVER_KEY,
+    OVERLAY_PROBE_MS,
+    OVERLAY_QUIET_MS,
 )
 
 _OVERLAY_OBSERVER_TEMPLATE = r"""
@@ -285,13 +287,14 @@ _OVERLAY_OBSERVER_TEMPLATE = r"""
   }
 
   const reused = !!(
-    window[key] && window[key].version === 2 && window[key].selector === selector
+    window[key] && window[key].version === 3 && window[key].selector === selector
   );
   const state = reused
     ? window[key]
     : {
-        version: 2, events: [], droppedEvents: 0, seen: {}, seenOrder: [],
+        version: 3, events: [], droppedEvents: 0, seen: {}, seenOrder: [],
         selector, observer: null, collect, baseline: [],
+        lastMutationAt: 0, lastEventAt: 0, recordedCount: 0, mutationCount: 0,
       };
   if (!state.seenOrder) state.seenOrder = [];
   if (!Number.isFinite(state.droppedEvents)) state.droppedEvents = 0;
@@ -306,6 +309,12 @@ _OVERLAY_OBSERVER_TEMPLATE = r"""
     state.droppedEvents = 0;
     state.seen = {};
     state.seenOrder = [];
+    // 活动水位线随观察窗口一起归零:自适应收敛只认"本次窗口"内的 DOM 变更,
+    // 否则上一次交互残留的时间戳会让本次窗口被误判为"已变更且已安静"而提前收口。
+    state.lastMutationAt = 0;
+    state.lastEventAt = 0;
+    state.recordedCount = 0;
+    state.mutationCount = 0;
     state.baseline = state.collect();
   }
   if (!state.observer) {
@@ -319,6 +328,8 @@ _OVERLAY_OBSERVER_TEMPLATE = r"""
         state.seen[dedupeKey] = item.timestamp;
         state.seenOrder.push(dedupeKey);
         state.events.push(item);
+        state.lastEventAt = item.timestamp;
+        state.recordedCount = Number(state.recordedCount || 0) + 1;
         if (state.events.length > maxEvents) {
           const excess = state.events.length - maxEvents;
           state.events.splice(0, excess);
@@ -331,6 +342,11 @@ _OVERLAY_OBSERVER_TEMPLATE = r"""
       }
     };
     state.observer = new MutationObserver(mutations => {
+      // 关键:任何一批 DOM 变更都推进水位线(即便与浮层无关)。
+      // 只看"记录到的浮层事件"会把"弹窗还在做进场动画"误判成安静,提前收口丢事件。
+      const now = Date.now();
+      state.lastMutationAt = now;
+      state.mutationCount = Number(state.mutationCount || 0) + mutations.length;
       for (const mutation of mutations) {
         if (mutation.type === "attributes") state.record(mutation.target, "changed");
         else for (const node of mutation.addedNodes) state.record(node, "added", true);
@@ -440,3 +456,84 @@ def _overlay_arm_script() -> str:
 
 
 _OVERLAY_ARM_INIT_SCRIPT = _overlay_arm_script
+
+# ---------------------------------------------------------------------------
+# 自适应差分收敛（Adaptive differential convergence）
+# ---------------------------------------------------------------------------
+# 迁移自 DrissionPage-MCP overlays.py：交互后不再"盲等固定时长"，而是驻留在页面内
+# 轮询 DOM 变更水位线，等"变更发生 → 安静 quiet_ms → 无 loading"三条件同时成立才收口。
+# 之所以放在页面内自轮询而不是 Python 侧多次 CDP 往返：跨进程 IPC 本身就有 1~5ms 抖动，
+# 用 CDP 轮询去测 25ms 级的静默期，噪声比信号还大。
+_ADAPTIVE_SETTLE_TEMPLATE = r"""
+(async () => {
+  const key = __KEY__;
+  const maxWaitMs = __MAX_WAIT__;
+  const quietMs = __QUIET__;
+  const probeMs = __PROBE__;
+
+  const state0 = window[key];
+  if (!state0 || !state0.collect) {
+    return {mode: "unobserved", elapsed_ms: 0, observed_mutations: false, idle_ms: null};
+  }
+
+  const activityOf = state => Math.max(
+    Number(state.lastMutationAt || 0), Number(state.lastEventAt || 0)
+  );
+  const loading = () => {
+    try {
+      return Boolean(document.querySelector(
+        ".ant-spin-spinning, .ant-btn-loading, .ant-modal-loading, "
+        + ".ant-table-placeholder .ant-spin, .ant-skeleton-active"
+      ));
+    } catch (_) {
+      return false;
+    }
+  };
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  const started = Date.now();
+  const deadline = started + maxWaitMs;
+  const initialActivity = activityOf(state0);
+  // 只有"近期"水位线才可归因于本次交互：陈旧时间戳不得让本窗口被误判成"已安静"。
+  let activity = initialActivity;
+  let observed = initialActivity > 0 && (started - initialActivity) <= maxWaitMs;
+  let mode = "settled";
+
+  while (Date.now() < deadline) {
+    await sleep(Math.max(1, Math.min(probeMs, deadline - Date.now())));
+    const current = window[key];
+    if (!current || !current.collect) break;
+    const now = activityOf(current);
+    if (now > activity) {
+      activity = now;
+      observed = true;
+    }
+    if (observed && Date.now() - activity >= quietMs && !loading()) {
+      mode = "converged";
+      break;
+    }
+  }
+  const elapsed = Date.now() - started;
+  return {
+    mode,
+    elapsed_ms: elapsed,
+    observed_mutations: observed,
+    idle_ms: observed ? Math.max(0, Date.now() - activity) : null,
+  };
+})()
+"""
+
+
+def _adaptive_settle_script(
+    max_wait_ms: int,
+    quiet_ms: int = OVERLAY_QUIET_MS,
+    probe_ms: int = OVERLAY_PROBE_MS,
+) -> str:
+    """构造页内自适应收敛探针；max_wait_ms 为硬上限（即 settle_ms 本身）。"""
+    return (
+        _ADAPTIVE_SETTLE_TEMPLATE.replace("__KEY__", json.dumps(OVERLAY_OBSERVER_KEY))
+        .replace("__MAX_WAIT__", str(max(0, int(max_wait_ms))))
+        .replace("__QUIET__", str(max(1, int(quiet_ms))))
+        .replace("__PROBE__", str(max(1, int(probe_ms))))
+    )
+

@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
 
-from ...browser import _frame_page_offset, _page_viewport_size
+from ...browser import (
+    _capture_window_bounds,
+    _frame_page_offset,
+    _page_viewport_size,
+    _read_viewport_or_none,
+    _restore_window_and_viewport,
+)
 from ...config import VTABLE_VERIFICATION_STRATEGY
 from .binding import _wrap2, cell_center
 from .scripts import CELL_VISUAL_STATE
@@ -93,7 +100,22 @@ async def _cell_screenshot(
         viewport = await _page_viewport_size(page)
         left = max(0.0, min(float(x) - size / 2, viewport["width"] - size))
         top = max(0.0, min(float(y) - size / 2, viewport["height"] - size))
-        image = await page.screenshot(clip={"x": left, "y": top, "width": size, "height": size})
+        clip = {"x": left, "y": top, "width": size, "height": size}
+        # 与 ui_screenshot 同一类护栏:clip 截图会让 Chromium 临时把视口撑到裁剪框尺寸,
+        # 一旦这次截图被中断,override 残留会把页面视口锁死,后续 VTable 坐标全部错位。
+        window_before = await _capture_window_bounds(page)
+        viewport_before = await _read_viewport_or_none(page)
+        try:
+            image = await asyncio.wait_for(page.screenshot(clip=clip), timeout=15)
+        finally:
+            await _restore_window_and_viewport(
+                page,
+                restore_bounds=window_before,
+                clip_size=(float(size), float(size)),
+                expected_size=(
+                    (viewport_before["w"], viewport_before["h"]) if viewport_before else None
+                ),
+            )
         return {"digest": hashlib.sha256(image).hexdigest()[:16], "clip": {"x": round(left, 2), "y": round(top, 2), "width": size, "height": size}}
     except Exception:
         return None

@@ -438,5 +438,174 @@ class AntdCheckboxSupportTests(unittest.TestCase):
         strategy = LocatorStrategy()
         self.assertIn("antd-checkbox", strategy.order)
         self.assertTrue(strategy.order.index("antd-checkbox") > strategy.order.index("css"))
+
+
+class InteractionContractOptimizationTests(unittest.TestCase):
+    def test_compact_contract_shapes_clean_and_slim_response(self) -> None:
+        from qa_automation.interaction.contract import _interaction_contract
+
+        raw_response = {
+            "status": "acted",
+            "page_id": "page-2",
+            "action": "click",
+            "frame": {"frame_id": "frame-6:66340002", "frame_url": "https://example.com", "frame_name": "app"},
+            "locator": {
+                "resolved_by": "ax-role",
+                "role": "button",
+                "name": "启 用",
+                "description": None,
+                "text": None,
+                "css": None,
+            },
+            "ui_events": [
+                {"kind": "notification", "text": "请先选择需要启用的规则", "visible": True, "event": "visible"}
+            ],
+            "overlays": [
+                {"kind": "notification", "text": "请先选择需要启用的规则", "visible": True, "event": "visible"}
+            ],
+            "visible_overlays": [
+                {"kind": "notification", "text": "请先选择需要启用的规则", "visible": True, "event": "visible"}
+            ],
+            "baseline": [],
+            "observer_errors": [],
+            "events_truncated": False,
+            "dropped_event_count": 0,
+            "observer_cleanup_failed": False,
+            "context": {"focus_layer": None},
+        }
+        result = _interaction_contract(
+            raw_response,
+            action="click",
+            target={"role": "button", "name": "启 用"},
+            compact=True,
+        )
+        self.assertEqual(result["status"], "acted")
+        self.assertEqual(result["action"], "click")
+        self.assertEqual(result["target"], {"role": "button", "name": "启 用"})
+        self.assertEqual(result["locator"], {"resolved_by": "ax-role", "role": "button", "name": "启 用"})
+        self.assertEqual(result["frame_id"], "frame-6:66340002")
+        self.assertEqual(result["page_id"], "page-2")
+        self.assertEqual(len(result["changes"]), 1)
+        self.assertEqual(result["changes"][0]["text"], "请先选择需要启用的规则")
+        self.assertNotIn("ui_events", result)
+        self.assertNotIn("overlays", result)
+        self.assertNotIn("visible_overlays", result)
+        self.assertNotIn("baseline", result)
+        self.assertNotIn("observer_errors", result)
+
+    def test_compact_contract_includes_failure_reason(self) -> None:
+        from qa_automation.interaction.contract import _interaction_contract
+
+        raw_response = {
+            "status": "failed",
+            "action": "click",
+            "reason": "target control not found",
+        }
+        result = _interaction_contract(
+            raw_response,
+            action="click",
+            target={"css": ".missing"},
+            compact=True,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "target control not found")
+
+    def test_non_compact_contract_prunes_empty_defensive_fields(self) -> None:
+        from qa_automation.interaction.contract import _interaction_contract
+
+        raw_response = {
+            "status": "acted",
+            "locator": {"resolved_by": "css", "css": "#btn", "xpath": None},
+            "baseline": [],
+            "observer_errors": [],
+            "events_truncated": False,
+            "dropped_event_count": 0,
+            "observer_cleanup_failed": False,
+            "context": {"focus_layer": None},
+            "overlays": [{"kind": "dialog", "text": "Unified dialog"}],
+        }
+        result = _interaction_contract(
+            raw_response,
+            action="click",
+            target={"css": "#btn"},
+            compact=False,
+        )
+        self.assertEqual(result["locator"], {"resolved_by": "css", "css": "#btn"})
+        self.assertNotIn("baseline", result)
+        self.assertNotIn("observer_errors", result)
+        self.assertNotIn("events_truncated", result)
+        self.assertNotIn("dropped_event_count", result)
+        self.assertNotIn("observer_cleanup_failed", result)
+        self.assertNotIn("focus_layer", result.get("context", {}))
+        self.assertIn("overlays", result)
+        self.assertIn("interaction", result)
+class AuthHelpersTests(unittest.TestCase):
+    def test_extract_parent_domain(self) -> None:
+        from qa_automation.auth import extract_parent_domain
+
+        self.assertEqual(extract_parent_domain("demo18-scm.hoolinks.com"), ".hoolinks.com")
+        self.assertEqual(extract_parent_domain("hoolinks.com"), ".hoolinks.com")
+        self.assertEqual(extract_parent_domain("localhost"), "localhost")
+
+    def test_build_cookies_to_inject(self) -> None:
+        from qa_automation.auth import build_cookies_to_inject
+
+        cookies = build_cookies_to_inject(
+            cookies_dict={"SESSION": "sess-123"},
+            token="tok-456",
+            target_host="demo18-scm.hoolinks.com",
+        )
+        names = {c["name"] for c in cookies}
+        domains = {c["domain"] for c in cookies}
+        self.assertIn("SESSION", names)
+        self.assertIn("HL-Access-Token", names)
+        self.assertIn("cookie_token", names)
+        self.assertIn("UCTOKEN", names)
+        self.assertIn("demo18-scm.hoolinks.com", domains)
+        self.assertIn(".hoolinks.com", domains)
+
+    def test_recognize_captcha_digits_requires_four_digits(self) -> None:
+        from qa_automation.auth import recognize_captcha_digits
+
+        # Invalid bytes should gracefully return None rather than raising
+        result = recognize_captcha_digits(b"not-an-image")
+        self.assertIsNone(result)
+    def test_pending_captcha_session_lifecycle(self) -> None:
+        import time
+        from qa_automation.auth import (
+            PendingCaptchaSession,
+            clear_pending_captcha_session,
+            get_pending_captcha_session,
+        )
+        import qa_automation.auth as auth_mod
+
+        clear_pending_captcha_session()
+        self.assertIsNone(get_pending_captcha_session())
+
+        auth_mod._PENDING_SESSION = PendingCaptchaSession(
+            origin="https://demo.example.com",
+            host="demo.example.com",
+            username="testuser",
+            password="testpassword",
+            cookies={"JSESSIONID": "xyz"},
+            captcha_image_path="/path/to/img.png",
+            captcha_image_base64="abc",
+            timestamp=time.time(),
+        )
+
+        # Match username
+        self.assertIsNotNone(get_pending_captcha_session("testuser"))
+        # Mismatch username
+        self.assertIsNone(get_pending_captcha_session("otheruser"))
+
+        # Expired session
+        auth_mod._PENDING_SESSION.timestamp = time.time() - 400.0
+        self.assertIsNone(get_pending_captcha_session())
+
+        # Clear
+        clear_pending_captcha_session()
+        self.assertIsNone(auth_mod._PENDING_SESSION)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

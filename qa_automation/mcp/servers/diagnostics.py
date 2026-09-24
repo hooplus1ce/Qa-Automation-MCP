@@ -18,7 +18,11 @@ def create_server() -> FastMCP:
 
     @mcp.tool()
     async def automation_metrics(limit: int = 50) -> dict:
-        """返回浏览器侧工具的近期耗时、响应体积和上下文 token 估算。"""
+        """返回浏览器侧工具的近期耗时、响应体积和上下文 token 估算。
+
+        Args:
+            limit: recent 里返回的最近调用条数（默认 50，钳到 1–200）；summary 不受它影响
+        """
         return metrics_snapshot(limit)
 
     return mcp

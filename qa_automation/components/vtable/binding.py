@@ -88,6 +88,10 @@ async def vtable_frame(page: Page) -> Frame:
 async def resolve_frame(page: Page, frame: str | None) -> Frame:
     if frame is None:
         return page.main_frame
+    if frame in {"main", "top", "document"}:
+        # 显式要顶层文档。ui_snapshot 默认已改为激活业务 iframe，
+        # 顶层是逃生舱，必须能被名字直达。
+        return page.main_frame
     if frame == "vtable":
         return await vtable_frame(page)
     if frame in {"active", "application"}:

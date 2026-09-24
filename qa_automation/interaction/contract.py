@@ -74,6 +74,15 @@ def _interaction_contract(
             "target": clean_target,
             "confidence": confidence,
         }
+        if response.get("page_id"):
+            compact_res["page_id"] = response["page_id"]
+        if response.get("reason"):
+            compact_res["reason"] = response["reason"]
+        if clean_locator:
+            compact_res["locator"] = clean_locator
+        frame_id = (response.get("frame") or {}).get("frame_id")
+        if frame_id:
+            compact_res["frame_id"] = frame_id
         if changes:
             compact_res["changes"] = changes
         focus = (response.get("context") or {}).get("focus_layer")
@@ -81,5 +90,25 @@ def _interaction_contract(
             compact_res["focus_layer"] = focus
         if inline_editor:
             compact_res["inline_editor"] = inline_editor
+        activation = response.get("activation")
+        if activation:
+            compact_res["activation"] = activation
         return compact_res
+
+    # Prune noise from non-compact response to eliminate redundant tokens
+    if clean_locator:
+        response["locator"] = clean_locator
+    if response.get("baseline") == []:
+        response.pop("baseline", None)
+    if response.get("observer_errors") == []:
+        response.pop("observer_errors", None)
+    if response.get("events_truncated") is False:
+        response.pop("events_truncated", None)
+    if response.get("dropped_event_count") == 0:
+        response.pop("dropped_event_count", None)
+    if response.get("observer_cleanup_failed") is False:
+        response.pop("observer_cleanup_failed", None)
+    if isinstance(response.get("context"), dict):
+        if response["context"].get("focus_layer") is None:
+            response["context"].pop("focus_layer", None)
     return response

@@ -10,3 +10,13 @@ dist/
 .env.qa-automation
 .qa-automation/
 ~$*.xlsx
+
+# 本机 MCP 客户端配置：含 tencent-docs 的 Authorization 令牌，不得入库。
+# 模板见 .mcp.json.example（本文件曾受 git 跟踪，令牌已进历史与远端，必须轮换）。
+.mcp.json
+
+# 临时文件与多媒体录屏
+*.mp4
+*.log
+.base*.txt
+.pytest_baseline.txt
