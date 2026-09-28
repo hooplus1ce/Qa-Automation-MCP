@@ -33,7 +33,11 @@ def create_server() -> FastMCP:
         expect_input: bool = False,
         compact: bool = True,
     ) -> dict:
-        """统一点击页面控件，并即时返回 Portal、提示和聚焦浮层。
+        """统一主点击入口：点击页面控件并即时返回 Portal、提示和聚焦浮层。
+
+        常规按钮、链接、图标、标签页、菜单项等所有点击动作，优先使用本工具。
+        若需要执行输入填值、悬停、按键等非点击类动作，请使用 ui_interact；
+        若需要操作 AntD 下拉框/日期框，请使用专用的 antd_select / antd_date_pick。
 
         可同时传多个来自分析结果的候选定位；执行顺序固定为 CSS → AX role/name
         (可带 description) → XPath → text/placeholder → 顶层视口绝对坐标。坐标仅作为
@@ -234,7 +238,10 @@ def create_server() -> FastMCP:
         expect_input: bool = False,
         compact: bool = True,
     ) -> dict:
-        """在当前页面/活动 iframe 中执行统一 DOM 交互并返回聚焦浮层结果。
+        """统一表单与复合交互入口：执行非点击类 DOM 操作（输入、按键、悬停、勾选）。
+
+        主要用于 fill/type 文本填入（必须带 value）、press 按键（必须带 key）、hover 悬停、check 复选等动作。
+        单纯点击控件请优先使用专用的 ui_click 工具，避免在通用交互间犹豫。
 
         分析器返回 CSS 时优先 CSS；否则按 AX role/name/description、XPath、text/
         placeholder 依次尝试。x/y 是顶层 viewport 绝对 CSS 像素，只在前述候选都无法
@@ -308,8 +315,9 @@ def create_server() -> FastMCP:
         timeout: float = 3.0,
         prune_noise: bool = True,
     ) -> dict:
-        """抓取页面 aria 快照(mode='ai' + boxes),给 AI 一张"语义之眼"。
+        """【页面元素识别与观察首选工具】抓取页面 aria 快照(mode='ai' + boxes)，给 AI 一张精准的“语义之眼”。
 
+        【推荐优先级：最高】所有常规页面元素识别、文本提取、定位决策，必须首选本工具！
         官方 Playwright MCP 范式:把 accessibility 树(含 [ref=xx] 引用和 [box=x,y,w,h]
         视口坐标)喂给 AI。VTable 本体是 canvas(单元格不进 a11y 树,仍走确定性几何定位),
         但工具栏/弹窗/编辑器输入框都在树里 —— 交互前先读快照,再决定点哪个。
@@ -383,7 +391,19 @@ def create_server() -> FastMCP:
         screenshot_timeout_ms: float = 15_000,
         max_bytes: int = 2_000_000,
     ) -> dict:
-        """截取指定 DOM 元素或顶层 viewport 区域，将图片保存到工作区并返回文件路径。
+        """【最低优先级 / 兜底工具】截取指定 DOM 元素或顶层 viewport 区域图像并保存到工作区。
+
+        ⚠️【AI 行为准则与优先级警告】⚠️
+        1. 最低优先级兜底工具：严禁在每次操作前常规化（routine）调用本工具识别页面！
+        2. 页面元素与信息识别首选语义工具：
+           - 页面结构/控件识别：必须首选 `ui_snapshot`（ARIA 语义树，带确定性 [ref] 和 [box] 坐标，无视觉畸变且省 Token）！
+           - 局部聚焦控件分析：使用 `ui_analyze_scope` 或 `ui_page_context`；
+           - 业务表格结构与数据：使用 `vtable_analysis` 或 `vtable_read_cells`；
+           - 全局提示与气泡：使用 `wait_message` 或 `overlay_scan`。
+        3. 坐标陷阱警示：严禁根据截图像素去反推或校准点击坐标！Windows 高分屏缩放（DPI/DSF）下，全屏截图可能产生灰边或缩放比例偏移（如 0.8x），依据图片像素计算坐标必然偏离真实目标；请直接使用 DOM / VTable / AX 报告的真实 CSS 坐标，或优先使用 CSS/Role/Text 语义选择器。
+        4. 何时才允许调用本工具：
+           - 仅当人类用户显式要求提供页面截图或留档时；
+           - 或页面遇到纯无语义 Canvas 渲染、图片验证码、极端白屏等必须依靠多模态视觉定位的极少数兜底场景。
 
         元素定位顺序与 ui_interact 相同：CSS → AX role/name/description → XPath →
         text/placeholder。frame 未指定时优先活动 iframe。若没有可用定位器，可传

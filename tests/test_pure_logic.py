@@ -572,12 +572,13 @@ class AuthHelpersTests(unittest.TestCase):
         self.assertIsNone(result)
     def test_pending_captcha_session_lifecycle(self) -> None:
         import time
+
+        import qa_automation.auth as auth_mod
         from qa_automation.auth import (
             PendingCaptchaSession,
             clear_pending_captcha_session,
             get_pending_captcha_session,
         )
-        import qa_automation.auth as auth_mod
 
         clear_pending_captcha_session()
         self.assertIsNone(get_pending_captcha_session())
@@ -606,6 +607,140 @@ class AuthHelpersTests(unittest.TestCase):
         clear_pending_captcha_session()
         self.assertIsNone(auth_mod._PENDING_SESSION)
 
+
+    def test_resolve_profile_matches_role_substring_and_reports_roles(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from qa_automation.auth_profiles import resolve_profile
+
+        toml_content = (
+            "[profiles.super_user]\n"
+            'host_prefix = "env1"\n'
+            'username = "u_super"\n'
+            'password = "p1"\n'
+            'role = "APS 超级管理员"\n\n'
+            "[profiles.perm_tester]\n"
+            'host_prefix = "env1"\n'
+            'username = "u_tester"\n'
+            'password = "p2"\n'
+            'role = "APS 权限测试专用账号"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "profiles.toml"
+            p.write_text(toml_content, encoding="utf-8")
+            prev = os.environ.get("QA_AUTOMATION_PROFILES_FILE")
+            os.environ["QA_AUTOMATION_PROFILES_FILE"] = str(p)
+            try:
+                # Match by role substring
+                matched = resolve_profile("权限测试")
+                self.assertEqual(matched.name, "perm_tester")
+                self.assertEqual(matched.username, "u_tester")
+                # Match by username
+                by_user = resolve_profile("u_super")
+                self.assertEqual(by_user.name, "super_user")
+                # Unknown profile lists roles in error
+                with self.assertRaises(ValueError) as ctx:
+                    resolve_profile("nonexistent")
+                self.assertIn("APS 权限测试专用账号", str(ctx.exception))
+            finally:
+                if prev is None:
+                    os.environ.pop("QA_AUTOMATION_PROFILES_FILE", None)
+                else:
+                    os.environ["QA_AUTOMATION_PROFILES_FILE"] = prev
+
+    def test_browser_login_switches_account_on_already_logged_in_page(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import qa_automation.browser as browser_mod
+
+        toml_content = (
+            "[profiles.perm_tester]\n"
+            'base_url = "https://env1.example.com"\n'
+            'admin_url = "https://env1.example.com/static/admin/"\n'
+            'username = "u_tester"\n'
+            'password = "p2"\n'
+            'role = "APS 权限测试专用账号"\n'
+        )
+
+        fake_ctx = MagicMock()
+        fake_ctx.clear_cookies = AsyncMock()
+        fake_ctx.add_cookies = AsyncMock()
+
+        fake_locator = MagicMock()
+        fake_locator.count = AsyncMock(return_value=0)
+
+        fake_page = MagicMock()
+        fake_page.url = "https://env1.example.com/static/admin/"
+        fake_page.context = fake_ctx
+        fake_page.locator = MagicMock(return_value=fake_locator)
+        fake_page.goto = AsyncMock()
+        fake_page.wait_for_timeout = AsyncMock()
+        fake_page.title = AsyncMock(return_value="APS Admin")
+
+        fake_browser = MagicMock()
+        fake_browser.is_connected = MagicMock(return_value=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "profiles.toml"
+            p.write_text(toml_content, encoding="utf-8")
+            prev_file = os.environ.get("QA_AUTOMATION_PROFILES_FILE")
+            prev_sess = os.environ.get("QA_AUTOMATION_SESSION_DIR")
+            os.environ["QA_AUTOMATION_PROFILES_FILE"] = str(p)
+            os.environ["QA_AUTOMATION_SESSION_DIR"] = str(Path(tmp) / "sessions")
+            try:
+                with (
+                    patch.object(browser_mod._state, "browser", fake_browser),
+                    patch.object(browser_mod, "_current_page_impl", AsyncMock(return_value=fake_page)),
+                    patch.object(browser_mod, "_maximize_and_fill_viewport", AsyncMock()),
+                    patch.object(
+                        browser_mod,
+                        "scm_api_login",
+                        AsyncMock(
+                            return_value={
+                                "ok": True,
+                                "token": "new-token-9999",
+                                "cookies_to_inject": [
+                                    {
+                                        "name": "HL-Access-Token",
+                                        "value": "new-token-9999",
+                                        "domain": "env1.example.com",
+                                        "path": "/",
+                                    }
+                                ],
+                            }
+                        ),
+                    ) as mock_api_login,
+                ):
+                    # 1. Explicit unknown profile -> returns profile_not_found with profiles list
+                    not_found = asyncio.run(browser_mod._browser_login_impl(profile="unknown_role"))
+                    self.assertEqual(not_found["status"], "profile_not_found")
+                    self.assertEqual(len(not_found["profiles"]), 1)
+
+                    # 2. Explicit profile on an already-logged-in page (without prior cache)
+                    # MUST NOT short-circuit to already-logged-in; must call scm_api_login and clear cookies
+                    res = asyncio.run(browser_mod._browser_login_impl(profile="权限测试"))
+                    self.assertEqual(res["status"], "logged-in")
+                    self.assertEqual(res["method"], "api-fast-path")
+                    self.assertEqual(res["profile"], "perm_tester")
+                    self.assertEqual(res["username"], "u_tester")
+                    mock_api_login.assert_awaited_once()
+                    fake_ctx.clear_cookies.assert_awaited()
+                    fake_ctx.add_cookies.assert_awaited()
+            finally:
+                if prev_file is None:
+                    os.environ.pop("QA_AUTOMATION_PROFILES_FILE", None)
+                else:
+                    os.environ["QA_AUTOMATION_PROFILES_FILE"] = prev_file
+                if prev_sess is None:
+                    os.environ.pop("QA_AUTOMATION_SESSION_DIR", None)
+                else:
+                    os.environ["QA_AUTOMATION_SESSION_DIR"] = prev_sess
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

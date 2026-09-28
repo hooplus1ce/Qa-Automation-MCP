@@ -149,6 +149,16 @@ async def scm_api_login(
     captcha: str | None = None,
     max_retries: int = 4,
     timeout_sec: float = 10.0,
+    captcha_path: str = "/scmpsm/login/validateCode",
+    captcha_key: str = "regValidateCode",
+    login_path: str = "/scmpsm/login/signin",
+    username_field: str = "userName",
+    password_field: str = "userPwd",
+    captcha_field: str = "vcode",
+    success_field: str = "ok",
+    message_field: str = "msg",
+    token_field: str = "data",
+    user_agent: str | None = None,
 ) -> dict[str, Any]:
     """Perform fast API login to APS/SCM backend via /scmpsm/login endpoints.
 
@@ -169,7 +179,8 @@ async def scm_api_login(
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "User-Agent": (
+        "User-Agent": user_agent
+        or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
         ),
@@ -187,19 +198,19 @@ async def scm_api_login(
                 timeout=timeout_sec,
             ) as client:
                 signin_payload = {
-                    "userName": username,
-                    "userPwd": password,
-                    "vcode": resolved_code,
+                    username_field: username,
+                    password_field: password,
+                    captcha_field: resolved_code,
                 }
                 try:
                     resp_signin = await client.post(
-                        "/scmpsm/login/signin",
+                        login_path,
                         json=signin_payload,
                         headers=headers,
                     )
                     res_data = resp_signin.json() if resp_signin.status_code == 200 else {}
-                    if res_data.get("ok") and res_data.get("data"):
-                        token = str(res_data["data"])
+                    if res_data.get(success_field) and res_data.get(token_field):
+                        token = str(res_data[token_field])
                         cookies_dict = dict(client.cookies)
                         cookies_to_inject = build_cookies_to_inject(
                             cookies_dict=cookies_dict,
@@ -210,13 +221,13 @@ async def scm_api_login(
                         return {
                             "ok": True,
                             "token": token,
-                            "message": res_data.get("msg") or "登录成功！",
+                            "message": res_data.get(message_field) or "登录成功！",
                             "cookies": cookies_dict,
                             "cookies_to_inject": cookies_to_inject,
                             "attempts": 1,
                         }
                     else:
-                        msg = res_data.get("msg") or resp_signin.text[:100]
+                        msg = res_data.get(message_field) or resp_signin.text[:100]
                         logger.warning("Pending session signin rejected: %s", msg)
                 except Exception as exc:
                     logger.warning("Pending session signin request failed: %s", exc)
@@ -231,7 +242,7 @@ async def scm_api_login(
     async with httpx.AsyncClient(base_url=origin, timeout=timeout_sec) as client:
         for attempt in range(1, max(1, max_retries) + 1):
             rnd = random.random()
-            code_url = f"/scmpsm/login/validateCode?key=regValidateCode&random={rnd}"
+            code_url = f"{captcha_path}?key={captcha_key}&random={rnd}"
             try:
                 resp_img = await client.get(code_url, headers={"Accept": "image/*,*/*;q=0.8"})
             except Exception as exc:
@@ -254,14 +265,14 @@ async def scm_api_login(
                 continue
 
             signin_payload = {
-                "userName": username,
-                "userPwd": password,
-                "vcode": vcode,
+                username_field: username,
+                password_field: password,
+                captcha_field: vcode,
             }
 
             try:
                 resp_signin = await client.post(
-                    "/scmpsm/login/signin",
+                    login_path,
                     json=signin_payload,
                     headers=headers,
                 )
@@ -280,8 +291,8 @@ async def scm_api_login(
             except Exception:
                 res_data = {}
 
-            if res_data.get("ok") and res_data.get("data"):
-                token = str(res_data["data"])
+            if res_data.get(success_field) and res_data.get(token_field):
+                token = str(res_data[token_field])
                 cookies_dict = dict(client.cookies)
                 cookies_to_inject = build_cookies_to_inject(
                     cookies_dict=cookies_dict,
@@ -292,13 +303,13 @@ async def scm_api_login(
                 return {
                     "ok": True,
                     "token": token,
-                    "message": res_data.get("msg") or "登录成功！",
+                    "message": res_data.get(message_field) or "登录成功！",
                     "cookies": cookies_dict,
                     "cookies_to_inject": cookies_to_inject,
                     "attempts": attempt,
                 }
             else:
-                msg = res_data.get("msg") or resp_signin.text[:100]
+                msg = res_data.get(message_field) or resp_signin.text[:100]
                 last_error = f"接口登录未通过: {msg}"
                 await asyncio.sleep(0.25)
 

@@ -219,7 +219,7 @@ _GHOST_START_SCRIPT = r"""([localX, localY]) => {
         try { existing.remove(); } catch (e) {}
     }
 
-    // 轻量卡片式拖影（对齐 DrissionPage-MCP cursor.py 的 __dp_drag_ghost__）：
+    // 轻量卡片式拖影（虚拟光标拖拽时只带一段短标签）：
     // 旧版 el.cloneNode(true) 会把整棵子树（含内联样式、事件属性、视频/画布节点）
     // 复制进 DOM，在复杂业务页面上既卡顿又会重复触发懒加载；卡片只带一段短标签。
     const label = (() => {

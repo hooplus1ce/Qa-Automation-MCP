@@ -27,9 +27,7 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ui_interact", ui_names)
         self.assertIn("vtable_analysis", vtable_names)
         self.assertIn("update_test_case_result", tencent_docs_names)
-        self.assertIn("testcase_connect", tencent_docs_names)
-        self.assertIn("testcase_get", tencent_docs_names)
-        self.assertIn("testcase_batch_update_results", tencent_docs_names)
+        self.assertNotIn("testcase_connect", tencent_docs_names)
         self.assertIn("tencent_sheet_connect", tencent_docs_names)
         self.assertIn("tencent_sheet_get_row", tencent_docs_names)
         self.assertIn("tencent_sheet_query_rows", tencent_docs_names)
@@ -43,7 +41,7 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("browser.browser_start", root_names)
 
     async def test_app_ui_and_resources_survive_composition(self) -> None:
-        async with Client(server.mcp) as client:
+        async with Client(server.create_server(include_demos=True)) as client:
             result = await client.call_tool("case_execution_panel", {})
             resources = await client.list_resources()
             templates = await client.list_resource_templates()
@@ -78,14 +76,13 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("automation_metrics", by_name)
         self.assertIn("vtable_discover", by_name)
         self.assertIn("vtable_analysis", by_name)
-        self.assertIn("vtable_cell_resolve", by_name)
-        self.assertIn("vtable_cell_click_by_field", by_name)
+        self.assertIn("vtable_cell_click", by_name)
+        self.assertIn("field", by_name["vtable_cell_click"].inputSchema["properties"])
+        self.assertIn("record_index", by_name["vtable_cell_click"].inputSchema["properties"])
         self.assertIn("frame", by_name["vtable_discover"].inputSchema["properties"])
         for name in (
             "vtable_cell_info",
             "vtable_cell_click",
-            "vtable_cell_resolve",
-            "vtable_cell_click_by_field",
             "vtable_meta",
             "vtable_analysis",
             "vtable_read_cells",
@@ -94,6 +91,8 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
             schema = by_name[name].inputSchema
             self.assertIn("frame", schema["properties"], name)
             self.assertIn("table_index", schema["properties"], name)
+        self.assertNotIn("vtable_cell_resolve", by_name)
+        self.assertNotIn("vtable_cell_click_by_field", by_name)
         self.assertNotIn("vtable_checkbox_click", by_name)
         self.assertNotIn("vtable_dom_click", by_name)
         self.assertNotIn("vtable_dom_click_and_observe", by_name)
@@ -126,7 +125,7 @@ class ServerContractTests(unittest.IsolatedAsyncioTestCase):
             "max_controls", by_name["ui_analyze_scope"].inputSchema["properties"]
         )
         self.assertIn(
-            "record_index", by_name["vtable_cell_resolve"].inputSchema["required"]
+            "record_index", by_name["vtable_cell_click"].inputSchema["properties"]
         )
         self.assertIn(
             "max_columns", by_name["vtable_analysis"].inputSchema["properties"]

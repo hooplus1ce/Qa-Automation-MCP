@@ -16,9 +16,9 @@ import time
 import urllib.error
 import urllib.request
 import weakref
-from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 try:
     from playwright.async_api import Browser, Frame, Page, async_playwright
@@ -28,6 +28,11 @@ except ImportError:  # pragma: no cover
     Page = Any  # type: ignore[assignment,misc]
     async_playwright = None  # type: ignore[assignment]
 
+from .auth import (
+    build_cookies_to_inject,
+    recognize_captcha_digits,
+    scm_api_login,
+)
 from .config import (
     NAV_TIMEOUT_MS,
     PLAYWRIGHT_INSTALL_HINT,
@@ -38,12 +43,6 @@ from .config import (
 from .mouse import _WIN_CURSOR_HELPER_SCRIPT, _reset_last_mouse_point
 from .workspace import artifact_dir, artifact_file, resolve_workspace_path
 
-from .auth import (
-    build_cookies_to_inject,
-    extract_parent_domain,
-    recognize_captcha_digits,
-    scm_api_login,
-)
 
 @dataclass
 class _BrowserState:
@@ -361,6 +360,56 @@ async def _page_viewport_size(page: Page) -> dict[str, float]:
     if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
         raise ValueError("page viewport is unavailable")
     return {"width": width, "height": height}
+
+
+async def _page_pixel_ratio(page: Page) -> dict[str, float]:
+    """读取内容栅格比例:1 DOM CSS 像素对应多少物理像素。
+
+    真机 APS 复现的缺陷(浏览器缩放过 100%):
+
+    * ``page.screenshot(clip=...)`` 的出图画布按**显示器缩放系数**放大
+      (实测 2.2),而页面内容按 **devicePixelRatio** 栅格化(实测 1.76)。
+      两者只在页面缩放为 100% 时相等,不等时画布右侧/底部会多出
+      ``1 - dpr/画布系数`` 的空白(实测 20%),元素在图片里的位置也比 DOM 坐标小。
+    * **不要用 ``visualViewport.zoom`` 去推算**:同一台机器上它在 0.8 与 1.0 之间
+      反复横跳(Chrome 的 per-origin zoom 与 CDP 的 visual viewport zoom 不是一回事),
+      但几何完全没变。可靠的做法是拿真实截图回读画布尺寸自校验,
+      见 ``interaction.snapshot._capture_correction``。
+
+    Returns:
+        {"dpr": 设备像素比(内容栅格比例), "zoom_hint": visualViewport.zoom(仅供参考),
+         "vw"/"vh": 同一时刻的 innerWidth/innerHeight(供调用方做缓存键)}
+        取不到时退化为 1.0,不会把调用方带崩。
+    """
+    fallback = {"dpr": 1.0, "zoom_hint": 1.0, "vw": 0.0, "vh": 0.0}
+    try:
+        raw = await page.evaluate(
+            "() => ({"
+            "  zoom: (window.visualViewport && window.visualViewport.zoom) || 1,"
+            "  dpr: window.devicePixelRatio || 1,"
+            "  vw: Number(window.innerWidth) || 0,"
+            "  vh: Number(window.innerHeight) || 0"
+            "})"
+        )
+    except Exception:
+        return fallback
+    try:
+        dpr = float(raw["dpr"])
+        zoom_hint = float(raw["zoom"])
+    except Exception:
+        return fallback
+    if not math.isfinite(dpr) or not 0.1 <= dpr <= 10:
+        dpr = 1.0
+    if not math.isfinite(zoom_hint) or not 0.1 <= zoom_hint <= 10:
+        zoom_hint = 1.0
+    vw = float(raw.get("vw") or 0.0)
+    vh = float(raw.get("vh") or 0.0)
+    return {
+        "dpr": dpr,
+        "zoom_hint": zoom_hint,
+        "vw": vw if math.isfinite(vw) and vw > 0 else 0.0,
+        "vh": vh if math.isfinite(vh) and vh > 0 else 0.0,
+    }
 
 
 async def _frame_context_details(
@@ -700,25 +749,45 @@ def _same_size(
     )
 
 
+def _size_candidates(clip_size: Any) -> list[tuple[float, float]]:
+    """把 clip_size 归一成候选尺寸列表。
+
+    截图在浏览器缩放过 100% 时会有两套尺寸:DOM CSS 空间(视口回读所在的
+    空间)与裁剪框空间(已乘 zoom)。两者都可能是 emulation 残留时视口被锁成
+    的值,所以复位校验要同时认这两套,否则会漏判。
+    """
+    if not clip_size:
+        return []
+    if isinstance(clip_size[0], (list, tuple)):
+        return [tuple(item) for item in clip_size if item]
+    return [tuple(clip_size)]
+
+
 def _looks_like_clip_lock(
     measured: dict[str, float] | None,
-    clip_size: tuple[float, float] | None,
+    clip_size: Any,
     expected_size: tuple[float, float] | None = None,
 ) -> bool:
     """视口是否仍等于「刚才那次截图的 clip 尺寸」——命中即说明 emulation 残留没清掉。
 
     必须传 expected_size(截图前的视口尺寸):全视口截图的 clip 本来就等于自然视口,
     只看 clip 会把正常结果误判成残留,并白白多跑一轮复位。
+    clip_size 可以是单个 (w, h),也可以是候选尺寸列表。
     """
-    if not _same_size(measured, clip_size):
+    if not measured:
         return False
-    if not clip_size:
+    candidates = _size_candidates(clip_size)
+    if not candidates:
         return False
-    try:
-        if float(clip_size[0]) <= 0 or float(clip_size[1]) <= 0:
+    matched = any(_same_size(measured, item) for item in candidates)
+    if not matched:
+        return False
+    for item in candidates:
+        try:
+            if float(item[0]) <= 0 or float(item[1]) <= 0:
+                return False
+        except Exception:
             return False
-    except Exception:
-        return False
     return not _same_size(measured, expected_size)
 
 
@@ -765,7 +834,7 @@ async def _restore_window_and_viewport(
     page: Page,
     *,
     restore_bounds: dict[str, Any] | None = None,
-    clip_size: tuple[float, float] | None = None,
+    clip_size: Any = None,
     expected_size: tuple[float, float] | None = None,
     attempts: int = 2,
 ) -> dict[str, Any]:
@@ -789,7 +858,9 @@ async def _restore_window_and_viewport(
 
     Args:
         restore_bounds: 截图前留档的窗口 bounds,normal 中转时用于避免窗口跳位
-        clip_size: 本次截图的 (width, height),用于识别 emulation 残留
+        clip_size: 本次截图的裁剪框尺寸,用于识别 emulation 残留。可以是单个
+            (width, height),也可以是候选列表——浏览器缩放过 100% 时 DOM CSS 空间
+            与裁剪框空间尺寸不同,两套都要认
         expected_size: 截图前的视口尺寸;与 clip_size 相等时不再判为残留
             (全视口截图本就如此,否则会误报)
         attempts: 最大尝试轮数(默认 2)
@@ -1490,26 +1561,78 @@ async def _browser_login_impl(
     *,
     url: str | None = None,
     captcha: str | None = None,
+    profile: str | None = None,
+    force: bool = False,
     max_retries: int = 3,
 ) -> dict[str, Any]:
-    """Log in to the APS system, automatically handling login state, expired dialog, and captcha.
+    """登录 APS：账号档案预配置 + 登录态缓存复用 + 验证码两段式。
 
-    凭据不再写死为默认参数：显式传参优先，否则回落 QA_AUTOMATION_LOGIN_USER /
-    _PASSWORD / QA_AUTOMATION_APS_URL（见 config.resolve_login_credentials）。
+    凭据解析优先级（都不写死为默认参数，避免随 inputSchema 每轮下发给模型）：
+      1. 显式传参 username / password / url
+      2. 账号档案（profiles.toml，按 profile 名取用；缺省取 QA_AUTOMATION_ACCOUNT）
+      3. 环境变量 QA_AUTOMATION_LOGIN_USER / _PASSWORD / QA_AUTOMATION_APS_URL
+
+    流程：档案命中且会话缓存有效 → 直接注入 cookies 秒级恢复（免验证码）；
+          否则走接口登录（首次不带 captcha 返回验证码图片，带 captcha 再调一次完成），
+          成功后把 token + cookies 写入会话缓存，供后续调用直接复用。
     """
     import base64
     from urllib.parse import urlsplit
 
+    from .auth_profiles import (
+        clear_session,
+        list_profiles,
+        load_session,
+        resolve_profile,
+        save_session,
+        session_info,
+    )
+
+    account = None
+    explicit_profile = (profile or "").strip()
+    explicit_credentials = bool((username or "").strip() and (password or "").strip())
+    explicit_account_request = bool(
+        force or explicit_profile or explicit_credentials or (captcha or "").strip()
+    )
+    if not explicit_credentials:
+        try:
+            account = resolve_profile(profile)
+        except Exception as exc:
+            if explicit_profile:
+                available_profiles: list[dict[str, Any]] = []
+                try:
+                    available_profiles = list_profiles()
+                except Exception:
+                    available_profiles = []
+                return {
+                    "status": "profile_not_found",
+                    "profile": explicit_profile,
+                    "reason": str(exc),
+                    "profiles": available_profiles,
+                }
+            account = None
+        if account is not None:
+            username = username or account.username
+            password = password or account.password
+            url = url or account.admin_url
     username, password, url = resolve_login_credentials(username, password, url)
     if not username or not password:
-        return {
-            "status": "config_missing",
-            "reason": credential_missing_message(user=bool(username), password=bool(password)),
-        }
+        reason = credential_missing_message(user=bool(username), password=bool(password))
+        available: list[str] = []
+        try:
+            available = [str(item.get("profile")) for item in list_profiles()]
+        except Exception:
+            available = []
+        if available:
+            reason += (
+                " 也可改用账号档案登录：browser_login(profile=\"<档案名>\")；"
+                f"当前可用档案：{', '.join(available)}。"
+            )
+        return {"status": "config_missing", "reason": reason, "profiles": available}
     if not url:
         return {
             "status": "config_missing",
-            "reason": "未配置目标站点：请设置 QA_AUTOMATION_APS_URL 或在调用时传 url。",
+            "reason": "未配置目标站点：请设置 QA_AUTOMATION_APS_URL、配置账号档案，或在调用时传 url。",
         }
 
     # 站点归属判定从配置推导，不再硬编码某个环境的域名
@@ -1523,6 +1646,40 @@ async def _browser_login_impl(
 
     page = await _current_page_impl()
     await _maximize_and_fill_viewport(page)
+
+    # A) 账号档案 + 会话缓存：直接注入 cookies 秒级恢复（免验证码）
+    # 注意：必须用不带锁的 _inject_cookies_impl —— 公共 inject_cookies 会再次获取
+    # _action_lock，而本函数由已持锁的 browser_login 调用，会造成自死锁。
+    if account is not None and not force:
+        cached = load_session(account)
+        if cached and cached.get("token"):
+            try:
+                await page.context.clear_cookies()
+                await _inject_cookies_impl(
+                    cookies=cached.get("cookies") or None,
+                    token=str(cached["token"]),
+                    navigate_to=url,
+                    domain=account.cookie_domain,
+                )
+            except Exception:
+                pass
+            page = await _current_page_impl()
+            landed = page.url or ""
+            if target_host in (urlsplit(landed).netloc or "") and "login" not in landed.lower():
+                return {
+                    "status": "logged-in",
+                    "method": "session-cache",
+                    "profile": account.name,
+                    "username": account.username,
+                    "role": account.role,
+                    "page_id": _page_id(page),
+                    "url": landed,
+                    "title": (await page.title())[:200],
+                    "token_tail": str(cached["token"])[-4:],
+                    "session": session_info(account),
+                }
+            # 缓存已被服务端拒绝：清掉后走正常登录
+            clear_session(account)
 
     # Check if we need to navigate
     curr_url = page.url or ""
@@ -1540,8 +1697,12 @@ async def _browser_login_impl(
     except Exception:
         pass
 
-    # Check if already logged in (on /static/admin and no login inputs present)
-    if "login" not in page.url and await page.locator("input[placeholder='请输入账号']").count() == 0:
+    # Check if already logged in (only when caller did not explicitly request switching/forcing account)
+    if (
+        not explicit_account_request
+        and "login" not in page.url
+        and await page.locator("input[placeholder='请输入账号']").count() == 0
+    ):
         return {
             "status": "already-logged-in",
             "page_id": _page_id(page),
@@ -1550,12 +1711,28 @@ async def _browser_login_impl(
         }
     # Fast path: Try direct SCM API authentication & cookie injection
     try:
+        api_kwargs: dict[str, Any] = {}
+        if account is not None:
+            api_kwargs = {
+                "timeout_sec": account.timeout,
+                "captcha_path": account.captcha_path,
+                "captcha_key": account.captcha_key,
+                "login_path": account.login_path,
+                "username_field": account.username_field,
+                "password_field": account.password_field,
+                "captcha_field": account.captcha_field,
+                "success_field": account.success_field,
+                "message_field": account.message_field,
+                "token_field": account.token_field,
+                "user_agent": account.user_agent,
+            }
         api_res = await scm_api_login(
             url,
             username,
             password,
             captcha=captcha,
             max_retries=max_retries,
+            **api_kwargs,
         )
         if api_res.get("status") == "captcha-needed":
             return {
@@ -1564,11 +1741,22 @@ async def _browser_login_impl(
                 "captcha_image_path": api_res.get("captcha_image_path"),
                 "captcha_image_base64": api_res.get("captcha_image_base64"),
                 "username": username,
+                "profile": account.name if account else None,
                 "message": api_res.get("message"),
             }
 
         if api_res.get("ok") and api_res.get("cookies_to_inject"):
+            if account is not None:
+                try:
+                    save_session(
+                        account,
+                        token=str(api_res.get("token")),
+                        cookies=api_res.get("cookies_to_inject") or [],
+                    )
+                except Exception:
+                    pass
             ctx = page.context
+            await ctx.clear_cookies()
             await ctx.add_cookies(api_res["cookies_to_inject"])
             admin_url = url
             if "/login" in admin_url:
@@ -1586,7 +1774,10 @@ async def _browser_login_impl(
                     "method": "api-fast-path" if not captcha else "api-pending-captcha-resolved",
                     "page_id": _page_id(page),
                     "username": username,
+                    "profile": account.name if account else None,
+                    "role": account.role if account else None,
                     "token": api_res.get("token"),
+                    "session": session_info(account) if account else None,
                     "url": page.url,
                     "title": (await page.title())[:200],
                 }
@@ -1595,14 +1786,23 @@ async def _browser_login_impl(
 
 
 
-    # Wait for login form inputs to be ready
+    # Wait for login form inputs to be ready (if currently on an authenticated page, clear cookies & go to login page)
+    if "login" not in page.url and await page.locator("input[placeholder='请输入账号']").count() == 0:
+        login_target = (
+            account.login_page
+            if account is not None and account.login_page
+            else f"{urlsplit(url).scheme}://{target_host}/static/admin/login"
+        )
+        await page.context.clear_cookies()
+        await page.goto(login_target, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(600)
+
     user_input = page.locator("input[placeholder='请输入账号']").first
     pwd_input = page.locator("input[placeholder='请输入密码']").first
     captcha_input = page.locator("input[placeholder='请输入图形验证码']").first
     login_btn = page.locator("button:has-text('登 录')").first
 
     await user_input.wait_for(state="visible", timeout=10_000)
-
     attempts = 0
     current_captcha = captcha
 
@@ -1703,12 +1903,15 @@ async def browser_login(
     *,
     url: str | None = None,
     captcha: str | None = None,
+    profile: str | None = None,
+    force: bool = False,
     max_retries: int = 3,
 ) -> dict[str, Any]:
-    """统一登录工具: 针对新建浏览器会话/登录过期自动登录 APS 系统。
+    """统一登录工具：登录 / 恢复 APS 会话，支持账号档案、登录态缓存与验证码两段式。
 
-    账号密码来自显式传参或环境变量（QA_AUTOMATION_LOGIN_USER/_PASSWORD），
-    不支持代码内默认值——工具签名的默认值会进 inputSchema 并每轮下发给模型。
+    凭据来自显式传参、账号档案（profiles.toml）或环境变量
+    （QA_AUTOMATION_LOGIN_USER/_PASSWORD/_APS_URL），不支持代码内默认值——
+    工具签名的默认值会进 inputSchema 并每轮下发给模型。
     """
     async with _action_lock:
         return await _browser_login_impl(
@@ -1716,6 +1919,8 @@ async def browser_login(
             password=password,
             url=url,
             captcha=captcha,
+            profile=profile,
+            force=force,
             max_retries=max_retries,
         )
 
@@ -1802,4 +2007,96 @@ async def inject_cookies(
             token=token,
             navigate_to=navigate_to,
             domain=domain,
+        )
+
+
+RUN_JS_OUTPUT_LIMIT = 8000
+
+
+async def _run_js_impl(
+    script: str,
+    arg: Any = None,
+    *,
+    frame: str | None = None,
+    timeout_ms: int = 10_000,
+) -> Any:
+    """在当前页面或指定 frame 中执行 JavaScript 并返回结果。"""
+    from .profiles import active_profile
+
+    page = await _current_page_impl()
+
+    # 解析目标 Frame
+    target: Any = page
+    if frame and frame not in ("main", "top"):
+        if frame == "active":
+            profile = active_profile()
+            try:
+                iframe_ele = await page.query_selector(profile.active_iframe_selector)
+                if iframe_ele:
+                    content_frame = await iframe_ele.content_frame()
+                    if content_frame:
+                        target = content_frame
+            except Exception:
+                pass
+        else:
+            for f in page.frames:
+                if _frame_id(page, f) == frame or f.name == frame:
+                    target = f
+                    break
+
+    clean_script = (script or "").strip()
+    if not clean_script:
+        raise ValueError("JavaScript 脚本内容不能为空")
+
+    # 智能函数包裹：如果包含 return 且未被函数闭包包裹，自动包裹为闭包
+    if clean_script.startswith(("function", "async function", "()", "(", "async (")):
+        eval_code = clean_script
+    elif "return " in clean_script:
+        eval_code = f"async (arg) => {{\n{clean_script}\n}}"
+    else:
+        eval_code = clean_script
+
+    raw_result = await target.evaluate(eval_code, arg)
+
+    # 基础类型直接返回
+    if raw_result is None or isinstance(raw_result, (int, float, bool)):
+        return raw_result
+
+    # 字符串截断
+    if isinstance(raw_result, str):
+        if len(raw_result) > RUN_JS_OUTPUT_LIMIT:
+            return (
+                raw_result[:RUN_JS_OUTPUT_LIMIT]
+                + f"\n...[输出截断: 共 {len(raw_result)} 字符，如需完整数据请在 JS 内自行裁剪返回]"
+            )
+        return raw_result
+
+    # 字典/数组结构截断检测
+    try:
+        dumped = json.dumps(raw_result, ensure_ascii=False)
+        if len(dumped) > RUN_JS_OUTPUT_LIMIT:
+            return (
+                dumped[:RUN_JS_OUTPUT_LIMIT]
+                + f"\n...[输出截断: JSON 序列化共 {len(dumped)} 字符，如需完整数据请在 JS 内自行裁剪返回]"
+            )
+    except Exception:
+        pass
+
+    return raw_result
+
+
+async def run_js(
+    script: str,
+    arg: Any = None,
+    *,
+    frame: str | None = None,
+    timeout_ms: int = 10_000,
+) -> Any:
+    """在当前页面或指定 frame 中执行 JavaScript 并返回结果（逃生通道）。"""
+    async with _action_lock:
+        return await _run_js_impl(
+            script=script,
+            arg=arg,
+            frame=frame,
+            timeout_ms=timeout_ms,
         )

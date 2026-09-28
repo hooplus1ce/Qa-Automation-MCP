@@ -11,7 +11,7 @@
         "--extra",
         "browser",
         "--env-file",
-        "<QA_AUTOMATION_MCP_仓库绝对路径>/.env.qa-automation",
+        "<QA_AUTOMATION_MCP_仓库绝对路径>/.env",
         "fastmcp",
         "run",
         "<QA_AUTOMATION_MCP_仓库绝对路径>/fastmcp.json",

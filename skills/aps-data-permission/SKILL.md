@@ -63,9 +63,9 @@ graph TD
    - **Port 9222 (受控验证端)**：账号 `权限测试`（账号 `Hooplus1cer`），仅分配受测角色，负责核验列表过滤与越权拦截；
    - 分别通过 `browser_connect(address="127.0.0.1:9223")` 与 `browser_connect(address="127.0.0.1:9222")` 登记并管理。
 2. **方案 B：单浏览器多账号独立上下文（无外部调试端口时推荐）**：
-   - **管理员上下文**：调用 `profile_open(profile="aps")` 打开管理员会话；
-   - **测试账号上下文**：调用 `profile_open(profile="aps_approver")` 开启独立 BrowserContext（Cookies 与 LocalStorage 隔离）；
-   - 测试完毕调用 `profile_close` 成对关闭。
+   - **管理员上下文**：调用 `browser_login(profile="hooplus1ce")` 打开管理员会话；
+   - **测试账号上下文**：调用 `browser_session(action="create", name="tester")` 开启独立 BrowserContext（Cookies 与 LocalStorage 隔离），再调用 `browser_login(profile="hooplus1cer")` 登录受控账号；
+   - 切换上下文调用 `browser_session(action="select", name="tester" / "0")`，或单页原地切号直接调用 `browser_login(profile="hooplus1cer")`。
 
 ---
 

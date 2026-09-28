@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .antd import antd_date_pick, antd_select, nav_menu, wait_message
 from .browser import (
     _action_lock,
     _browser_session_impl,
@@ -38,11 +39,12 @@ from .browser import (
     close_browser,
     connect_browser,
     current_page,
+    inject_cookies,
     launch_chrome,
     list_pages,
     open_url,
     reset_viewport,
-    inject_cookies,
+    run_js,
     select_page,
     set_page_preference_probe,
     start_browser,
@@ -93,6 +95,15 @@ from .components.vtable.verification import (
     _cell_screenshot,
     _cell_visual_state,
     _verify_landed,
+)
+from .components.x6 import (
+    bind_x6,
+    click_node,
+    connect_nodes,
+    delete_node,
+    fit_view,
+    get_topology,
+    move_node,
 )
 from .config import (
     _CURSOR_HEIGHT,
@@ -165,6 +176,13 @@ from .mouse import (
     _smooth_mouse_move_to,
     _stable_viewport_click,
 )
+from .net import (
+    net_listen_snapshot,
+    net_listen_start,
+    net_listen_stop,
+    net_listen_wait,
+    net_listen_wait_silent,
+)
 from .overlay import (
     _drain_overlay_observers,
     _finalize_overlay_observation,
@@ -201,6 +219,7 @@ from .overlay.scripts import (
     _overlay_arm_script,
     _overlay_script,
 )
+from .scenario import parse_scenario, run_scenario, substitute_vars
 from .tencent_sheet import (
     SheetBatchUpdateResult,
     SheetConnectResult,
@@ -262,7 +281,7 @@ __all__ = [
     "browser_login",
     "reset_viewport",
     "inject_cookies",
-    # VTable
+    "run_js",
     "vtable_frame",
     "active_application_frame",
     "resolve_frame",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
@@ -135,28 +135,40 @@ def create_server() -> FastMCP:
         password: str | None = None,
         url: str | None = None,
         captcha: str | None = None,
+        profile: str | None = None,
+        force: bool = False,
         max_retries: int = 3,
     ) -> dict:
-        """针对新建浏览器会话/登录过期的专属自动登录工具:
-        自动处理登录失效弹窗、自动输入账号密码、截图并尝试AI识别图形验证码完成登录。
-        若无需自动识别或已有验证码字符，可直接传入 captcha 参数跳过识别。
+        """登录 / 恢复 / 切换 APS 账号会话的统一入口（账号档案 + 登录态缓存 + 验证码两段式）。
 
-        账号密码默认取自环境变量，通常无需传：QA_AUTOMATION_LOGIN_USER /
-        QA_AUTOMATION_LOGIN_PASSWORD / QA_AUTOMATION_APS_URL。未配置时返回
-        status=config_missing 并提示缺哪一个，不会回退到代码内置口令。
+        支持在当前页面直接原地切换账号（自动清空旧会话并注入新账号 Cookie 刷新后台，无需在页面内点击退出登录）。
+        凭据解析优先级：显式传参 > 账号档案（profiles.toml，支持按 profile 档案名、username 或 role 角色关键词匹配）> 环境变量
+        QA_AUTOMATION_LOGIN_USER / QA_AUTOMATION_LOGIN_PASSWORD / QA_AUTOMATION_APS_URL。
+        三者都缺或传入未知 profile 时返回可用档案列表（含角色说明），不回退到内置口令。
+
+        典型用法：
+          - 免参登录/恢复：browser_login()                     # 用默认档案，命中缓存则秒级恢复
+          - 原地切换账号：  browser_login(profile="<档案名或角色名>") # 直接切换当前页登录账号（如超管/系统管理员/权限测试）
+          - 强制重新登录：  browser_login(profile="<档案名>", force=True) # 忽略缓存重新调接口获取新 Token
+          - 验证码两段式：  先 browser_login(profile=...) 拿到验证码图片，
+                            识别后 browser_login(profile=..., captcha="1234") 完成登录
 
         Args:
-            username: 登录账号；省略时取 QA_AUTOMATION_LOGIN_USER
-            password: 登录口令；省略时取 QA_AUTOMATION_LOGIN_PASSWORD
-            url: 目标站点入口；省略时取 QA_AUTOMATION_APS_URL
-            captcha: 已知的验证码字符，传入则跳过图形验证码识别
-            max_retries: 登录失败后的最大重试次数（默认 3）
+            username: 登录账号；显式传入时优先于账号档案与环境变量
+            password: 登录口令；显式传入时优先于账号档案与环境变量
+            url: 目标站点入口；省略时取账号档案的 admin_url 或 QA_AUTOMATION_APS_URL
+            captcha: 已知的图形验证码字符；省略时返回待识别的验证码图片
+            profile: 账号档案名、账号名或角色关键词（见 profiles.toml）；省略时取 QA_AUTOMATION_ACCOUNT，其次第一个档案
+            force: True 时忽略登录态缓存、强制重新登录（缓存失效或显式传 profile 切号会自动处理，通常无需传）
+            max_retries: 接口登录失败后的最大重试次数（默认 3）
         """
         return await automation.browser_login(
             username=username,
             password=password,
             url=url,
             captcha=captcha,
+            profile=profile,
+            force=force,
             max_retries=max_retries,
         )
 
@@ -184,6 +196,34 @@ def create_server() -> FastMCP:
             token=token,
             navigate_to=navigate_to,
             domain=domain,
+        )
+
+    @mcp.tool(name="run_js")
+    @instrument_tool
+    async def run_js(
+        script: str,
+        arg: Any = None,
+        frame: str | None = None,
+        timeout_ms: int = 10_000,
+    ) -> Any:
+        """【受限逃生通道】在浏览器当前页面或指定 frame 中执行 JavaScript 脚本并返回结果。
+
+        ⚠️【AI 强制行为准则与调用约束】⚠️
+        1. 严禁主动调用：除非人类用户在提示词中显式、明确指令要求执行 JS（例如：“请用 run_js 执行...”、“执行一段 JS 脚本...”），否则 AI 严禁擅自调用本工具！
+        2. 常规自动化严禁替代：常规点击、输入、下拉选择、表格数据读取、弹层断言等，必须使用专属高阶工具（ui_click / ui_interact / antd_select / vtable_cell_click / wait_message 等），严禁擅自手写 querySelector/click 脚本替代。
+        3. 适用场景：仅用于用户明确要求的底层调试、读取特殊的全局内存变量（如 window.__store__）、或极端自定义控件的逃生操作。
+
+        Args:
+            script: 要执行的 JavaScript 代码。支持表达式（如 'window.innerWidth'）、异步函数或包含 return 的代码块
+            arg: 传递给 JS 脚本的入参对象（在脚本中可通过参数或 arguments[0] 访问）
+            frame: 目标 frame：省略=顶层文档；'active'=当前激活的微前端 iframe；也可传 frame_id 或 name
+            timeout_ms: 执行超时毫秒数（默认 10000ms）
+        """
+        return await automation.run_js(
+            script=script,
+            arg=arg,
+            frame=frame,
+            timeout_ms=timeout_ms,
         )
 
     return mcp

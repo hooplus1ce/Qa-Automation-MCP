@@ -257,7 +257,7 @@ async def test_fastmcp_tools_registration(monkeypatch):
     testcase_manager._headers_cache.clear()
     testcase_manager._id_index_cache.clear()
 
-    mcp = create_server()
+    mcp = create_server(include_legacy_aliases=True)
     client = Client(mcp)
     async with client:
         # 1. 验证工具列表中暴露了相关工具
@@ -527,7 +527,7 @@ async def test_fastmcp_read_cells_tool(monkeypatch):
     testcase_manager._headers_cache.clear()
     testcase_manager._id_index_cache.clear()
 
-    mcp = create_server()
+    mcp = create_server(include_legacy_aliases=True)
     client = Client(mcp)
     async with client:
         # 1. 连接

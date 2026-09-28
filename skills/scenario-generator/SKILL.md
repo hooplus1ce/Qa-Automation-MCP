@@ -1,12 +1,12 @@
 ---
 name: scenario-generator
-description: 指导 AI 与自动化脚本生成符合 DrissionPage-MCP 规范的声明式回归场景（YAML/JSON），以 demo18 APS 多角色协同为基准范例
+description: 指导 AI 与自动化脚本生成声明式回归场景（YAML/JSON），以 demo18 APS 多角色协同为基准范例
 metadata:
   version: 1.0.0
-  author: DrissionPage-MCP
+  author: Qa-Automation-MCP
 ---
 
-# DrissionPage-MCP 声明式回归场景生成规范
+# 声明式回归场景生成规范
 
 本 Skill 旨在指导 AI 代理（Agent）或测试开发者，自动生成可被 `scenario_run` 工具直接执行的声明式端到端回归场景文件（YAML / JSON）。
 

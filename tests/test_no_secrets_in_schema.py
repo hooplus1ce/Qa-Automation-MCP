@@ -74,12 +74,23 @@ class NoHardcodedCredentialsTest(unittest.TestCase):
         self.assertTrue(all(lit not in msg for lit in FORBIDDEN_LITERALS))
 
     def test_calling_login_without_credentials_is_config_missing(self):
-        """未配置时必须干净失败，而不是回退到内置口令。"""
+        """未配置时必须干净失败，而不是回退到内置口令。
+
+        注意：账号档案（profiles.toml）本身就是一种"已配置"来源——因此本用例把
+        档案文件也指向不存在的路径，只有三者（显式传参 / 档案 / 环境变量）都不可用时，
+        才应判定为 config_missing。
+        """
         from qa_automation.browser import _browser_login_impl
 
         for k in ("QA_AUTOMATION_LOGIN_USER", "QA_AUTOMATION_LOGIN_PASSWORD"):
             os.environ.pop(k, None)
-        result = asyncio.run(_browser_login_impl())
+        os.environ["QA_AUTOMATION_PROFILES_FILE"] = str(
+            Path(__file__).resolve().parent / "no-such-profiles.toml"
+        )
+        try:
+            result = asyncio.run(_browser_login_impl())
+        finally:
+            os.environ.pop("QA_AUTOMATION_PROFILES_FILE", None)
         self.assertEqual(result.get("status"), "config_missing")
         self.assertIn("QA_AUTOMATION_LOGIN", result.get("reason", ""))
 

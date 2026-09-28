@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import re
+import struct
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -20,6 +21,7 @@ from ..browser import (
     _frame_id,
     _frame_page_offset,
     _page_id,
+    _page_pixel_ratio,
     _page_viewport_size,
     _read_viewport_or_none,
     _restore_window_and_viewport,
@@ -828,6 +830,87 @@ async def analyze_scope(
         )
 
 
+def _image_size(image: bytes) -> dict[str, int] | None:
+    """从 PNG/JPEG 字节里读出像素尺寸(不引第三方图像库)。
+
+    截图响应里带上真实尺寸,调用方就能立刻发现「裁剪框被 clamp / 出图比例不对」,
+    不必等肉眼看图才发现右边多了一条空白边。
+    """
+    try:
+        if image[:8] == b"\x89PNG\r\n\x1a\n":
+            width, height = struct.unpack(">II", image[16:24])
+            return {"width": int(width), "height": int(height)}
+        if image[:2] == b"\xff\xd8":
+            pos = 2
+            while pos + 9 < len(image):
+                if image[pos] != 0xFF:
+                    pos += 1
+                    continue
+                marker = image[pos + 1]
+                if marker in {0xD8, 0x01} or 0xD0 <= marker <= 0xD7:
+                    pos += 2
+                    continue
+                (length,) = struct.unpack(">H", image[pos + 2 : pos + 4])
+                if 0xC0 <= marker <= 0xCF and marker not in {0xC4, 0xC8, 0xCC}:
+                    height, width = struct.unpack(">HH", image[pos + 5 : pos + 9])
+                    return {"width": int(width), "height": int(height)}
+                pos += 2 + length
+    except Exception:
+        return None
+    return None
+
+
+def _dom_clip(clip: dict[str, Any]) -> dict[str, float]:
+    return {
+        "x": float(clip["x"]),
+        "y": float(clip["y"]),
+        "width": float(clip["width"]),
+        "height": float(clip["height"]),
+    }
+
+
+def _scale_clip(clip: dict[str, Any], factor: float) -> dict[str, float]:
+    """按系数等比放大裁剪框(原点也要跟着放大,否则会拍到邻域)。"""
+    return {key: value * float(factor) for key, value in _dom_clip(clip).items()}
+
+
+def _capture_correction(
+    measured: dict[str, int] | None, clip: dict[str, Any], dpr: float
+) -> float | None:
+    """出图还差多少:让画布等于「clip(DOM CSS)× dpr」所需再乘的系数。
+
+    * 返回 1.0  → 画布已经等于内容栅格尺寸,无需处理
+    * 返回 >1.0 → 画布偏大(页面缩放过 100% 的典型现象),需要放大裁剪框
+    * 返回 None → 图片尺寸读不出来,调用方应放弃校正、保留原图
+    """
+    if not measured or dpr <= 0:
+        return None
+    width = float(clip["width"])
+    if width <= 0:
+        return None
+    return (float(dpr) * width) / float(measured["width"])
+
+
+_CAPTURE_CORRECTION_CACHE: dict[tuple, float] = {}
+_CAPTURE_CORRECTION_CACHE_LIMIT = 8
+
+
+def _capture_scale_key(page: Any, ratios: dict[str, float]) -> tuple:
+    """校正系数的缓存键:页面 + 视口尺寸(缩放变化会改 innerWidth,自然失效)。"""
+    return (
+        _page_id(page),
+        round(float(ratios.get("vw") or 0.0), 1),
+        round(float(ratios.get("vh") or 0.0), 1),
+        round(float(ratios.get("dpr") or 0.0), 3),
+    )
+
+
+def _remember_capture_correction(key: tuple, factor: float) -> None:
+    if len(_CAPTURE_CORRECTION_CACHE) >= _CAPTURE_CORRECTION_CACHE_LIMIT:
+        _CAPTURE_CORRECTION_CACHE.clear()
+    _CAPTURE_CORRECTION_CACHE[key] = float(factor)
+
+
 async def _screenshot_element_impl(
     *,
     role: str | None = None,
@@ -916,7 +999,17 @@ async def _screenshot_element_impl(
         }
         frame_details = _frame_details(page, page.main_frame)
 
-    screenshot_kwargs: dict[str, Any] = {"clip": clip, "type": image_format}
+    # 出图画布系数(显示器缩放)与内容栅格系数(dpr)在页面缩放过 100% 时不相等:
+    # 直接传 DOM CSS 坐标会拿到一张画布比内容大 1.25 倍的图——页面只占左上角
+    # 一大块,右侧/底部是空白,元素在图片里的位置也比 DOM 坐标小。这里先按缓存
+    # 系数换算,再用真实出图回读自校验,不信任 visualViewport.zoom(实测会横跳)。
+    ratios = await _page_pixel_ratio(page)
+    dpr = float(ratios["dpr"])
+    page_key = _capture_scale_key(page, ratios)
+    correction = _CAPTURE_CORRECTION_CACHE.get(page_key)
+    capture_clip = _scale_clip(clip, correction) if correction else _dom_clip(clip)
+
+    screenshot_kwargs: dict[str, Any] = {"clip": capture_clip, "type": image_format}
     if image_format == "jpeg" and quality is not None:
         if not 1 <= quality <= 100:
             raise ValueError("quality must be between 1 and 100")
@@ -928,7 +1021,12 @@ async def _screenshot_element_impl(
     # 并在 finally 里无条件按 clip 尺寸做复位校验（命中残留会重试一轮）。
     window_before = await _capture_window_bounds(page)
     viewport_before = await _read_viewport_or_none(page)
-    clip_size = (float(clip["width"]), float(clip["height"]))
+    dom_clip_size = (float(clip["width"]), float(clip["height"]))
+    guard_sizes: list[tuple[float, float]] = [dom_clip_size]
+    clip_size = (float(capture_clip["width"]), float(capture_clip["height"]))
+    if clip_size != dom_clip_size:
+        # DOM CSS 空间与裁剪框空间尺寸不同,两套都可能成为残留值
+        guard_sizes.append(clip_size)
     expected_size = (
         (viewport_before["w"], viewport_before["h"]) if viewport_before else None
     )
@@ -938,6 +1036,36 @@ async def _screenshot_element_impl(
             page.screenshot(**screenshot_kwargs),
             timeout=max(0.5, float(screenshot_timeout_ms) / 1000),
         )
+        # 自校验:画布宽度应当等于 clip(DOM CSS) × dpr。不等说明出图还夹带缩放,
+        # 按实测系数重拍一次;重拍失败就保留首图(至少不比修复前更差)。
+        measured = _image_size(image)
+        factor = _capture_correction(measured, clip, dpr)
+        if factor is not None and abs(factor - 1.0) > 0.01:
+            retry_clip = _scale_clip(clip, factor)
+            retry_kwargs = dict(screenshot_kwargs)
+            retry_kwargs["clip"] = retry_clip
+            try:
+                retried = await asyncio.wait_for(
+                    page.screenshot(**retry_kwargs),
+                    timeout=max(0.5, float(screenshot_timeout_ms) / 1000),
+                )
+            except Exception:
+                retried = None
+            if retried:
+                retried_size = _image_size(retried)
+                retried_factor = _capture_correction(retried_size, clip, dpr)
+                # 只在重拍确实落到位(clip × dpr)时才替换,否则保留首图,
+                # 保证结果不会比修复前更差。
+                if retried_factor is not None and abs(retried_factor - 1.0) <= 0.01:
+                    image, capture_clip, measured = retried, retry_clip, retried_size
+                    _remember_capture_correction(page_key, factor)
+                    for size in (
+                        clip_size,
+                        (float(retry_clip["width"]), float(retry_clip["height"])),
+                    ):
+                        if size not in guard_sizes:
+                            guard_sizes.append(size)
+                    clip_size = (float(retry_clip["width"]), float(retry_clip["height"]))
     except TimeoutError as exc:
         raise TimeoutError(
             "截图在 "
@@ -950,7 +1078,7 @@ async def _screenshot_element_impl(
             viewport_guard = await _restore_window_and_viewport(
                 page,
                 restore_bounds=window_before,
-                clip_size=clip_size,
+                clip_size=guard_sizes[0] if len(guard_sizes) == 1 else guard_sizes,
                 expected_size=expected_size,
             )
         except Exception:
@@ -997,6 +1125,21 @@ async def _screenshot_element_impl(
             "name": name,
         } if locator_source else None,
     }
+    image_size = _image_size(image)
+    if image_size:
+        result["image_size"] = image_size
+        # image_size ≈ clip(DOM CSS px) × px_per_css_px,可以直接把图片里的像素位置
+        # 换算回 DOM 坐标:x_css = clip.x + x_image / px_per_css_px
+        px_per_css = image_size["width"] / max(1e-6, float(clip["width"]))
+        expected_px = float(clip["width"]) * dpr
+        result["image_scale"] = {
+            "px_per_css_px": round(px_per_css, 4),
+            "device_pixel_ratio": round(dpr, 4),
+            "page_zoom_hint": round(float(ratios.get("zoom_hint") or 1.0), 4),
+            "capture_clip": {key: round(value, 2) for key, value in capture_clip.items()},
+            # Chromium 会把裁剪框取整到整像素,小元素上允许 2px 误差
+            "matches_device_pixels": abs(image_size["width"] - expected_px) <= 2.0,
+        }
     if viewport_guard:
         result["viewport_guard"] = {
             # False = 清理后视口仍等于本次 clip 尺寸，说明 emulation 残留没清掉

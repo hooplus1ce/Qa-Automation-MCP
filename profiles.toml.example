@@ -1,0 +1,15 @@
+# APS 平台账号档案模板 —— 复制为 profiles.toml 后填入真实账号口令。
+# profiles.toml 已在 .gitignore 中忽略（含明文凭据，切勿提交）。
+#
+# 生效方式：browser_login 每次调用实时读取档案文件，改完保存即生效，无需重启 MCP。
+# 取值方式：browser_login(profile="<档案名>")；不传时代码取 .env 的 QA_AUTOMATION_ACCOUNT。
+#
+# 字段：host_prefix（或 base_url/admin_url）、username、password、role
+#       其余可选项（接口路径 / 请求字段名 / 令牌字段 / 超时 / UA 等）见
+#       qa_automation/auth_profiles.py 模块文档。
+
+[profiles.<档案名>]
+host_prefix = "<环境前缀>"      # 由前缀推导站点地址；也可直接给 base_url
+username    = "<账号>"
+password    = "<口令>"
+role        = "<角色说明>"      # 可选：便于按角色识别档案

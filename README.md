@@ -116,6 +116,8 @@ http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=<Ubuntu终端输出的token>
 | `tencent_sheet_update_row` | 工具 | 向表格指定行原子回写更新任意表头列字段（亦支持 `testcase_update_result` 别名） |
 | `tencent_sheet_batch_update` | 工具 | 批量回写多行表格数据（防限流核心引擎，单次原子提交；亦支持 `testcase_batch_update_results` 别名） |
 | `tencent_sheet_read_cells` | 工具 | 读取表格原始单元格切片与 CSV 数据（带网格边界保护；亦支持 `testcase_read_cells` 别名） |
+| `tencent_sheet_delete_rows` | 工具 | **物理删除整行**（官方 `sheet.delete_dimension`）：支持按主键/用例编号或 0-based 全表行号定位，降序删避免行号漂移，内建表头保护、单次 200 行上限与 `dry_run` 预览 |
+| `tencent_sheet_insert_rows` | 工具 | 在指定位置插入空白行（官方 `sheet.insert_dimension`），用于误删后的结构恢复或批量补行；只插空行不还原内容 |
 | `update_test_case_result` | 工具 | 单条回写指定用例的测试结果、执行人与执行时间（兼容历史接口） |
 | `vtable://js/index` | 资源 | JS 脚本目录(JSON) |
 | `vtable://js/{name}` | 资源 | 19 个 VTable JS 脚本(fast_bind、vtable_analysis、resolve_cell、read_cells …) |
@@ -320,8 +322,8 @@ async with Client(transport) as client:
 `fastmcp.json` 是运行配置的单一来源。依赖环境只由外层 `uv run` 创建；
 `fastmcp.json` 不声明第二个 UVEnvironment，避免重复派生 `uv run --skip-env`。
 
-仓库根目录的 `.env.qa-automation.example` 是共享运行变量模板；本机复制为
-`.env.qa-automation` 后由 `uv run --env-file` 显式加载。该文件属于 MCP 服务项目，
+仓库根目录的 `.env.example` 是共享运行变量模板；本机复制为
+`.env` 后由 `uv run --env-file` 显式加载。该文件属于 MCP 服务项目，
 其中的产物路径保持相对；最终解析基准由 Agent 传入的使用方项目 `cwd` 决定。
 
 ```dotenv
@@ -381,7 +383,7 @@ QA_AUTOMATION_DATA_DIR=.qa-automation/data
         "--extra",
         "browser",
         "--env-file",
-        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env",
         "fastmcp",
         "run",
         "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
@@ -411,7 +413,7 @@ QA_AUTOMATION_DATA_DIR=.qa-automation/data
         "--extra",
         "browser",
         "--env-file",
-        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation",
+        "D:/Developer/Hoolinks/Qa-Automation-MCP/.env",
         "fastmcp",
         "run",
         "D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json",
@@ -435,7 +437,7 @@ QA_AUTOMATION_DATA_DIR=.qa-automation/data
 uv run \
   --project D:/Developer/Hoolinks/Qa-Automation-MCP \
   --extra browser \
-  --env-file D:/Developer/Hoolinks/Qa-Automation-MCP/.env.qa-automation \
+  --env-file D:/Developer/Hoolinks/Qa-Automation-MCP/.env \
   fastmcp run D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json \
   --no-banner
 ```
@@ -470,7 +472,7 @@ namespace 造成破坏性重命名：
 Qa-Automation-MCP/
 ├── fastmcp.json                     # FastMCP 声明式运行配置
 ├── .mcp.json                        # Agent Host 项目级自动发现
-├── .env.qa-automation.example       # MCP 共享运行变量模板
+├── .env.example                         # MCP 共享运行变量模板
 ├── pyproject.toml                   # Python/uv 项目元数据
 ├── qa_automation/                   # 通用 UI 自动化测试框架
 │   ├── workspace.py                 # 使用方项目工作区与产物路径边界

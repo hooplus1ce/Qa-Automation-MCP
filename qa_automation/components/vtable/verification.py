@@ -101,6 +101,9 @@ async def _cell_screenshot(
         left = max(0.0, min(float(x) - size / 2, viewport["width"] - size))
         top = max(0.0, min(float(y) - size / 2, viewport["height"] - size))
         clip = {"x": left, "y": top, "width": size, "height": size}
+        # 注:页面缩放过 100% 时出图画布会比内容大(见 browser._page_pixel_ratio),
+        # 这里只做「前后是否变化」的指纹比对,画布固定留白不影响指纹稳定性,
+        # 因此不做裁剪框换算,避免多一次截图往返。
         # 与 ui_screenshot 同一类护栏:clip 截图会让 Chromium 临时把视口撑到裁剪框尺寸,
         # 一旦这次截图被中断,override 残留会把页面视口锁死,后续 VTable 坐标全部错位。
         window_before = await _capture_window_bounds(page)

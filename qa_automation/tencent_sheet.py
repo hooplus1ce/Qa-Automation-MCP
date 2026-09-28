@@ -127,6 +127,29 @@ class SheetBatchUpdateResult(BaseModel):
     message: str = ""
 
 
+class SheetDimensionResult(BaseModel):
+    """表格行/列维度增删结果（物理插删行，非清空内容）。"""
+
+    ok: bool
+    sheet_name: str
+    sheet_id: str | None = None
+    dimension_type: str = Field(default="row", description="row | col")
+    requested: int = Field(default=0, description="请求处理的目标数量")
+    affected_indices: list[int] = Field(
+        default_factory=list,
+        description="实际处理的全表 0-based 行号（删除按降序执行）",
+    )
+    affected_rows: list[str] = Field(default_factory=list, description="命中的主键/用例编号")
+    not_found_rows: list[str] = Field(default_factory=list, description="未匹配到的主键/用例编号")
+    not_found_indices: list[int] = Field(default_factory=list, description="越界或非法的行号")
+    skipped_header: bool = Field(default=False, description="是否因保护表头而跳过了第 1 行")
+    failed_items: list[dict[str, str]] = Field(default_factory=list)
+    row_count_before: int | None = Field(default=None, description="操作前子表总行数")
+    row_count_after: int | None = Field(default=None, description="操作后子表总行数")
+    dry_run: bool = False
+    message: str = ""
+
+
 # 别名兼容
 TestCaseConnectResult = SheetConnectResult
 TestCaseDetail = SheetRowDetail
@@ -401,6 +424,65 @@ class TencentSheetClient:
                 "end_row": end_row,
                 "start_col": start_col,
                 "end_col": end_col,
+            },
+        )
+
+    def delete_dimension(
+        self,
+        file_id: str,
+        sheet_id: str,
+        dimension_type: str = "row",
+        index: int = 0,
+        count: int = 1,
+    ) -> dict[str, Any]:
+        """物理删除指定位置的行或列（调用官方 sheet.delete_dimension）。
+
+        与 ``clear_range_cells`` 的本质区别：本方法**真正移除整行/整列**，
+        后续行会整体上移，子表总行数随之减少；后者只清空内容、行结构不变。
+
+        Args:
+            file_id: 在线表格唯一标识
+            sheet_id: 子表 ID
+            dimension_type: "row" 或 "col"
+            index: 起始索引（0-based，含表头行，即 0 为表头）
+            count: 删除数量，默认 1
+        """
+        return self.call_tool(
+            "sheet.delete_dimension",
+            {
+                "file_id": file_id,
+                "sheet_id": sheet_id,
+                "dimension_type": dimension_type,
+                "index": int(index),
+                "count": int(count),
+            },
+        )
+
+    def insert_dimension(
+        self,
+        file_id: str,
+        sheet_id: str,
+        dimension_type: str = "row",
+        index: int = 0,
+        count: int = 1,
+        direction: str = "before",
+    ) -> dict[str, Any]:
+        """在指定位置插入空行或空列（调用官方 sheet.insert_dimension）。
+
+        Args:
+            index: 参照索引（0-based，含表头行）
+            count: 插入数量，默认 1
+            direction: "before"（默认，插在 index 之前）或 "after"
+        """
+        return self.call_tool(
+            "sheet.insert_dimension",
+            {
+                "file_id": file_id,
+                "sheet_id": sheet_id,
+                "dimension_type": dimension_type,
+                "index": int(index),
+                "count": int(count),
+                "direction": direction,
             },
         )
 
@@ -1385,6 +1467,272 @@ class TencentSheetManager:
             "failed_items": failed_items,
             "failed_cases": failed_items,
             "message": f"成功批量回写 {len(updated_rows)} 行数据，共更新 {len(cells_to_write)} 个单元格",
+        }
+
+    # ------------------------------------------------------------------
+    # 行列维度物理增删（官方 sheet.delete_dimension / sheet.insert_dimension）
+    # ------------------------------------------------------------------
+
+    MAX_DIMENSION_OPS = 200
+
+    def _collect_row_indices(
+        self,
+        sheet_name: str | None,
+        row_ids: list[str] | None,
+        row_indices: list[int] | None,
+    ) -> tuple[str, dict[str, Any], list[int], list[str], list[str], list[int]]:
+        """把主键/用例编号与显式行号统一解析为升序去重的 0-based 全表行号。
+
+        Returns:
+            (sheet_id, sheet_info, sorted_indices, hit_ids, missing_ids, missing_indices)
+        """
+        sheet_id, sheet_info = self.resolve_sheet(sheet_name)
+        row_count = int(sheet_info.get("row_count") or 0)
+
+        resolved: set[int] = set()
+        hit_ids: list[str] = []
+        missing_ids: list[str] = []
+        missing_indices: list[int] = []
+
+        if row_ids:
+            id_map = self.build_id_index(sheet_name)
+            for raw in row_ids:
+                key = str(raw or "").strip()
+                if not key:
+                    continue
+                if key in id_map:
+                    resolved.add(id_map[key])
+                    hit_ids.append(key)
+                else:
+                    missing_ids.append(key)
+
+        if row_indices:
+            for raw in row_indices:
+                try:
+                    idx = int(raw)
+                except (TypeError, ValueError):
+                    missing_indices.append(-1)
+                    continue
+                if idx < 0 or (row_count and idx >= row_count):
+                    missing_indices.append(idx)
+                else:
+                    resolved.add(idx)
+
+        return sheet_id, sheet_info, sorted(resolved), hit_ids, missing_ids, missing_indices
+
+    def _invalidate_after_dimension_change(self, sheet_id: str, delta: int) -> int | None:
+        """维度变更后失效行主键缓存、刷新子表行数，返回刷新后的总行数。"""
+        self._id_index_cache.pop(sheet_id, None)
+
+        info = self._sheets_by_id.get(sheet_id)
+        if info is not None and delta:
+            info["row_count"] = max(0, int(info.get("row_count") or 0) + delta)
+
+        try:
+            fresh = self.client.get_sheet_info(self.effective_file_id)
+            sheets = fresh.get("sheets") if isinstance(fresh, dict) else fresh
+            if isinstance(sheets, list):
+                for s in sheets:
+                    sid = s.get("sheet_id")
+                    cached = self._sheets_by_id.get(sid) if sid else None
+                    if cached is None:
+                        continue
+                    for key in ("row_count", "col_count", "hidden", "sheet_name", "sheet_type"):
+                        if s.get(key) is not None:
+                            cached[key] = s[key]
+                    self._sheets_by_name[cached["sheet_name"]] = cached
+        except Exception as e:
+            logger.warning("维度变更后刷新子表元数据失败，沿用本地推算行数: %s", e)
+
+        info = self._sheets_by_id.get(sheet_id)
+        return int(info.get("row_count") or 0) if info else None
+
+    def delete_rows(
+        self,
+        sheet_name: str | None = None,
+        row_ids: list[str] | None = None,
+        row_indices: list[int] | None = None,
+        dry_run: bool = False,
+        allow_header: bool = False,
+    ) -> dict[str, Any]:
+        """物理删除子表中的整行（删除后下方行整体上移，子表总行数减少）。
+
+        与 ``batch_update_rows``（回写单元格内容）的本质区别：本方法真正移除行结构。
+        多行删除按行号**降序**执行，避免删行后行号漂移导致误删。
+
+        Args:
+            sheet_name: 子表名称或 sheet_id，缺省为当前活跃子表
+            row_ids: 主键 / 用例编号列表（经主键列索引解析为行号）
+            row_indices: 全表 0-based 行号列表（含表头行，0 即表头）
+            dry_run: 仅解析目标、返回影响范围，不实际执行删除
+            allow_header: 是否允许删除第 0 行（表头）；默认 False 予以保护
+        """
+        sheet_id, sheet_info, indices, hit_ids, missing_ids, missing_indices = (
+            self._collect_row_indices(sheet_name, row_ids, row_indices)
+        )
+        resolved_sname = sheet_info.get("sheet_name", sheet_name or sheet_id)
+        row_count_before = int(sheet_info.get("row_count") or 0)
+        requested = len(row_ids or []) + len(row_indices or [])
+
+        skipped_header = False
+        if not allow_header and 0 in indices:
+            indices = [i for i in indices if i != 0]
+            skipped_header = True
+
+        if len(indices) > self.MAX_DIMENSION_OPS:
+            raise TencentDocError(
+                f"单次最多删除 {self.MAX_DIMENSION_OPS} 行，本次命中 {len(indices)} 行；请分批调用"
+            )
+
+        deleted_indices: list[int] = []
+        failed_items: list[dict[str, str]] = []
+
+        if dry_run or not indices:
+            deleted_indices = list(indices)
+        else:
+            for idx in sorted(indices, reverse=True):
+                try:
+                    self.client.delete_dimension(
+                        file_id=self.effective_file_id,
+                        sheet_id=sheet_id,
+                        dimension_type="row",
+                        index=idx,
+                        count=1,
+                    )
+                    deleted_indices.append(idx)
+                except Exception as e:
+                    logger.error("删除子表 [%s] 第 %d 行失败: %s", resolved_sname, idx, e)
+                    failed_items.append({"row_index": str(idx), "error": str(e)})
+
+        row_count_after = row_count_before
+        if not dry_run and deleted_indices:
+            row_count_after = self._invalidate_after_dimension_change(
+                sheet_id, -len(deleted_indices)
+            )
+
+        if dry_run:
+            message = f"预览：命中 {len(deleted_indices)} 行待删除（未执行）"
+        elif failed_items:
+            message = (
+                f"已删除 {len(deleted_indices)} 行，{len(failed_items)} 行失败；"
+                f"子表行数 {row_count_before} → {row_count_after}"
+            )
+        else:
+            message = (
+                f"成功删除 {len(deleted_indices)} 行；子表行数 {row_count_before} → {row_count_after}"
+            )
+
+        return {
+            "ok": not failed_items,
+            "sheet_name": resolved_sname,
+            "sheet_id": sheet_id,
+            "dimension_type": "row",
+            "requested": requested,
+            "affected_indices": sorted(deleted_indices, reverse=True),
+            "affected_rows": hit_ids,
+            "not_found_rows": missing_ids,
+            "not_found_indices": missing_indices,
+            "skipped_header": skipped_header,
+            "failed_items": failed_items,
+            "row_count_before": row_count_before,
+            "row_count_after": row_count_after,
+            "dry_run": dry_run,
+            "message": message,
+        }
+
+    def insert_rows(
+        self,
+        sheet_name: str | None = None,
+        row_indices: list[int] | None = None,
+        count: int = 1,
+        direction: str = "before",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """在指定位置插入空白行（行结构新增，子表总行数增加）。
+
+        多位置插入按行号**升序**执行，并对前序插入造成的行号漂移自动补偿。
+
+        Args:
+            row_indices: 全表 0-based 参照行号列表（含表头行）
+            count: 每个位置插入的行数，默认 1
+            direction: "before"（默认）或 "after"
+        """
+        sheet_id, sheet_info = self.resolve_sheet(sheet_name)
+        resolved_sname = sheet_info.get("sheet_name", sheet_name or sheet_id)
+        row_count_before = int(sheet_info.get("row_count") or 0)
+
+        valid: list[int] = []
+        missing_indices: list[int] = []
+        for raw in row_indices or []:
+            try:
+                idx = int(raw)
+            except (TypeError, ValueError):
+                missing_indices.append(-1)
+                continue
+            if idx < 0 or (row_count_before and idx >= row_count_before):
+                missing_indices.append(idx)
+            else:
+                valid.append(idx)
+        valid = sorted(set(valid))
+
+        ins_count = max(1, int(count))
+        if len(valid) * ins_count > self.MAX_DIMENSION_OPS:
+            raise TencentDocError(
+                f"单次最多插入 {self.MAX_DIMENSION_OPS} 行，本次 {len(valid) * ins_count} 行；请分批调用"
+            )
+
+        inserted: list[int] = []
+        failed_items: list[dict[str, str]] = []
+
+        if dry_run or not valid:
+            inserted = list(valid)
+        else:
+            shift = 0
+            for idx in valid:
+                try:
+                    self.client.insert_dimension(
+                        file_id=self.effective_file_id,
+                        sheet_id=sheet_id,
+                        dimension_type="row",
+                        index=idx + shift,
+                        count=ins_count,
+                        direction=direction,
+                    )
+                    inserted.append(idx)
+                    shift += ins_count
+                except Exception as e:
+                    logger.error("向子表 [%s] 第 %d 行插入失败: %s", resolved_sname, idx, e)
+                    failed_items.append({"row_index": str(idx), "error": str(e)})
+
+        row_count_after = row_count_before
+        if not dry_run and inserted:
+            row_count_after = self._invalidate_after_dimension_change(
+                sheet_id, len(inserted) * ins_count
+            )
+
+        if dry_run:
+            message = f"预览：将在 {len(inserted)} 个位置插入 {len(inserted) * ins_count} 行（未执行）"
+        else:
+            message = (
+                f"成功插入 {len(inserted) * ins_count} 行；子表行数 {row_count_before} → {row_count_after}"
+            )
+
+        return {
+            "ok": not failed_items,
+            "sheet_name": resolved_sname,
+            "sheet_id": sheet_id,
+            "dimension_type": "row",
+            "requested": len(row_indices or []),
+            "affected_indices": sorted(inserted),
+            "affected_rows": [],
+            "not_found_rows": [],
+            "not_found_indices": missing_indices,
+            "skipped_header": False,
+            "failed_items": failed_items,
+            "row_count_before": row_count_before,
+            "row_count_after": row_count_after,
+            "dry_run": dry_run,
+            "message": message,
         }
 
     # 兼容历史方法名

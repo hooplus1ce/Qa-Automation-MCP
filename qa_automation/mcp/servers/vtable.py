@@ -1,6 +1,6 @@
 """VTable-specific inspection and trusted-input tools."""
 
-from __future__ import annotations
+import os
 
 from fastmcp import FastMCP
 
@@ -9,8 +9,10 @@ import qa_automation as automation
 from ..metrics import instrument_tool
 
 
-def create_server() -> FastMCP:
+def create_server(include_legacy_tools: bool | None = None) -> FastMCP:
     mcp = FastMCP("VTable Automation")
+    if include_legacy_tools is None:
+        include_legacy_tools = os.getenv("QA_AUTOMATION_ENABLE_LEGACY_VTABLE_TOOLS", "false").lower() in ("true", "1")
 
     @mcp.tool()
     @instrument_tool
@@ -48,8 +50,10 @@ def create_server() -> FastMCP:
     @mcp.tool()
     @instrument_tool
     async def vtable_cell_click(
-        col: int,
-        row: int,
+        col: int | None = None,
+        row: int | None = None,
+        field: str | None = None,
+        record_index: int | list[int] | None = None,
         double_click: bool = False,
         button: str = "left",
         verify: bool = True,
@@ -59,103 +63,98 @@ def create_server() -> FastMCP:
         frame: str | None = None,
         table_index: int | None = None,
     ) -> dict:
-        """稳定点击指定 VTable 单元格。
+        """稳定点击指定 VTable 单元格（支持物理坐标或业务字段两种定位方式）。
 
-        流程:显式绑定目标表 → 滚动到视口 → API 取中心点 → 等待鼠标悬停后的几何
-        稳定 → trusted 鼠标点击 → 回读选中区间/编辑器状态验证。
-
-        Args:
-            col: 全表列号，0-based，含左/右冻结列；不支持负数，越界点不到
-            row: 全表行号，0-based，含表头行与冻结行；点列头排序也用它
-            double_click: False=单击选中（默认）；True=双击，用于进入 editCellTrigger=doubleclick 的编辑器
-            button: 按下的鼠标键：left（默认）/ middle / right，其它值报错
-            verify: True（默认）回读选中区间、场景图绘制与局部截图作为落地证据，未过则降级为 unverified 并自动重试一次；False=点完即返回，verification_skipped
-            observe_after: 是否在点击期间收集 Portal/提示/下拉（默认 False）；要看单元格触发的弹窗就打开
-            settle_ms: 浮层观察窗口毫秒数（默认 300，限 0–2000，越界报错）；仅 observe_after 时生效
-            max_results: 浮层条目上限（默认 20），调小会丢掉排序靠后的浮层
-            frame: 目标 frame：省略=自动挑含 .vtable 的 frame（优先激活 iframe）；可传 main/top/active/vtable 或 frame_id
-            table_index: 该 frame 内第几个 .vtable 根节点，0-based；省略时多张可见表会直接要求补传
-        """
-        return await automation.click_cell(
-            col,
-            row,
-            double_click=double_click,
-            button=button,
-            verify=verify,
-            observe_after=observe_after,
-            settle_ms=settle_ms,
-            max_results=max_results,
-            frame=frame,
-            table_index=table_index,
-        )
-
-    @mcp.tool()
-    @instrument_tool
-    async def vtable_cell_resolve(
-        field: str,
-        record_index: int | list[int],
-        frame: str | None = None,
-        table_index: int | None = None,
-    ) -> dict:
-        """用目标 VTable 内部 API 将业务字段和记录索引解析为单元格地址。
+        二选一定位传参：
+        1. 业务定位（推荐）：传 field (列字段名) + record_index (数据记录序号，不含表头行)；
+        2. 物理定位：传 col (全表列号) + row (全表行号，含表头行)。
 
         Args:
-            field: 列定义里的 field/key 业务字段名（不是中文表头标题），取自 vtable_analysis 的 columns[].field
-            record_index: 数据记录序号，0-based 且不含表头行，直接透传给 VTable API；树形/分组表可传多级索引数组
-            frame: 目标 frame：省略=自动挑含 .vtable 的 frame（优先激活 iframe）；可传 main/top/active/vtable 或 frame_id
-            table_index: 该 frame 内第几个 .vtable 根节点，0-based；省略时多张可见表会直接要求补传
+            col: 全表列号，0-based，含左/右冻结列；物理定位时必传
+            row: 全表行号，0-based，含表头行与冻结行；物理定位时必传
+            field: 列定义里的 field/key 业务字段名（不是中文表头）；业务定位时必传
+            record_index: 数据记录序号，0-based 且不含表头行；业务定位时必传
+            double_click: False=单击选中（默认）；True=双击进入编辑
+            button: 按下的鼠标键：left（默认）/ middle / right
+            verify: True（默认）回读选中区间与场景图截图校验落地证据；False=点完即返回
+            observe_after: 是否在点击期间收集 Portal/提示/下拉（默认 False）
+            settle_ms: 浮层观察窗口毫秒数（默认 300）
+            max_results: 浮层条目上限（默认 20）
+            frame: 目标 frame：省略=自动挑选（优先激活 iframe）
+            table_index: 该 frame 内第几个 .vtable 根节点，0-based
         """
-        return await automation.resolve_vtable_cell(
-            field,
-            record_index,
-            frame=frame,
-            table_index=table_index,
-        )
+        if field is not None and record_index is not None:
+            return await automation.click_vtable_cell_by_field(
+                field,
+                record_index,
+                double_click=double_click,
+                button=button,
+                verify=verify,
+                observe_after=observe_after,
+                settle_ms=settle_ms,
+                max_results=max_results,
+                frame=frame,
+                table_index=table_index,
+            )
+        if col is not None and row is not None:
+            return await automation.click_cell(
+                col,
+                row,
+                double_click=double_click,
+                button=button,
+                verify=verify,
+                observe_after=observe_after,
+                settle_ms=settle_ms,
+                max_results=max_results,
+                frame=frame,
+                table_index=table_index,
+            )
+        raise ValueError("vtable_cell_click: 必须提供 (col, row) 或 (field, record_index)")
 
-    @mcp.tool()
-    @instrument_tool
-    async def vtable_cell_click_by_field(
-        field: str,
-        record_index: int | list[int],
-        double_click: bool = False,
-        button: str = "left",
-        verify: bool = True,
-        observe_after: bool = False,
-        settle_ms: int = 300,
-        max_results: int = 20,
-        frame: str | None = None,
-        table_index: int | None = None,
-    ) -> dict:
-        """按目标 VTable 的业务字段 + 记录索引稳定点击单元格。
+    if include_legacy_tools:
+        @mcp.tool()
+        @instrument_tool
+        async def vtable_cell_resolve(
+            field: str,
+            record_index: int | list[int],
+            frame: str | None = None,
+            table_index: int | None = None,
+        ) -> dict:
+            """用目标 VTable 内部 API 将业务字段和记录索引解析为单元格地址。"""
+            return await automation.resolve_vtable_cell(
+                field,
+                record_index,
+                frame=frame,
+                table_index=table_index,
+            )
 
-        先用 VTable API 把 field/record_index 解成 col/row，再走 vtable_cell_click
-        的完整滚动+可信点击+验证流程，因此无需自己换算行号。
-
-        Args:
-            field: 列定义里的 field/key 业务字段名（不是中文表头标题），取自 vtable_analysis 的 columns[].field
-            record_index: 数据记录序号，0-based 且不含表头行；树形/分组表可传多级索引数组
-            double_click: False=单击选中（默认）；True=双击，用于进入 editCellTrigger=doubleclick 的编辑器
-            button: 按下的鼠标键：left（默认）/ middle / right，其它值报错
-            verify: True（默认）回读选中区间、场景图绘制与局部截图作为落地证据，未过则降级为 unverified；False=点完即返回
-            observe_after: 是否在点击期间收集 Portal/提示/下拉（默认 False）；要看单元格触发的弹窗就打开
-            settle_ms: 浮层观察窗口毫秒数（默认 300，限 0–2000，越界报错）；仅 observe_after 时生效
-            max_results: 浮层条目上限（默认 20），调小会丢掉排序靠后的浮层
-            frame: 目标 frame：省略=自动挑含 .vtable 的 frame（优先激活 iframe）；可传 main/top/active/vtable 或 frame_id
-            table_index: 该 frame 内第几个 .vtable 根节点，0-based；省略时多张可见表会直接要求补传
-        """
-        return await automation.click_vtable_cell_by_field(
-            field,
-            record_index,
-            double_click=double_click,
-            button=button,
-            verify=verify,
-            observe_after=observe_after,
-            settle_ms=settle_ms,
-            max_results=max_results,
-            frame=frame,
-            table_index=table_index,
-        )
-
+        @mcp.tool()
+        @instrument_tool
+        async def vtable_cell_click_by_field(
+            field: str,
+            record_index: int | list[int],
+            double_click: bool = False,
+            button: str = "left",
+            verify: bool = True,
+            observe_after: bool = False,
+            settle_ms: int = 300,
+            max_results: int = 20,
+            frame: str | None = None,
+            table_index: int | None = None,
+        ) -> dict:
+            """按目标 VTable 的业务字段 + 记录索引稳定点击单元格（建议直接使用 vtable_cell_click）。"""
+            return await automation.click_vtable_cell_by_field(
+                field,
+                record_index,
+                double_click=double_click,
+                button=button,
+                verify=verify,
+                observe_after=observe_after,
+                settle_ms=settle_ms,
+                max_results=max_results,
+                frame=frame,
+                table_index=table_index,
+            )
     @mcp.tool()
     @instrument_tool
     async def vtable_meta(

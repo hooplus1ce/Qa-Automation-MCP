@@ -1,6 +1,6 @@
 """Unit coverage for adaptive differential settling of overlay observation.
 
-迁移自 DrissionPage-MCP overlays.py 的自适应收敛,必须在以下三点上可回归:
+浮层观察的自适应差分收敛,必须在以下三点上可回归:
   1. 真收敛(变更+安静+无 loading)时提前收口,不空等满窗口;
   2. 没看到变更 / 探针不可用时,退回固定等待,观察窗口一秒不少;
   3. settle_ms 永远是硬上限,任何分支都不会等得比改造前更久。

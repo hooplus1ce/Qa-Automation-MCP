@@ -42,7 +42,7 @@ OVERLAY_SETTLE_LIMIT_MS = 2_000
 
 OVERLAY_RESULT_LIMIT = _env_int("QA_AUTOMATION_OVERLAY_RESULT_LIMIT", 20)
 
-# 自适应差分收敛（迁移自 DrissionPage-MCP overlays.py 的设计）：
+# 自适应差分收敛（浮层观察窗口的收口策略）：
 
 # 交互后不再"死等满 settle_ms"：只有【确实观察到 DOM 变更】+【变更后安静 quiet_ms】
 # +【无 loading 骨架】三个条件同时成立才提前收口；任一不成立就照旧等满 settle_ms。
@@ -106,7 +106,7 @@ def credential_missing_message(*, user: bool, password: bool) -> str:
     hint = "、".join(missing)
     return (
         f"未配置登录凭据：缺少 {hint} 环境变量。"
-        "请在 .env.qa-automation（参见 .env.qa-automation.example）或 MCP 客户端的 env 中设置，"
+        "请在 .env（参见 .env.example）或 MCP 客户端的 env 中设置，"
         "也可以在调用 browser_login 时显式传 username/password。"
         "凭据不支持写死在代码或工具默认参数里——那会让它随 schema 每轮进入模型上下文。"
     )

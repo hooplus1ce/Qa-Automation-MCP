@@ -7,9 +7,13 @@ dist/
 .tools/
 .local/
 .zcode/
+.env
 .env.qa-automation
 .qa-automation/
 ~$*.xlsx
+
+# 账号档案：含明文账号口令，只驻留本机，不得入库（模板见 profiles.toml.example）
+profiles.toml
 
 # 本机 MCP 客户端配置：含 tencent-docs 的 Authorization 令牌，不得入库。
 # 模板见 .mcp.json.example（本文件曾受 git 跟踪，令牌已进历史与远端，必须轮换）。

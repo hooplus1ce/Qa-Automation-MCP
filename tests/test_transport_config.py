@@ -37,7 +37,8 @@ class TransportConfigTests(unittest.TestCase):
         self.assertEqual(config.environment.build_command(["probe"]), ["probe"])
 
     def test_agent_config_separates_mcp_project_from_workspace(self) -> None:
-        raw = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        target = ROOT / ".mcp.json" if (ROOT / ".mcp.json").exists() else ROOT / ".mcp.json.example"
+        raw = json.loads(target.read_text(encoding="utf-8"))
         server = raw["mcpServers"]["qa-automation"]
         args = server["args"]
 
@@ -46,24 +47,44 @@ class TransportConfigTests(unittest.TestCase):
             server["command"],
             {"uv", "D:/Developer/ScoopApps/apps/uv/current/uv.exe"},
         )
-        self.assertEqual(args[args.index("--project") + 1], ROOT.as_posix())
-        self.assertEqual(
-            args[args.index("--env-file") + 1],
-            (ROOT / ".env.qa-automation").as_posix(),
-        )
-        self.assertEqual(
-            args[args.index("fastmcp") :],
-            [
-                "fastmcp",
-                "run",
-                (ROOT / "fastmcp.json").as_posix(),
-                "--no-banner",
-            ],
-        )
+        if target.name == ".mcp.json":
+            self.assertEqual(args[args.index("--project") + 1], ROOT.as_posix())
+            self.assertEqual(
+                args[args.index("--env-file") + 1],
+                (ROOT / ".env").as_posix(),
+            )
+            self.assertEqual(
+                args[args.index("fastmcp") :],
+                [
+                    "fastmcp",
+                    "run",
+                    (ROOT / "fastmcp.json").as_posix(),
+                    "--no-banner",
+                ],
+            )
+        else:
+            self.assertEqual(
+                args[args.index("--project") + 1],
+                "<QA_AUTOMATION_MCP_仓库绝对路径>",
+            )
+            self.assertEqual(
+                args[args.index("--env-file") + 1],
+                "<QA_AUTOMATION_MCP_仓库绝对路径>/.env",
+            )
+            self.assertEqual(
+                args[args.index("fastmcp") :],
+                [
+                    "fastmcp",
+                    "run",
+                    "<QA_AUTOMATION_MCP_仓库绝对路径>/fastmcp.json",
+                    "--no-banner",
+                ],
+            )
 
     def test_environment_example_keeps_artifacts_workspace_relative(self) -> None:
+        example_path = ROOT / ".env.example"
         lines = (
-            (ROOT / ".env.qa-automation.example")
+            example_path
             .read_text(encoding="utf-8")
             .splitlines()
         )

@@ -6,7 +6,9 @@
 2. 动态表头与多别名弹性映射（主键、分类、状态、负责人、日期、备注等）；
 3. 全字段无损提取与全文/自定义多字段检索；
 4. 严格边界保护与安全分块（彻底规避 60871 错误）；
-5. 单行/批量原子聚合回写（支持扩展列与防限流）。
+5. 单行/批量原子聚合回写（支持扩展列与防限流）；
+6. 行维度物理增删（官方 sheet.delete_dimension / sheet.insert_dimension，
+   支持按主键/用例编号定位、条数上限保护、表头保护与 dry-run 预览）。
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import csv
 import io
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any
 
@@ -27,6 +30,7 @@ from ...config import TENCENT_DOCS_MCP_URL, resolve_tencent_docs_token
 from ...tencent_sheet import (
     SheetBatchUpdateResult,
     SheetConnectResult,
+    SheetDimensionResult,
     SheetQueryResult,
     SheetRowDetail,
     SheetUpdateResult,
@@ -92,7 +96,7 @@ async def _call_mcp_tool(
         return {"raw_text": first_text, "csv_data": first_text}
 
 
-def create_server() -> FastMCP:
+def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
     mcp = FastMCP("Tencent Docs Automation")
 
     # =======================================================================
@@ -365,6 +369,107 @@ def create_server() -> FastMCP:
 
     @mcp.tool(
         tags={"tencent_sheet", "tencent_docs"},
+        annotations={
+            "title": "删除腾讯文档表格行",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+        },
+    )
+    def tencent_sheet_delete_rows(
+        row_ids: list[str] | None = None,
+        case_ids: list[str] | None = None,
+        row_indices: list[int] | None = None,
+        sheet_name: str | None = None,
+        dry_run: bool = False,
+        allow_header: bool = False,
+    ) -> SheetDimensionResult:
+        """物理删除腾讯文档在线表格中的整行数据（官方 sheet.delete_dimension，不可撤销）。
+
+        与 tencent_sheet_batch_update 的本质区别：本工具**真正移除行结构**——被删行下方
+        的数据整体上移、子表总行数减少；后者只是把单元格内容改写/清空，行结构不变。
+        因此删除后行号会变化，涉及多行操作务必重新解析行号。
+
+        两种定位方式可单用也可混用，命中结果自动去重、行号越界值会被列入 not_found_indices：
+        - row_ids / case_ids：按主键列（默认「用例编号」，支持多别名）解析为行号；
+        - row_indices：直接给出 0-based 全表行号（含表头行，第 0 行即表头）。
+
+        安全约束：
+        1. 默认保护表头（allow_header=False 时第 0 行永不删除）；
+        2. 单次最多删除 200 行，超出请分批调用；
+        3. 删除按行号降序执行，避免删行导致行号漂移而误删；
+        4. 建议先 dry_run=True 预览命中范围，确认无误后再实际删除。
+
+        Args:
+            row_ids: 主键/用例编号列表，如 ["APS_YJGL_0132", "APS_YJGL_0133"]
+            case_ids: row_ids 的兼容别名（历史「用例编号」语义）
+            row_indices: 0-based 全表行号列表（含表头行）
+            sheet_name: 子表名称或 sheet_id（缺省时自动使用当前活跃子表）
+            dry_run: 仅解析目标并返回影响范围，不执行删除
+            allow_header: 是否允许删除第 0 行（表头），默认 False
+        """
+        merged_ids = [*(row_ids or []), *(case_ids or [])]
+        try:
+            res = tencent_sheet_manager.delete_rows(
+                sheet_name=sheet_name,
+                row_ids=merged_ids or None,
+                row_indices=row_indices,
+                dry_run=dry_run,
+                allow_header=allow_header,
+            )
+            return SheetDimensionResult(**res)
+        except TencentDocError as e:
+            raise ToolError(f"删除表格行失败: {e}") from e
+        except Exception as e:
+            raise ToolError(f"删除表格行异常: {e}") from e
+
+    @mcp.tool(
+        tags={"tencent_sheet", "tencent_docs"},
+        annotations={
+            "title": "插入腾讯文档表格行",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+        },
+    )
+    def tencent_sheet_insert_rows(
+        row_indices: list[int] | None = None,
+        count: int = 1,
+        direction: str = "before",
+        sheet_name: str | None = None,
+        dry_run: bool = False,
+    ) -> SheetDimensionResult:
+        """在腾讯文档在线表格的指定位置插入空白行（官方 sheet.insert_dimension）。
+
+        主要用途：误删行后的结构恢复（插入等量空行使后续行回到原位置）、批量补行。
+        ⚠️ 本工具只插入**空白行**，不会还原被删单元格的内容；原内容需另用
+        tencent_sheet_batch_update 回写。
+
+        多位置插入按行号升序执行，并对前序插入造成的行号漂移自动补偿。
+
+        Args:
+            row_indices: 0-based 全表参照行号列表（含表头行）
+            count: 每个位置插入的行数，默认 1
+            direction: "before"（默认，插在参照行之前）或 "after"
+            sheet_name: 子表名称或 sheet_id（缺省时自动使用当前活跃子表）
+            dry_run: 仅预览不执行
+        """
+        try:
+            res = tencent_sheet_manager.insert_rows(
+                sheet_name=sheet_name,
+                row_indices=row_indices,
+                count=count,
+                direction=direction,
+                dry_run=dry_run,
+            )
+            return SheetDimensionResult(**res)
+        except TencentDocError as e:
+            raise ToolError(f"插入表格行失败: {e}") from e
+        except Exception as e:
+            raise ToolError(f"插入表格行异常: {e}") from e
+
+    @mcp.tool(
+        tags={"tencent_sheet", "tencent_docs"},
         annotations={"title": "读取表格单元格切片", "readOnlyHint": True},
     )
     def tencent_sheet_read_cells(
@@ -423,142 +528,147 @@ def create_server() -> FastMCP:
             raise ToolError(f"读取单元格发生异常: {e}") from e
 
     # =======================================================================
-    # 历史保留工具集：testcase_* 兼容别名（确保旧脚本与既有测试 100% 正常运行）
+    # 历史保留工具集：testcase_* 兼容别名（默认不暴露，避免与 tencent_sheet_* 冲突引发 AI 决策犹豫）
     # =======================================================================
-
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "连接腾讯文档用例表格(兼容别名)", "readOnlyHint": False},
+    enable_testcase_aliases = (
+        include_legacy_aliases
+        if include_legacy_aliases is not None
+        else os.getenv("QA_AUTOMATION_ENABLE_TESTCASE_ALIASES", "false").lower() in ("true", "1")
     )
-    def testcase_connect(
-        url_or_file_id: str | None = None,
-        token: str | None = None,
-    ) -> TestCaseConnectResult:
-        """连接并绑定腾讯文档在线测试用例表格（等价于 tencent_sheet_connect）。"""
-        return tencent_sheet_connect(url_or_file_id=url_or_file_id, token=token)
-
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "列出用例子表清单(兼容别名)", "readOnlyHint": True},
-    )
-    def testcase_list_sheets(
-        url_or_file_id: str | None = None,
-        token: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """列出用例子表清单（等价于 tencent_sheet_list_sheets）。"""
-        return tencent_sheet_list_sheets(url_or_file_id=url_or_file_id, token=token)
-
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "获取单条测试用例详情(兼容别名)", "readOnlyHint": True},
-    )
-    def testcase_get(
-        sheet_name: str | None = None,
-        case_id: str | None = None,
-        row_index: int | None = None,
-        function: str | None = None,
-        check_point: str | None = None,
-    ) -> TestCaseDetail:
-        """获取单条测试用例详情（等价于 tencent_sheet_get_row）。"""
-        return tencent_sheet_get_row(
-            sheet_name=sheet_name,
-            case_id=case_id,
-            row_index=row_index,
-            function=function,
-            check_point=check_point,
+    if enable_testcase_aliases:
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "连接腾讯文档用例表格(兼容别名)", "readOnlyHint": False},
         )
+        def testcase_connect(
+            url_or_file_id: str | None = None,
+            token: str | None = None,
+        ) -> TestCaseConnectResult:
+            """连接并绑定腾讯文档在线测试用例表格（等价于 tencent_sheet_connect）。"""
+            return tencent_sheet_connect(url_or_file_id=url_or_file_id, token=token)
 
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "多维度检索测试用例(兼容别名)", "readOnlyHint": True},
-    )
-    def testcase_query(
-        sheet_name: str | None = None,
-        case_id_pattern: str | None = None,
-        level: str | None = None,
-        module: str | None = None,
-        sub_module: str | None = None,
-        function: str | None = None,
-        check_point: str | None = None,
-        result_filter: str | None = None,
-        keyword: str | None = None,
-        filters: dict[str, str] | None = None,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> TestCaseQueryResult:
-        """多维度检索测试用例（等价于 tencent_sheet_query_rows）。"""
-        return tencent_sheet_query_rows(
-            sheet_name=sheet_name,
-            keyword=keyword,
-            filters=filters,
-            id_pattern=case_id_pattern,
-            limit=limit,
-            offset=offset,
-            level=level,
-            module=module,
-            sub_module=sub_module,
-            function=function,
-            check_point=check_point,
-            result_filter=result_filter,
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "列出用例子表清单(兼容别名)", "readOnlyHint": True},
         )
+        def testcase_list_sheets(
+            url_or_file_id: str | None = None,
+            token: str | None = None,
+        ) -> list[dict[str, Any]]:
+            """列出用例子表清单（等价于 tencent_sheet_list_sheets）。"""
+            return tencent_sheet_list_sheets(url_or_file_id=url_or_file_id, token=token)
 
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "单条用例测试结果回写(兼容别名)", "readOnlyHint": False},
-    )
-    def testcase_update_result(
-        sheet_name: str | None = None,
-        case_id: str = "",
-        result: str = "",
-        executor: str | None = None,
-        execute_time: str | None = None,
-        remark: str | None = None,
-        extra_fields: dict[str, Any] | None = None,
-    ) -> TestCaseUpdateResult:
-        """单条用例测试结果回写（等价于 tencent_sheet_update_row）。"""
-        return tencent_sheet_update_row(
-            sheet_name=sheet_name,
-            case_id=case_id,
-            result=result,
-            executor=executor,
-            execute_time=execute_time,
-            remark=remark,
-            extra_fields=extra_fields,
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "获取单条测试用例详情(兼容别名)", "readOnlyHint": True},
         )
+        def testcase_get(
+            sheet_name: str | None = None,
+            case_id: str | None = None,
+            row_index: int | None = None,
+            function: str | None = None,
+            check_point: str | None = None,
+        ) -> TestCaseDetail:
+            """获取单条测试用例详情（等价于 tencent_sheet_get_row）。"""
+            return tencent_sheet_get_row(
+                sheet_name=sheet_name,
+                case_id=case_id,
+                row_index=row_index,
+                function=function,
+                check_point=check_point,
+            )
 
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "批量回写测试结果(兼容别名)", "readOnlyHint": False},
-    )
-    def testcase_batch_update_results(
-        sheet_name: str | None = None,
-        updates: list[dict[str, Any]] | None = None,
-    ) -> TestCaseBatchUpdateResult:
-        """批量回写多条测试用例结果（等价于 tencent_sheet_batch_update）。"""
-        return tencent_sheet_batch_update(
-            sheet_name=sheet_name,
-            updates=updates,
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "多维度检索测试用例(兼容别名)", "readOnlyHint": True},
         )
+        def testcase_query(
+            sheet_name: str | None = None,
+            case_id_pattern: str | None = None,
+            level: str | None = None,
+            module: str | None = None,
+            sub_module: str | None = None,
+            function: str | None = None,
+            check_point: str | None = None,
+            result_filter: str | None = None,
+            keyword: str | None = None,
+            filters: dict[str, str] | None = None,
+            limit: int = 20,
+            offset: int = 0,
+        ) -> TestCaseQueryResult:
+            """多维度检索测试用例（等价于 tencent_sheet_query_rows）。"""
+            return tencent_sheet_query_rows(
+                sheet_name=sheet_name,
+                keyword=keyword,
+                filters=filters,
+                id_pattern=case_id_pattern,
+                limit=limit,
+                offset=offset,
+                level=level,
+                module=module,
+                sub_module=sub_module,
+                function=function,
+                check_point=check_point,
+                result_filter=result_filter,
+            )
 
-    @mcp.tool(
-        tags={"testcase", "tencent_docs", "compatibility"},
-        annotations={"title": "读取表格原始单元格数据(兼容别名)", "readOnlyHint": True},
-    )
-    def testcase_read_cells(
-        sheet_name: str | None = None,
-        start_row: int = 0,
-        end_row: int = 20,
-        start_col: int = 0,
-        end_col: int = 20,
-    ) -> dict[str, Any]:
-        """读取指定子表单元格文本数据（等价于 tencent_sheet_read_cells）。"""
-        return tencent_sheet_read_cells(
-            sheet_name=sheet_name,
-            start_row=start_row,
-            end_row=end_row,
-            start_col=start_col,
-            end_col=end_col,
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "单条用例测试结果回写(兼容别名)", "readOnlyHint": False},
         )
+        def testcase_update_result(
+            sheet_name: str | None = None,
+            case_id: str = "",
+            result: str = "",
+            executor: str | None = None,
+            execute_time: str | None = None,
+            remark: str | None = None,
+            extra_fields: dict[str, Any] | None = None,
+        ) -> TestCaseUpdateResult:
+            """单条用例测试结果回写（等价于 tencent_sheet_update_row）。"""
+            return tencent_sheet_update_row(
+                sheet_name=sheet_name,
+                case_id=case_id,
+                result=result,
+                executor=executor,
+                execute_time=execute_time,
+                remark=remark,
+                extra_fields=extra_fields,
+            )
+
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "批量回写测试结果(兼容别名)", "readOnlyHint": False},
+        )
+        def testcase_batch_update_results(
+            sheet_name: str | None = None,
+            updates: list[dict[str, Any]] | None = None,
+        ) -> TestCaseBatchUpdateResult:
+            """批量回写多条测试用例结果（等价于 tencent_sheet_batch_update）。"""
+            return tencent_sheet_batch_update(
+                sheet_name=sheet_name,
+                updates=updates,
+            )
+
+        @mcp.tool(
+            tags={"testcase", "tencent_docs", "compatibility"},
+            annotations={"title": "读取表格原始单元格数据(兼容别名)", "readOnlyHint": True},
+        )
+        def testcase_read_cells(
+            sheet_name: str | None = None,
+            start_row: int = 0,
+            end_row: int = 20,
+            start_col: int = 0,
+            end_col: int = 20,
+        ) -> dict[str, Any]:
+            """读取指定子表单元格文本数据（等价于 tencent_sheet_read_cells）。"""
+            return tencent_sheet_read_cells(
+                sheet_name=sheet_name,
+                start_row=start_row,
+                end_row=end_row,
+                start_col=start_col,
+                end_col=end_col,
+            )
 
     # -----------------------------------------------------------------------
     # 历史保留工具：update_test_case_result（保持既有测试与旧调用方 100% 契约兼容）
