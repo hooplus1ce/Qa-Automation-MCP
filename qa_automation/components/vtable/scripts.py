@@ -911,6 +911,84 @@ return (function(options, unused){
       return {box: {x: left, y: top, width: right - left, height: bottom - top}, center: {x: (left + right) / 2, y: (top + bottom) / 2}};
     } catch (_) { return null; }
   };
+  const extractHeaderText = (cell, col, row, colTitle, icons) => {
+    let textGeom = null;
+    if (cell) {
+      const queue = [{node: cell, depth: 0}], seen = new Set();
+      let visited = 0;
+      while (queue.length && visited < 128) {
+        const item = queue.shift(), node = item.node;
+        if (!node || seen.has(node) || item.depth > 6) continue;
+        seen.add(node); visited += 1;
+        if (item.depth > 0) {
+          const attribute = node.attribute || {};
+          const nodeText = text(attribute.text ?? node.text);
+          const type = String(node.type || '').toLowerCase();
+          const bounds = node.globalAABBBounds;
+          const isText = (type === 'text' || node.name === 'text' || !!nodeText) && bounds;
+          if (isText) {
+            const x1 = Number(bounds.x1), y1 = Number(bounds.y1), x2 = Number(bounds.x2), y2 = Number(bounds.y2);
+            const w = x2 - x1, h = y2 - y1;
+            if ([x1, y1, x2, y2, w, h].every(Number.isFinite) && w > 0 && h > 0 && w < 1000 && h < 200) {
+              const match = colTitle && nodeText && (nodeText.includes(colTitle) || colTitle.includes(nodeText));
+              if (match || !textGeom) {
+                textGeom = {
+                  text: nodeText || colTitle,
+                  box: {x: x1, y: y1, width: w, height: h},
+                  center: {x: (x1 + x2) / 2, y: (y1 + y2) / 2}
+                };
+                if (match) break;
+              }
+            }
+          }
+        }
+        for (const child of childrenOf(node)) queue.push({node: child, depth: item.depth + 1});
+      }
+    }
+    const cellGeom = relativeBox(col, row);
+    let result = textGeom;
+    if (!result && cellGeom) {
+      let minIconX = cellGeom.box.x + cellGeom.box.width;
+      for (const ic of icons) {
+        if (ic && ic.box && ic.box.x < minIconX) minIconX = ic.box.x;
+      }
+      const safeWidth = Math.max(16, minIconX - cellGeom.box.x - 12);
+      const safeLeft = cellGeom.box.x + 8;
+      result = {
+        text: colTitle,
+        box: {x: safeLeft, y: cellGeom.box.y, width: safeWidth, height: cellGeom.box.height},
+        center: {x: safeLeft + Math.min(safeWidth / 2, 30), y: cellGeom.center.y}
+      };
+    }
+    if (result && icons.length) {
+      for (const ic of icons) {
+        if (ic && ic.box) {
+          const inIconX = result.center.x >= (ic.box.x - 4) && result.center.x <= (ic.box.x + ic.box.width + 4);
+          if (inIconX) {
+            const safeX = Math.max(cellGeom ? cellGeom.box.x + 6 : result.box.x, ic.box.x - 12);
+            result.center.x = safeX;
+          }
+        }
+      }
+    }
+    return result;
+  };
+  const extractSeparator = (col, row) => {
+    const cellGeom = relativeBox(col, row);
+    if (!cellGeom) return null;
+    const colRight = cellGeom.box.x + cellGeom.box.width;
+    let rightFrozenW = 0;
+    try {
+      rightFrozenW = (t.rightFrozenColCount && t.getRightFrozenColsWidth) ? t.getRightFrozenColsWidth() : 0;
+    } catch (_) {}
+    const cvWidth = canvasRect.width;
+    const isDraggable = (colRight < cvWidth - rightFrozenW - 1) && (col < colCount - 1 || colRight < cvWidth - 2);
+    return {
+      box: {x: colRight - 4, y: cellGeom.box.y, width: 8, height: cellGeom.box.height},
+      center: {x: colRight, y: cellGeom.center.y},
+      draggable: isDraggable
+    };
+  };
   const editorTags = editor => {
     const name = text(editor && ((editor.constructor && editor.constructor.name) || editor.name || editor.type)).toLowerCase();
     if (name.includes('textarea')) return ['textarea'];
@@ -927,9 +1005,9 @@ return (function(options, unused){
   const rowCount = clamp(t.rowCount, 0, 10000000);
   const colCount = Math.max(clamp(t.colCount, 0, 100000), configuredColumns.length);
   const headerRows = Math.max(1, clamp(t.columnHeaderLevelCount ?? t.headerRowCount ?? 1, 1, Math.max(1, rowCount)));
-  const columnLimit = Math.min(colCount, clamp(settings.max_columns, 20, 100));
+  const columnLimit = Math.min(colCount, clamp(settings.max_columns, 1, 100));
   const bodyRows = Math.max(0, rowCount - headerRows);
-  const rowLimit = Math.min(bodyRows, clamp(settings.sample_rows, 2, 8));
+  const rowLimit = Math.min(bodyRows, clamp(settings.sample_rows, 0, 8));
   const requestedFields = new Set((Array.isArray(settings.fields) ? settings.fields : []).map(value => String(value)));
   const includeValues = settings.include_values === true;
   const scanColumnCount = requestedFields.size ? Math.min(colCount, 100) : columnLimit;
@@ -952,7 +1030,11 @@ return (function(options, unused){
       if (!isHeader) continue;
       let headerCell = null;
       try { headerCell = t.scenegraph.getCell(col, row); } catch (_) {}
-      if (headerCell) header.push({row, geometry: relativeBox(col, row), icons: collectTargets(headerCell)});
+      const cellGeom = relativeBox(col, row);
+      const icons = headerCell ? collectTargets(headerCell) : [];
+      const textGeom = extractHeaderText(headerCell, col, row, title, icons);
+      const sepGeom = extractSeparator(col, row);
+      if (headerCell || cellGeom) header.push({row, geometry: cellGeom, text: textGeom, separator: sepGeom, icons});
     }
     const samples = [];
     for (let index = 0; index < rowLimit; index++) {

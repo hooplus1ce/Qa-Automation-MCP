@@ -12,7 +12,14 @@ from ..metrics import instrument_tool
 def create_server() -> FastMCP:
     mcp = FastMCP("Interaction Chain")
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "read_only_hint": False,
+            "destructive_hint": True,
+            "idempotent_hint": False,
+            "open_world_hint": True,
+        },
+    )
     @instrument_tool
     async def interaction_chain(
         goal: str | None = None,
@@ -24,21 +31,18 @@ def create_server() -> FastMCP:
     ) -> dict:
         """一次性批量执行 N 个 UI 交互动作(1 次调用替代 N 次往返),或返回紧凑页面分析。
 
-        两种用法:
-        - 传入 actions(非空):按序批量执行,忽略 mode。动作类型:click/dblclick/
-          rightclick/hover/fill/type/press/check/uncheck/select/drag/cell_click/
-          cell_click_field/wait,字段名遵循对应原语(ui_interact/ui_mouse_drag/
-          vtable_cell_click/vtable_cell_click_by_field)。每个动作结果只保留
-          {action, ok, status, target/locator/point, evidence_count, error} 摘要;
-          链尾统一观察一次:结果含 observation {url_changed, url, overlays[极简
-          kind/text/visible]},不逐动作返回浮层 dump。planning 由客户端 AI 完成,
-          本工具不做任何服务端 LLM 调用。
+        - 传入 actions(非空):按序批量执行(整体持锁,批内不会被其他工具插入),
+          忽略 mode。动作类型:click/dblclick/rightclick/hover/fill/type/press/
+          check/uncheck/select/drag/cell_click/cell_click_field/wait,字段名遵循对应
+          原语(ui_interact/ui_mouse_drag/vtable_cell_click/vtable_cell_click_by_field)。
+          每步只回 {action, ok, status, target/locator/point, evidence_count, error} 摘要;
+          链尾统一观察一次,结果含 observation {url_changed, url, overlays[极简]}。
         - 不传 actions 且 mode="auto":返回 status="analysis-only" 与紧凑
           analysis/page_context,由 AI 据此在下次调用显式传 actions。
+        planning 由客户端 AI 完成,本工具不做任何服务端 LLM 调用。
 
-        失败语义:单步硬超时(默认 5000ms,超时记该步失败);stop_on_error=True(默认)
-        时首个失败动作终止链条(整体 status="failed",executed 停在失败前成功数);
-        False 时收集失败继续(整体 status="partial" 或 "executed")。
+        失败语义:单步硬超时(默认 5000ms)记该步失败;stop_on_error=True(默认)首个
+        失败终止链条,整体 status="failed";False 时跑完剩余,status="partial"/"executed"。
 
         Args:
             goal: 本轮自然语言意图；当前实现未消费该参数，仅作调用方自述，不传无影响
@@ -98,9 +102,7 @@ def create_server() -> FastMCP:
             "reason": "no-actions-provided",
         }
         if include_analysis:
-            response["analysis"] = {
-                k: v for k, v in analysis_full.items() if k != "page_context"
-            }
+            response["analysis"] = {k: v for k, v in analysis_full.items() if k != "page_context"}
             response["page_context"] = analysis_full.get("page_context")
         return response
 

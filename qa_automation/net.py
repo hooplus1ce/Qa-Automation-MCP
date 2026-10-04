@@ -17,6 +17,7 @@ from typing import Any
 from playwright.async_api import Page, Request, Response
 
 from .browser import current_page
+from .completeness import completeness_report
 
 BODY_LIMIT = 4000
 HEADER_LIMIT = 40
@@ -413,24 +414,49 @@ async def net_listen_wait_silent(
 async def net_listen_snapshot(
     pattern: str | None = None,
     limit: int = 20,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    """获取当前已捕获网络数据包的只读快照列表（不等待、不出队）。"""
+    """获取当前已捕获网络数据包的只读分页快照（不等待、不出队）。"""
     page = await current_page()
     listener = await get_or_create_listener(page)
     regex = re.compile(pattern, re.IGNORECASE) if pattern else None
 
-    matches: list[dict[str, Any]] = []
-    for pkt in reversed(listener.packets):
-        if regex and not regex.search(pkt.url):
-            continue
-        matches.append(pkt.to_dict())
-        if len(matches) >= limit:
-            break
-
+    effective_limit = max(1, min(500, int(limit)))
+    effective_offset = max(0, int(offset))
+    packets_snapshot = list(listener.packets)
+    matching = [
+        packet for packet in reversed(packets_snapshot) if regex is None or regex.search(packet.url)
+    ]
+    total_count = len(matching)
+    page_packets = matching[effective_offset : effective_offset + effective_limit]
+    returned = [packet.to_dict() for packet in page_packets]
+    has_more = effective_offset + len(returned) < total_count
+    next_offset = effective_offset + len(returned) if has_more else None
     return {
-        "total_queued": len(listener.packets),
-        "matched_count": len(matches),
-        "packets": matches,
+        "total_queued": len(packets_snapshot),
+        "matched_count": len(returned),
+        "returned_count": len(returned),
+        "total_count": total_count,
+        "offset": effective_offset,
+        "limit": effective_limit,
+        "next_offset": next_offset,
+        "has_more": has_more,
+        "truncated": has_more,
+        "packets": returned,
+        "coverage": completeness_report(
+            scope={
+                "kind": "captured_network_packets",
+                "url_pattern": pattern,
+                "offset": effective_offset,
+                "order": "newest_first",
+            },
+            returned_count=len(returned),
+            total_count=total_count,
+            limit=effective_limit,
+            truncated=has_more,
+            has_more=has_more,
+            reasons=["limit"] if has_more else [],
+        ),
     }
 
 

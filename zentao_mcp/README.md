@@ -36,10 +36,17 @@
 ## 工具清单
 
 ### 1. 账号会话与人员指派
+
+凭据建议走环境变量注入（MCP 配置的 `env` 或 `--env-file`），避免密码进入 inputSchema、会话日志与模型上下文：
+
+- `ZENTAO_URL` / `ZENTAO_ACCOUNT` / `ZENTAO_PASSWORD`：连接与自动登录的默认凭据
+- `ZENTAO_PASSWORD_<账号大写>`：按账号覆盖密码（如 `ZENTAO_PASSWORD_WANGPENG`），多账号切换免传参
+- `ZENTAO_DEFAULT_PRODUCT` / `ZENTAO_DEFAULT_EXECUTION`：默认归属（缺省 40 / 578）
+
 | 工具 | 功能 | 说明 |
 |------|------|------|
-| `zentao_connect` | 连接禅道并登录换取 Token | 显式连接并缓存会话 |
-| `switch_account` | 快速切换操作账户 | 随时切换不同人员身份（研发/测试/管理员） |
+| `zentao_connect` | 连接禅道并登录换取 Token | 凭据优先级：显式传参 > 环境变量；密码参数可留空 |
+| `switch_account` | 快速切换操作账户 | 随时切换不同人员身份（研发/测试/管理员）；密码可留空走环境变量 |
 | `whoami` | 查询当前登录人员身份 | 显示连接地址、账号、真实姓名、角色、部门与 Token 状态 |
 | `find_user` | 查询人员真实姓名与账号 | 支持输入「万棚」「赵浩源」「段广」「胡嘉斌」直接解析 account |
 | `assign_bug` | 专门的缺陷指派工具 | 支持中文姓名直派（如 `assign_bug(65295, '胡嘉斌', '请回归')`） |

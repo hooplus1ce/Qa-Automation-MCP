@@ -13,7 +13,15 @@ from ..metrics import instrument_tool
 def create_server() -> FastMCP:
     mcp = FastMCP("Scenario Runner")
 
-    @mcp.tool(name="scenario_run")
+    @mcp.tool(
+        name="scenario_run",
+        annotations={
+            "read_only_hint": False,
+            "destructive_hint": True,
+            "idempotent_hint": False,
+            "open_world_hint": True,
+        },
+    )
     @instrument_tool
     async def scenario_run(
         scenario: str | dict[str, Any],

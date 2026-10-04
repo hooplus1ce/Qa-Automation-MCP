@@ -42,7 +42,7 @@ class RunJsTests(unittest.TestCase):
         mock_page = MagicMock()
         mock_page.evaluate = AsyncMock(return_value=42)
 
-        with patch("qa_automation.browser._current_page_impl", return_value=mock_page):
+        with patch("qa_automation.browser.runjs._current_page_impl", return_value=mock_page):
             # 1. 纯表达式：不额外包裹
             res1 = asyncio.run(_run_js_impl("window.innerWidth"))
             mock_page.evaluate.assert_called_with("window.innerWidth", None)
@@ -65,7 +65,7 @@ class RunJsTests(unittest.TestCase):
         long_string = "z" * (RUN_JS_OUTPUT_LIMIT + 500)
         mock_page.evaluate = AsyncMock(return_value=long_string)
 
-        with patch("qa_automation.browser._current_page_impl", return_value=mock_page):
+        with patch("qa_automation.browser.runjs._current_page_impl", return_value=mock_page):
             res = asyncio.run(_run_js_impl("getHugeString()"))
             self.assertTrue(isinstance(res, str))
             self.assertIn("...[输出截断:", res)
@@ -75,7 +75,7 @@ class RunJsTests(unittest.TestCase):
         mock_page = MagicMock()
         mock_page.evaluate = AsyncMock(return_value="matched")
 
-        with patch("qa_automation.browser._current_page_impl", return_value=mock_page):
+        with patch("qa_automation.browser.runjs._current_page_impl", return_value=mock_page):
             res = asyncio.run(run_js("arg => arg.name", arg={"name": "Alice"}))
             mock_page.evaluate.assert_called_with("arg => arg.name", {"name": "Alice"})
             self.assertEqual(res, "matched")

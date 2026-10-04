@@ -24,3 +24,9 @@ profiles.toml
 *.log
 .base*.txt
 .pytest_baseline.txt
+
+# 测试/运行期产物目录
+artifacts/
+
+# IDE/Agent 偏好与指令缓存
+.commandcode/

@@ -262,7 +262,7 @@ class WorkspaceArtifactTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(browser._state, "browser", SimpleNamespace()),
                 patch.object(browser._state, "selected_context", None),
                 patch.object(
-                    browser,
+                    browser.core,
                     "_current_page_impl",
                     AsyncMock(return_value=current),
                 ),

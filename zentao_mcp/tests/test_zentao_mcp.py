@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """禅道 MCP 服务的回归测试套件（标准库 unittest，零外部依赖）。
 
 覆盖两类东西：
@@ -14,6 +13,7 @@
 """
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -156,6 +156,98 @@ class TestStepsHtml(unittest.TestCase):
         self.assertIn("[步骤]", out)
         self.assertIn("[结果]", out)
         self.assertIn("[期望]", out)
+
+
+BASE_STEPS_HTML = (
+    "<p>[接口信息]</p><p>接口地址：POST <a href='http://x/a'>x</a></p>"
+    "<p>[步骤]</p><p>打开列表页</p>"
+    "<p>[结果]</p><p>旧的实际结果</p>"
+    '<p><img onload="setImageSize(this,0)" src="http://img/1.png" /></p>'
+    "<p>[期望]</p><p>旧的期望</p>"
+)
+
+
+class TestReplaceStepsSection(unittest.TestCase):
+    def test_replace_result_keeps_other_sections_and_image(self):
+        """只替换 [结果] 小节：步骤、接口信息、截图、[期望] 必须原样保留。"""
+        merged = z._replace_steps_section(BASE_STEPS_HTML, "结果", "<p>新结果</p>")
+        self.assertIn("<p>新结果</p>", merged)
+        self.assertNotIn("旧的实际结果", merged)
+        self.assertIn("打开列表页", merged)
+        self.assertIn("http://img/1.png", merged)
+        self.assertIn("旧的期望", merged)
+        self.assertIn("[接口信息]", merged)
+
+    def test_replace_expected_keeps_steps_and_image(self):
+        merged = z._replace_steps_section(BASE_STEPS_HTML, "期望", "<p>新期望</p>")
+        self.assertIn("<p>新期望</p>", merged)
+        self.assertNotIn("旧的期望", merged)
+        self.assertIn("旧的实际结果", merged)
+        self.assertIn("http://img/1.png", merged)
+        self.assertIn("打开列表页", merged)
+
+    def test_missing_marker_appends_without_losing_content(self):
+        """老格式正文没有小节标记：追加新小节，不丢任何既有内容。"""
+        merged = z._replace_steps_section("<p>[步骤]</p><p>只有步骤</p>", "期望", "<p>新期望</p>")
+        self.assertTrue(merged.endswith("<p>新期望</p>"))
+        self.assertIn("只有步骤", merged)
+
+    def test_last_section_replaced_to_end(self):
+        """[结果] 是最后一个小节时替换到正文末尾，不得残留旧内容。"""
+        merged = z._replace_steps_section("<p>[步骤]</p><p>s</p><p>[结果]</p><p>tail</p>", "结果", "<p>n</p>")
+        self.assertNotIn("tail", merged)
+        self.assertIn("n", merged)
+
+
+class TestUpdateBugSectionPreservation(unittest.TestCase):
+    """只传 expected/actual 时不得整字段覆盖 steps。
+
+    旧实现 `payload["steps"] = _steps_html(steps, expected, actual)` 在 steps 为空时
+    会把正文重建为仅含新小节——原有步骤与截图被静默清空（丢图有告警护栏，丢文字没有）。
+    """
+
+    def _run_update(self, **kwargs):
+        captured = {}
+
+        class FakeClient:
+            def get_bug(self, bug_id, full_steps=False):
+                return {"product": "40", "steps": BASE_STEPS_HTML}
+
+            def update_bug(self, bug_id, payload):
+                captured["payload"] = payload
+                return {"id": bug_id, "title": "t"}
+
+        original = z._get_client
+        z._get_client = lambda: FakeClient()
+        try:
+            out = z.update_bug(123, **kwargs)
+        finally:
+            z._get_client = original
+        return out, captured.get("payload", {})
+
+    def test_only_expected_preserves_steps_and_image(self):
+        _, payload = self._run_update(expected="新期望")
+        self.assertIn("新期望", payload["steps"])
+        self.assertNotIn("旧的期望", payload["steps"])
+        self.assertIn("打开列表页", payload["steps"])       # 原步骤保留
+        self.assertIn("http://img/1.png", payload["steps"])  # 原截图保留
+        self.assertIn("旧的实际结果", payload["steps"])      # 未触及的 [结果] 小节保留
+        self.assertNotIn("[警告]", _, "小节替换不应触发丢图告警")
+
+    def test_only_actual_preserves_steps_and_expected(self):
+        _, payload = self._run_update(actual="新结果")
+        self.assertIn("新结果", payload["steps"])
+        self.assertNotIn("旧的实际结果", payload["steps"])
+        self.assertIn("打开列表页", payload["steps"])
+        self.assertIn("http://img/1.png", payload["steps"])
+        self.assertIn("旧的期望", payload["steps"])
+
+    def test_explicit_steps_keeps_full_overwrite_semantics(self):
+        """显式传 steps 仍是整字段覆盖（契约不变），丢图护栏照常生效。"""
+        out, payload = self._run_update(steps="全新步骤正文")
+        self.assertIn("全新步骤正文", payload["steps"])
+        self.assertNotIn("打开列表页", payload["steps"])
+        self.assertIn("[警告]", out)  # 旧图未抄入 → 丢图告警必须出现
 
 
 class TestCleanHtmlForMd(unittest.TestCase):
@@ -480,6 +572,68 @@ class TestLoadBugsFromXlsx(unittest.TestCase):
         bugs = z._load_bugs_from_xlsx(p)
         self.assertEqual(len(bugs), 1)
         self.assertEqual(z._norm_severity(bugs[0]["severity"]), 3)
+
+
+# ─────────────────── 8. 凭据解析与环境覆盖 ───────────────────
+
+class TestCredentialResolution(unittest.TestCase):
+    """密码改为环境变量注入后的解析优先级与缺参报错。
+
+    旧行为把 password 做成工具必填入参：签名进 inputSchema 随每轮对话下发，
+    密码留在会话日志与模型上下文里。
+    """
+
+    def setUp(self):
+        self._saved = {k: v for k, v in os.environ.items()
+                       if k.startswith("ZENTAO_")}
+        for k in list(self._saved):
+            del os.environ[k]
+
+    def tearDown(self):
+        for k in list(os.environ):
+            if k.startswith("ZENTAO_"):
+                del os.environ[k]
+        os.environ.update(self._saved)
+
+    def test_password_priority_account_specific_over_generic(self):
+        os.environ["ZENTAO_PASSWORD"] = "generic"
+        os.environ["ZENTAO_PASSWORD_WANGPENG"] = "specific"
+        self.assertEqual(z._resolve_zentao_password("wangpeng"), "specific")
+        self.assertEqual(z._resolve_zentao_password("lihaizhen"), "generic")
+        self.assertEqual(z._resolve_zentao_password(""), "generic")
+
+    def test_password_account_with_mixed_case_normalizes_env_key(self):
+        os.environ["ZENTAO_PASSWORD_LI_HAI_ZHEN"] = "v"
+        self.assertEqual(z._resolve_zentao_password("li.hai.zhen"), "v")
+
+    def test_connect_without_credentials_raises_readable_error(self):
+        # @_tool 把异常兜成 "[error] ..." 文本,调用方拿到的是可读指引
+        out = z.zentao_connect(url="", account="", password="")
+        self.assertIn("[error]", out)
+        self.assertIn("ZENTAO_URL", out)
+
+    def test_switch_account_without_credentials_raises_readable_error(self):
+        z._STATE["client"] = None
+        try:
+            out = z.switch_account(account="wangpeng", password="", url="")
+            self.assertIn("[error]", out)
+            self.assertIn("ZENTAO_PASSWORD", out)
+        finally:
+            z._STATE["client"] = None
+
+    def test_default_product_execution_env_overridable(self):
+        """默认归属读环境变量,换环境不改代码(模块级常量在 import 时取值)。"""
+        import os
+        self.assertEqual(z.DEFAULT_PRODUCT, os.environ.get("ZENTAO_DEFAULT_PRODUCT", "40"))
+
+    def test_regression_report_uses_client_base_web(self):
+        """详情链接从当前 client 拼出,不再硬编码某个部署环境的 IP。"""
+        report = z._build_regression_report(
+            {"id": 65295, "title": "t", "status": "resolved", "resolution": "fixed",
+             "product": 40, "execution": 578, "module": 0},
+            base_web="http://zt.local/zentao",
+        )
+        self.assertIn("http://zt.local/zentao/bug-view-65295.html", report)
 
 
 if __name__ == "__main__":

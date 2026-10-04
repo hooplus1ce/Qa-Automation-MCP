@@ -5,7 +5,8 @@ description = "通用 UI 自动化测试 MCP 服务，包含浏览器、DOM、�
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp[apps]>=3.4.0",
+    "fastmcp[apps]>=4.0,<5",
+    "httpx>=0.28",
     "openpyxl>=3.1.5",
     "requests>=2.34.2",
 ]
@@ -44,11 +45,23 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # facade 模块:全部导入都是有意再导出(供 `import qa_automation as automation` 使用)
 "qa_automation/__init__.py" = ["F401"]
+"qa_automation/components/vtable/__init__.py" = ["F401"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["qa_automation"]
 
 [dependency-groups]
 dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "ruff>=0.16.5",
+]
+
+[tool.pytest.ini_options]
+asyncio_default_test_loop_scope = "function"
+testpaths = ["tests", "zentao_mcp/tests"]
+addopts = "-ra --strict-markers -p no:cacheprovider"
+markers = [
+    "browser: tests that require a real Playwright browser or CDP endpoint",
+    "slow: long-running integration tests",
 ]

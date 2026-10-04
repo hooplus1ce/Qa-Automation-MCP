@@ -15,11 +15,15 @@ import os
 import time
 import unittest
 
+import pytest
+
 from qa_automation.overlay import (
     _await_overlay_settle,
     _drain_overlay_observers,
     _install_overlay_observers,
 )
+
+pytestmark = pytest.mark.browser
 
 MODAL_PAGE = """
 <!doctype html><html><body>
@@ -72,9 +76,7 @@ async def _launch_page(playwright):
     if explicit:
         attempts.insert(0, (explicit, {"executable_path": explicit}))
     attempts.extend(
-        (path, {"executable_path": path})
-        for path in _SYSTEM_BROWSERS
-        if os.path.exists(path)
+        (path, {"executable_path": path}) for path in _SYSTEM_BROWSERS if os.path.exists(path)
     )
     errors: list[str] = []
     for label, kwargs in attempts:

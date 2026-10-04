@@ -13,7 +13,7 @@ from ..metrics import instrument_tool
 def create_server() -> FastMCP:
     mcp = FastMCP("AntV X6 Workflow")
 
-    @mcp.tool(name="x6_nodes")
+    @mcp.tool(name="x6_nodes", annotations={"read_only_hint": True})
     @instrument_tool
     async def x6_nodes(
         frame: str | None = None,
@@ -31,7 +31,10 @@ def create_server() -> FastMCP:
         session = await x6_ops.bind_x6(frame=frame, auto_fit=auto_fit)
         return await x6_ops.get_topology(session, auto_fit=False)
 
-    @mcp.tool(name="x6_move_node")
+    @mcp.tool(
+        name="x6_move_node",
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def x6_move_node(
         node: str,
@@ -50,7 +53,10 @@ def create_server() -> FastMCP:
         session = await x6_ops.bind_x6(frame=frame, auto_fit=False)
         return await x6_ops.move_node(session, node=node, dx=dx, dy=dy)
 
-    @mcp.tool(name="x6_connect")
+    @mcp.tool(
+        name="x6_connect",
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def x6_connect(
         from_node: str,
@@ -77,7 +83,10 @@ def create_server() -> FastMCP:
             to_port=to_port,
         )
 
-    @mcp.tool(name="x6_click_node")
+    @mcp.tool(
+        name="x6_click_node",
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False},
+    )
     @instrument_tool
     async def x6_click_node(
         node: str,
@@ -94,7 +103,10 @@ def create_server() -> FastMCP:
         session = await x6_ops.bind_x6(frame=frame, auto_fit=False)
         return await x6_ops.click_node(session, node=node, double=double)
 
-    @mcp.tool(name="x6_delete_node")
+    @mcp.tool(
+        name="x6_delete_node",
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def x6_delete_node(
         node: str,

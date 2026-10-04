@@ -1,540 +1,35 @@
-"""腾讯文档在线表格通用操作与管理模块。
-
-提供与腾讯文档 OpenAPI（JSON-RPC 2.0 / MCP 契约）的原生通讯、
-子表元数据缓存、多维度行记录定位与检索、网格切片读取、
-以及防限流的单行/批量单元格回写引擎。
-
-支持普通在线表格（sheet）与多维智能表格（smartsheet），
-适用于测试用例管理、业务数据录入、多表同步及通用表格自动化操作。
-"""
+"""腾讯文档表格业务门面:连接、动态表头、主键索引、检索与防限流回写引擎。"""
 
 from __future__ import annotations
 
 import csv
+import functools
 import io
-import json
 import logging
 import os
-import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+import threading
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
-
-from .config import TENCENT_DOCS_MCP_URL, resolve_tencent_docs_token
+from .parsing import normalize_header, parse_file_id
+from .transport import TencentDocError, TencentSheetClient
 
 logger = logging.getLogger("qa_automation.tencent_sheet")
 
-DEFAULT_MCP_URL = "https://docs.qq.com/openapi/mcp"
+def _state_guard(method):
+    """Serialize a manager call on the instance's ``_state_lock``.
 
-
-class TencentDocError(Exception):
-    """腾讯文档接口调用异常。"""
-
-    def __init__(self, message: str, code: int | None = None, trace_id: str | None = None):
-        super().__init__(message)
-        self.code = code
-        self.trace_id = trace_id
-
-
-# ---------------------------------------------------------------------------
-# 字段规范化辅助函数
-# ---------------------------------------------------------------------------
-
-
-def normalize_header(text: str) -> str:
-    """去除表头空格、常见中英文标点、下划线并转小写，便于弹性模糊匹配。"""
-    if not text:
-        return ""
-    return re.sub(r"[\s\(\)（）\[\]【】_—\-:：#]+", "", str(text).strip().lower())
-
-
-# ---------------------------------------------------------------------------
-# Pydantic 结果数据模型
-# ---------------------------------------------------------------------------
-
-
-class SheetConnectResult(BaseModel):
-    """腾讯文档表格连接结果。"""
-
-    ok: bool
-    file_id: str
-    title: str | None = None
-    url: str | None = None
-    active_tab_sheet: str | None = None
-    active_tab_id: str | None = None
-    total_sheets: int = 0
-    visible_sheets_count: int = 0
-    sheets: list[dict[str, Any]] = Field(default_factory=list)
-    message: str = ""
-
-
-class SheetRowDetail(BaseModel):
-    """单行记录详情。"""
-
-    sheet_name: str
-    sheet_id: str | None = None
-    row_index: int = Field(description="1-based 物理行号（对应 Excel 界面行号）")
-    row_id: str = Field(description="主键或唯一标识，如用例编号、订单编号、员工号等")
-    case_id: str = Field(default="", description="兼容历史用例编号字段")
-    data: dict[str, Any] = Field(default_factory=dict, description="整行所有字段键值对")
-
-
-class SheetQueryResult(BaseModel):
-    """表格多维度查询结果。"""
-
-    sheet_name: str
-    sheet_id: str | None = None
-    count: int
-    items: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class SheetUpdateResult(BaseModel):
-    """单行回写结果。"""
-
-    ok: bool
-    sheet_name: str
-    sheet_id: str | None = None
-    row_id: str = Field(default="", description="行标识符")
-    case_id: str = Field(default="", description="兼容历史用例编号字段")
-    result: str = Field(default="", description="兼容历史执行结果字段")
-    executor: str | None = None
-    execute_time: str | None = None
-    remark: str | None = None
-    updated_fields: dict[str, Any] = Field(default_factory=dict)
-    message: str = ""
-
-
-class SheetBatchUpdateResult(BaseModel):
-    """批量表格更新结果。"""
-
-    ok: bool
-    sheet_name: str
-    sheet_id: str | None = None
-    total_submitted: int
-    updated_count: int
-    updated_cells_count: int = 0
-    updated_rows: list[str] = Field(default_factory=list)
-    updated_cases: list[str] = Field(default_factory=list)
-    not_found_rows: list[str] = Field(default_factory=list)
-    not_found_cases: list[str] = Field(default_factory=list)
-    failed_items: list[dict[str, str]] = Field(default_factory=list)
-    failed_cases: list[dict[str, str]] = Field(default_factory=list)
-    message: str = ""
-
-
-class SheetDimensionResult(BaseModel):
-    """表格行/列维度增删结果（物理插删行，非清空内容）。"""
-
-    ok: bool
-    sheet_name: str
-    sheet_id: str | None = None
-    dimension_type: str = Field(default="row", description="row | col")
-    requested: int = Field(default=0, description="请求处理的目标数量")
-    affected_indices: list[int] = Field(
-        default_factory=list,
-        description="实际处理的全表 0-based 行号（删除按降序执行）",
-    )
-    affected_rows: list[str] = Field(default_factory=list, description="命中的主键/用例编号")
-    not_found_rows: list[str] = Field(default_factory=list, description="未匹配到的主键/用例编号")
-    not_found_indices: list[int] = Field(default_factory=list, description="越界或非法的行号")
-    skipped_header: bool = Field(default=False, description="是否因保护表头而跳过了第 1 行")
-    failed_items: list[dict[str, str]] = Field(default_factory=list)
-    row_count_before: int | None = Field(default=None, description="操作前子表总行数")
-    row_count_after: int | None = Field(default=None, description="操作后子表总行数")
-    dry_run: bool = False
-    message: str = ""
-
-
-# 别名兼容
-TestCaseConnectResult = SheetConnectResult
-TestCaseDetail = SheetRowDetail
-TestCaseQueryResult = SheetQueryResult
-TestCaseUpdateResult = SheetUpdateResult
-TestCaseBatchUpdateResult = SheetBatchUpdateResult
-
-
-# ---------------------------------------------------------------------------
-# 客户端通讯
-# ---------------------------------------------------------------------------
-
-
-def _resolve_token(token: str | None = None) -> str:
-    """解析腾讯文档访问令牌。"""
-    if token and token.strip():
-        return token.strip()
-    try:
-        return resolve_tencent_docs_token()
-    except Exception:
-        return (
-            os.getenv("TENCENT_DOCS_MCP_TOKEN")
-            or os.getenv("TENCENT_DOCS_TOKEN")
-            or os.getenv("TENCENT_API_KEY")
-            or ""
-        )
-
-
-class TencentSheetClient:
-    """腾讯文档 MCP / OpenAPI 原生客户端（JSON-RPC 2.0 over HTTP POST）。
-
-    内置：
-    1. 频率控制与请求间隔防抖（Pacing）；
-    2. HTTP 429 限流自适应退避重试（Exponential Backoff）；
-    3. JSON 与非 JSON（CSV/纯文本）响应解析容错；
-    4. 腾讯文档专用业务错误代码智能语义化识别。
+    FastMCP 在线程池里运行同步工具:两个并发调用若各自连不同文档,会在共享的
+    active_file_id/_sheets_by_name/表头缓存上互相串改,把数据写进错误的表格。
+    用 RLock(可重入)保证嵌套公开调用不死锁。
     """
 
-    def __init__(
-        self,
-        token: str | None = None,
-        base_url: str | None = None,
-        min_interval: float = 0.5,
-        max_retries: int = 4,
-    ):
-        self.token = _resolve_token(token)
-        self.base_url = base_url or TENCENT_DOCS_MCP_URL or DEFAULT_MCP_URL
-        self.min_interval = min_interval
-        self.max_retries = max_retries
-        self._last_call_time = 0.0
-        self._req_id = 0
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
 
-    def set_token(self, token: str) -> None:
-        self.token = token.strip()
-
-    def _wait_pacing(self) -> None:
-        elapsed = time.monotonic() - self._last_call_time
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """通过 JSON-RPC 2.0 调用腾讯文档 MCP 工具。"""
-        if not self.token:
-            self.token = _resolve_token()
-        if not self.token:
-            raise TencentDocError(
-                "未配置腾讯文档 MCP 访问令牌，请配置环境变量 TENCENT_DOCS_MCP_TOKEN 或在 connect 时传入 token"
-            )
-
-        self._req_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._req_id,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments,
-            },
-        }
-        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-        last_err: Exception | None = None
-        for attempt in range(self.max_retries):
-            self._wait_pacing()
-            req = urllib.request.Request(
-                self.base_url,
-                data=data_bytes,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": self.token,
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    resp_bytes = resp.read()
-                    self._last_call_time = time.monotonic()
-                    raw_text = resp_bytes.decode("utf-8", errors="replace")
-
-                res_json = json.loads(raw_text, strict=False)
-                if "error" in res_json and res_json["error"]:
-                    err_info = res_json["error"]
-                    msg = (
-                        err_info.get("message", str(err_info))
-                        if isinstance(err_info, dict)
-                        else str(err_info)
-                    )
-                    code = err_info.get("code") if isinstance(err_info, dict) else None
-                    if "60871" in msg or code == 60871:
-                        raise TencentDocError(
-                            f"腾讯文档表格区域超出实际行列范围 (code: 60871, invalid input grid range): {msg}",
-                            code=60871,
-                        )
-                    raise TencentDocError(f"RPC错误: {msg}", code=code)
-
-                result = res_json.get("result", {})
-                # 1. 优先解析 structuredContent
-                if "structuredContent" in result and isinstance(result["structuredContent"], dict):
-                    struct = result["structuredContent"]
-                    if struct.get("error"):
-                        err_msg = struct["error"]
-                        raise TencentDocError(
-                            f"工具返回错误: {err_msg}",
-                            trace_id=struct.get("trace_id"),
-                        )
-                    return struct
-
-                # 2. 其次解析 content 列表
-                content_list = result.get("content", [])
-                if content_list and isinstance(content_list, list):
-                    first_text = content_list[0].get("text", "")
-                    if first_text:
-                        try:
-                            parsed = json.loads(first_text, strict=False)
-                            if isinstance(parsed, dict):
-                                if parsed.get("error"):
-                                    raise TencentDocError(
-                                        f"工具返回错误: {parsed['error']}",
-                                        trace_id=parsed.get("trace_id"),
-                                    )
-                                return parsed
-                            if isinstance(parsed, list):
-                                return {"items": parsed}
-                        except json.JSONDecodeError:
-                            return {"raw_text": first_text, "csv_data": first_text}
-
-                return result
-
-            except urllib.error.HTTPError as e:
-                self._last_call_time = time.monotonic()
-                if e.code == 429:
-                    retry_after = e.headers.get("Retry-After")
-                    backoff = float(retry_after) if retry_after else (1.5 * (attempt + 1))
-                    logger.warning(
-                        "触发腾讯文档 429 限流，等待 %.1f 秒后重试 (attempt %d/%d)...",
-                        backoff,
-                        attempt + 1,
-                        self.max_retries,
-                    )
-                    time.sleep(backoff)
-                    last_err = TencentDocError(
-                        "腾讯文档接口限流 (HTTP 429)，已耗尽重试次数", code=429
-                    )
-                    continue
-                err_body = e.read().decode("utf-8", errors="replace")[:400]
-                raise TencentDocError(f"HTTP错误 {e.code}: {err_body}", code=e.code) from e
-            except urllib.error.URLError as e:
-                self._last_call_time = time.monotonic()
-                logger.warning(
-                    "网络通讯异常: %s，等待重试 (attempt %d/%d)...",
-                    e,
-                    attempt + 1,
-                    self.max_retries,
-                )
-                time.sleep(1.0 * (attempt + 1))
-                last_err = e
-            except json.JSONDecodeError as e:
-                raise TencentDocError(f"解析腾讯文档响应 JSON 失败: {e}") from e
-
-        if last_err:
-            raise last_err
-        raise TencentDocError("调用腾讯文档接口异常未知")
-
-    def get_sheet_info(self, file_id: str) -> dict[str, Any]:
-        """获取表格全部子表结构信息（调用官方 sheet.get_sheet_info）。"""
-        res = self.call_tool("sheet.get_sheet_info", {"file_id": file_id})
-        if isinstance(res, list):
-            return {"sheets": res}
-        return res
-
-    def get_cell_data(
-        self,
-        file_id: str,
-        sheet_id: str,
-        start_row: int,
-        end_row: int,
-        start_col: int,
-        end_col: int,
-        return_csv: bool = True,
-    ) -> str:
-        """获取指定区域单元格数据（调用官方 sheet.get_cell_data），返回 CSV 字符串。"""
-        res = self.call_tool(
-            "sheet.get_cell_data",
-            {
-                "file_id": file_id,
-                "sheet_id": sheet_id,
-                "start_row": start_row,
-                "end_row": end_row,
-                "start_col": start_col,
-                "end_col": end_col,
-                "return_csv": return_csv,
-            },
-        )
-        return res.get("csv_data", "")
-
-    def set_range_value(
-        self, file_id: str, sheet_id: str, values: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        """批量更新单元格数值（原子操作，调用官方 sheet.set_range_value）。"""
-        return self.call_tool(
-            "sheet.set_range_value",
-            {
-                "file_id": file_id,
-                "sheet_id": sheet_id,
-                "values": values,
-            },
-        )
-
-    def set_cell_value(
-        self,
-        file_id: str,
-        sheet_id: str,
-        row: int,
-        col: int,
-        value_type: str = "STRING",
-        string_value: str = "",
-        number_value: float | None = None,
-        bool_value: bool | None = None,
-    ) -> dict[str, Any]:
-        """更新单个单元格数值（调用官方 sheet.set_cell_value）。"""
-        payload: dict[str, Any] = {
-            "file_id": file_id,
-            "sheet_id": sheet_id,
-            "row": row,
-            "col": col,
-            "value_type": value_type,
-        }
-        if string_value is not None:
-            payload["string_value"] = string_value
-        if number_value is not None:
-            payload["number_value"] = number_value
-        if bool_value is not None:
-            payload["bool_value"] = bool_value
-        return self.call_tool("sheet.set_cell_value", payload)
-
-    def clear_range_cells(
-        self,
-        file_id: str,
-        sheet_id: str,
-        start_row: int,
-        end_row: int,
-        start_col: int,
-        end_col: int,
-    ) -> dict[str, Any]:
-        """清空单元格内容（调用官方 sheet.clear_range_cells）。"""
-        return self.call_tool(
-            "sheet.clear_range_cells",
-            {
-                "file_id": file_id,
-                "sheet_id": sheet_id,
-                "start_row": start_row,
-                "end_row": end_row,
-                "start_col": start_col,
-                "end_col": end_col,
-            },
-        )
-
-    def delete_dimension(
-        self,
-        file_id: str,
-        sheet_id: str,
-        dimension_type: str = "row",
-        index: int = 0,
-        count: int = 1,
-    ) -> dict[str, Any]:
-        """物理删除指定位置的行或列（调用官方 sheet.delete_dimension）。
-
-        与 ``clear_range_cells`` 的本质区别：本方法**真正移除整行/整列**，
-        后续行会整体上移，子表总行数随之减少；后者只清空内容、行结构不变。
-
-        Args:
-            file_id: 在线表格唯一标识
-            sheet_id: 子表 ID
-            dimension_type: "row" 或 "col"
-            index: 起始索引（0-based，含表头行，即 0 为表头）
-            count: 删除数量，默认 1
-        """
-        return self.call_tool(
-            "sheet.delete_dimension",
-            {
-                "file_id": file_id,
-                "sheet_id": sheet_id,
-                "dimension_type": dimension_type,
-                "index": int(index),
-                "count": int(count),
-            },
-        )
-
-    def insert_dimension(
-        self,
-        file_id: str,
-        sheet_id: str,
-        dimension_type: str = "row",
-        index: int = 0,
-        count: int = 1,
-        direction: str = "before",
-    ) -> dict[str, Any]:
-        """在指定位置插入空行或空列（调用官方 sheet.insert_dimension）。
-
-        Args:
-            index: 参照索引（0-based，含表头行）
-            count: 插入数量，默认 1
-            direction: "before"（默认，插在 index 之前）或 "after"
-        """
-        return self.call_tool(
-            "sheet.insert_dimension",
-            {
-                "file_id": file_id,
-                "sheet_id": sheet_id,
-                "dimension_type": dimension_type,
-                "index": int(index),
-                "count": int(count),
-                "direction": direction,
-            },
-        )
-
-    def query_file_info(self, file_id: str) -> dict[str, Any]:
-        """获取文档基础信息（调用官方 manage.query_file_info）。"""
-        return self.call_tool("manage.query_file_info", {"file_id": file_id})
-
-
-# 兼容别名
-TencentDocSheetClient = TencentSheetClient
-
-
-def parse_file_id(url_or_id: str) -> tuple[str, str | None]:
-    """从文档 URL 或 file_id 中提取规范的 (file_id, tab_sheet_id)。"""
-    raw = str(url_or_id or "").strip().strip("'\"")
-    if not raw:
-        return "", None
-
-    if not raw.startswith("http://") and not raw.startswith("https://"):
-        if "?" in raw or "#" in raw:
-            raw = f"https://docs.qq.com/sheet/{raw}"
-        else:
-            return raw, None
-
-    parsed = urllib.parse.urlparse(raw)
-    path_parts = [p for p in parsed.path.split("/") if p]
-    if not path_parts:
-        return "", None
-
-    action_words = {"edit", "view", "preview", "sheet", "smartsheet", "doc", "form", "table"}
-    if path_parts[-1].lower() in action_words and len(path_parts) > 1:
-        candidate_id = path_parts[-2]
-    else:
-        candidate_id = path_parts[-1]
-
-    file_id = candidate_id.split(".")[0]
-
-    query_params = urllib.parse.parse_qs(parsed.query)
-    tab = None
-    for key in ("tab", "sub_id", "subid", "subId", "sheet_id", "sheetId", "padid"):
-        if key in query_params and query_params[key]:
-            tab = query_params[key][0]
-            break
-
-    if not tab and parsed.fragment:
-        frag_params = urllib.parse.parse_qs(parsed.fragment)
-        for key in ("tab", "sub_id", "subid", "subId", "sheet_id", "sheetId"):
-            if key in frag_params and frag_params[key]:
-                tab = frag_params[key][0]
-                break
-
-    return file_id, tab
+    return wrapped
 
 
 class TencentSheetManager:
@@ -553,6 +48,8 @@ class TencentSheetManager:
 
     def __init__(self, client: TencentSheetClient | None = None):
         self.client = client or TencentSheetClient()
+        # 并发防护:见 _state_guard。RLock 允许公开方法嵌套调用。
+        self._state_lock = threading.RLock()
         self.active_file_id: str | None = None
         self.active_canonical_id: str | None = None
         self.active_url: str | None = None
@@ -603,6 +100,7 @@ class TencentSheetManager:
             ],
         }
 
+    @_state_guard
     def connect(
         self, url_or_file_id: str | None = None, token: str | None = None
     ) -> dict[str, Any]:
@@ -701,6 +199,7 @@ class TencentSheetManager:
             raise TencentDocError("尚未连接文档，请先调用 tencent_sheet_connect 连接表格")
         return fid
 
+    @_state_guard
     def resolve_sheet(self, sheet_name: str | None = None) -> tuple[str, dict[str, Any]]:
         """根据名称、简称或 sheet_id 解析目标子表 (sheet_id, sheet_info)。"""
         if not self._sheets_by_name:
@@ -765,6 +264,7 @@ class TencentSheetManager:
             f"未找到名为 '{sheet_name}' 的子表。可用子表包括: {available[:12]}"
         )
 
+    @_state_guard
     def get_headers(self, sheet_name: str | None = None) -> list[str]:
         """获取子表表头列名列表。"""
         sheet_id, sheet_info = self.resolve_sheet(sheet_name)
@@ -833,6 +333,7 @@ class TencentSheetManager:
 
         return fallback
 
+    @_state_guard
     def build_id_index(
         self,
         sheet_name: str | None = None,
@@ -916,6 +417,51 @@ class TencentSheetManager:
         )
         return index_map
 
+    def _read_id_column(
+        self, sheet_id: str, id_col_idx: int, row_start: int, row_end: int
+    ) -> dict[int, str]:
+        """读取主键列 [row_start, row_end]（0-based 闭区间），返回 {0based_row: 值}。"""
+        csv_text = self.client.get_cell_data(
+            file_id=self.effective_file_id,
+            sheet_id=sheet_id,
+            start_row=row_start,
+            end_row=row_end,
+            start_col=id_col_idx,
+            end_col=id_col_idx,
+            return_csv=True,
+        )
+        values: dict[int, str] = {}
+        for offset, r in enumerate(csv.reader(io.StringIO(csv_text))):
+            val = r[0].strip() if r else ""
+            if val:
+                values[row_start + offset] = val
+        return values
+
+    def _verify_row_ids(
+        self, sheet_id: str, id_col_idx: int, pairs: dict[str, int]
+    ) -> tuple[dict[str, int], list[str]]:
+        """写前按主键回读校验，防「缓存行号漂移 → 静默写错行」。
+
+        行号索引缓存只在 id 查不到时才重建；表格被外部（或并发调用）插删行后，
+        id 仍能命中但物理行号已漂移，直接按旧坐标写入会把结果写到错误的行。
+        这里对待写行统一回读主键列比对：一致的放行，不一致的列入 stale 交由
+        调用方强制重建索引后重解析；整段回读越界（表格已缩小）时全部视为 stale。
+        返回 (校验通过的 {id: row}, 未通过的 id 列表)。
+        """
+        if not pairs:
+            return {}, []
+        verified: dict[str, int] = {}
+        try:
+            col_vals = self._read_id_column(
+                sheet_id, id_col_idx, min(pairs.values()), max(pairs.values())
+            )
+        except TencentDocError:
+            return {}, list(pairs.keys())
+        stale = [i for i, row in pairs.items() if col_vals.get(row) != i]
+        verified = {i: row for i, row in pairs.items() if col_vals.get(row) == i}
+        return verified, stale
+
+    @_state_guard
     def get_row(
         self,
         sheet_name: str | None = None,
@@ -1019,6 +565,7 @@ class TencentSheetManager:
     # 兼容历史方法名
     get_case = get_row
 
+    @_state_guard
     def query_rows(
         self,
         sheet_name: str | None = None,
@@ -1198,6 +745,7 @@ class TencentSheetManager:
                 res_cols[canonical] = matched_idx
         return res_cols
 
+    @_state_guard
     def update_row(
         self,
         sheet_name: str | None = None,
@@ -1269,6 +817,17 @@ class TencentSheetManager:
     # 兼容历史方法名
     update_case_result = update_row
 
+    @_state_guard
+    def resolve_target_columns(self, sheet_name: str | None = None) -> dict[str, int]:
+        """解析子表中标准业务字段(结果/执行人/执行时间/备注)的列索引。
+
+        供工具层做 fail-closed 检查:批量写引擎对"别名列不存在"是静默跳过,
+        单字段回写类工具必须先确认列可解析,否则会静默丢写。
+        """
+        headers = self.get_headers(sheet_name)
+        return self._resolve_target_cols(headers)
+
+    @_state_guard
     def batch_update_rows(
         self,
         sheet_name: str | None = None,
@@ -1309,6 +868,9 @@ class TencentSheetManager:
         header_exact_map = {h: idx for idx, h in enumerate(headers)}
         header_norm_map = {normalize_header(h): idx for idx, h in enumerate(headers)}
 
+        # ---- 第一遍：解析每条 update 的目标行号（显式行号优先，其次主键索引） ----
+        entries: list[dict[str, Any]] = []
+        id_pairs: dict[str, int] = {}  # 走主键索引解析的 {id: row}，供写前校验
         for item in updates:
             raw_id = (
                 item.get("row_id")
@@ -1322,6 +884,7 @@ class TencentSheetManager:
             raw_row = item.get("_row_index") or item.get("row_index")
 
             row_idx: int | None = None
+            via_id = False
             id_str = str(raw_id).strip() if raw_id is not None else ""
 
             if raw_row is not None:
@@ -1343,6 +906,46 @@ class TencentSheetManager:
                     continue
 
                 row_idx = index_map[id_str]
+                via_id = True
+                id_pairs[id_str] = row_idx
+
+            entries.append({"item": item, "id": id_str, "row": row_idx, "via_id": via_id})
+
+        # ---- 写前主键回读校验：行号缓存只在 id 查不到时重建，表格被外部插删行后
+        # id 仍命中但行号已漂移，直接写会把结果写到错误的行（静默数据损坏）。
+        # 校验失败的 id 强制重建索引重解析；重建后仍找不到则拒绝写入该条。 ----
+        if id_pairs:
+            id_col_idx = self._find_column_index(headers, self.FILTER_FIELD_ALIASES["id"]) or 0
+            _, stale_ids = self._verify_row_ids(sheet_id, id_col_idx, id_pairs)
+            if stale_ids:
+                logger.warning(
+                    "子表 [%s] 检测到 %d 个主键的缓存行号已漂移，强制重建索引后重解析",
+                    resolved_sname,
+                    len(stale_ids),
+                )
+                index_map = self.build_id_index(sheet_name, force=True)
+                for entry in entries:
+                    if not entry["via_id"] or entry["id"] not in stale_ids:
+                        continue
+                    fresh_row = index_map.get(entry["id"])
+                    if fresh_row is None:
+                        failed_items.append({
+                            "item": str(entry["item"]),
+                            "error": (
+                                f"主键 [{entry['id']}] 的缓存行号 {entry['row'] + 1} 已漂移，"
+                                "重建索引后仍未找到该行，已拒绝写入（防止写错行）"
+                            ),
+                        })
+                        entry["row"] = None
+                    else:
+                        entry["row"] = fresh_row
+
+        for entry in entries:
+            item = entry["item"]
+            id_str = entry["id"]
+            row_idx = entry["row"]
+            if row_idx is None:
+                continue
 
             def _get_val(d: dict[str, Any], *keys: str) -> tuple[bool, Any]:
                 for k in keys:
@@ -1496,15 +1099,40 @@ class TencentSheetManager:
 
         if row_ids:
             id_map = self.build_id_index(sheet_name)
+            pairs: dict[str, int] = {}
             for raw in row_ids:
                 key = str(raw or "").strip()
                 if not key:
                     continue
                 if key in id_map:
-                    resolved.add(id_map[key])
-                    hit_ids.append(key)
+                    pairs[key] = id_map[key]
                 else:
                     missing_ids.append(key)
+
+            # 删除是破坏性操作：缓存行号在表格被外部插删行后会漂移，按旧行号删会误删
+            # 无辜行。写前（删前）按主键回读校验，漂移的 id 重建索引重解析，仍找不到
+            # 则归入 missing 拒绝删除。
+            if pairs:
+                headers = self.get_headers(sheet_name)
+                id_col_idx = self._find_column_index(headers, self.FILTER_FIELD_ALIASES["id"]) or 0
+                _, stale = self._verify_row_ids(sheet_id, id_col_idx, pairs)
+                if stale:
+                    logger.warning(
+                        "子表 [%s] 检测到 %d 个主键的缓存行号已漂移，删除前强制重建索引",
+                        sheet_info.get("sheet_name", sheet_id),
+                        len(stale),
+                    )
+                    id_map = self.build_id_index(sheet_name, force=True)
+                    for key in stale:
+                        fresh = id_map.get(key)
+                        if fresh is None:
+                            missing_ids.append(key)
+                        else:
+                            pairs[key] = fresh
+
+            for key, row in pairs.items():
+                resolved.add(row)
+                hit_ids.append(key)
 
         if row_indices:
             for raw in row_indices:
@@ -1547,6 +1175,7 @@ class TencentSheetManager:
         info = self._sheets_by_id.get(sheet_id)
         return int(info.get("row_count") or 0) if info else None
 
+    @_state_guard
     def delete_rows(
         self,
         sheet_name: str | None = None,
@@ -1640,6 +1269,7 @@ class TencentSheetManager:
             "message": message,
         }
 
+    @_state_guard
     def insert_rows(
         self,
         sheet_name: str | None = None,

@@ -83,7 +83,7 @@ class ArmScriptTests(unittest.TestCase):
 class ChromeExecutableTests(unittest.TestCase):
     def test_raises_when_nothing_found(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch(
-            "qa_automation.browser.shutil.which", return_value=None
+            "qa_automation.browser.cdp.shutil.which", return_value=None
         ), patch("os.path.isfile", return_value=False):
             with self.assertRaises(RuntimeError):
                 _chrome_executable()
@@ -238,7 +238,7 @@ class FallbackRegistryTests(unittest.TestCase):
         self.assertNotEqual(first, other)
 
     def test_fallback_registries_are_bounded(self) -> None:
-        with patch("qa_automation.browser._FALLBACK_REGISTRY_LIMIT", 4):
+        with patch("qa_automation.browser.state._FALLBACK_REGISTRY_LIMIT", 4):
             page = _SlottedFake("page")
             page.main_frame = _SlottedFake("main")  # type: ignore[attr-defined]
             for _ in range(20):
@@ -253,7 +253,7 @@ class FallbackRegistryTests(unittest.TestCase):
         _prune_fallback_registry(registry)
         self.assertEqual(len(registry), 10)  # 低于上限不动
 
-        with patch("qa_automation.browser._FALLBACK_REGISTRY_LIMIT", 4):
+        with patch("qa_automation.browser.state._FALLBACK_REGISTRY_LIMIT", 4):
             _prune_fallback_registry(registry)
         self.assertEqual(len(registry), 5)  # 10 -> 丢最旧 5 条
         self.assertEqual(sorted(registry), [5, 6, 7, 8, 9])
@@ -329,7 +329,7 @@ class CdpProbeTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(browser._state, "chrome_process", None),
-            patch.object(browser, "_probe_cdp", return_value={"Browser": "Chrome/120"}),
+            patch.object(browser.core, "_probe_cdp", return_value={"Browser": "Chrome/120"}),
             patch("subprocess.Popen") as popen,
         ):
             with self.assertRaisesRegex(RuntimeError, "browser_connect"):
@@ -342,7 +342,7 @@ class CdpProbeTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(browser._state, "chrome_process", None),
-            patch.object(browser, "_probe_cdp", side_effect=_PortHeldByOtherService("nginx")),
+            patch.object(browser.core, "_probe_cdp", side_effect=_PortHeldByOtherService("nginx")),
             patch("subprocess.Popen") as popen,
         ):
             with self.assertRaisesRegex(RuntimeError, "非 Chrome CDP 服务占用"):
@@ -384,10 +384,10 @@ class ViewportHealthTests(unittest.IsolatedAsyncioTestCase):
         import qa_automation.browser as b
 
         mock_page = SimpleNamespace(is_closed=lambda: False)
-        with patch.object(b, "_current_page_impl", AsyncMock(return_value=mock_page)), \
-             patch.object(b, "_maximize_and_fill_viewport", AsyncMock()) as mock_fill, \
-             patch.object(b, "_page_viewport_size", AsyncMock(return_value={"width": 1920, "height": 1080})), \
-             patch.object(b, "_page_id", return_value="page_test_1"):
+        with patch.object(b.core, "_current_page_impl", AsyncMock(return_value=mock_page)), \
+             patch.object(b.core, "_maximize_and_fill_viewport", AsyncMock()) as mock_fill, \
+             patch.object(b.core, "_page_viewport_size", AsyncMock(return_value={"width": 1920, "height": 1080})), \
+             patch.object(b.core, "_page_id", return_value="page_test_1"):
             res = await b.reset_viewport()
 
         mock_fill.assert_awaited_once_with(mock_page)
@@ -400,7 +400,7 @@ class ViewportHealthTests(unittest.IsolatedAsyncioTestCase):
 
         import qa_automation.browser as b
 
-        with patch.object(b, "_reset_viewport_impl", AsyncMock(return_value={"status": "viewport-reset"})) as mock_impl:
+        with patch.object(b.core, "_reset_viewport_impl", AsyncMock(return_value={"status": "viewport-reset"})) as mock_impl:
             res = await b.browser_session(action="reset_viewport")
 
         mock_impl.assert_awaited_once()
@@ -696,10 +696,10 @@ class AuthHelpersTests(unittest.TestCase):
             try:
                 with (
                     patch.object(browser_mod._state, "browser", fake_browser),
-                    patch.object(browser_mod, "_current_page_impl", AsyncMock(return_value=fake_page)),
-                    patch.object(browser_mod, "_maximize_and_fill_viewport", AsyncMock()),
+                    patch.object(browser_mod.login, "_current_page_impl", AsyncMock(return_value=fake_page)),
+                    patch.object(browser_mod.login, "_maximize_and_fill_viewport", AsyncMock()),
                     patch.object(
-                        browser_mod,
+                        browser_mod.login,
                         "scm_api_login",
                         AsyncMock(
                             return_value={

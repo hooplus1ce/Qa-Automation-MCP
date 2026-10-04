@@ -1,0 +1,1 @@
+"""Filesystem-discovered FastMCP components."""

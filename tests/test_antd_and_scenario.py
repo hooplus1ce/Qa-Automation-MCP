@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from qa_automation.antd import _dropdown_score
 from qa_automation.scenario import (
@@ -120,6 +120,64 @@ steps:
         self.assertIsNone(result["failed_step"])
         self.assertEqual(result["variables"]["auth_token"], "mock-token-abc")
 
+
+    def test_guarantee_dropdown_closed_stages(self) -> None:
+        from qa_automation.antd import _guarantee_dropdown_closed
+
+        mock_page = AsyncMock()
+        mock_target = AsyncMock()
+        mock_trigger = MagicMock()
+        mock_dd = AsyncMock()
+
+        # 场景 1：浮层原本就不可见
+        mock_dd.is_visible.return_value = False
+        res1 = asyncio.run(_guarantee_dropdown_closed(mock_page, mock_target, mock_trigger, mock_dd))
+        self.assertTrue(res1)
+        mock_page.keyboard.press.assert_not_called()
+
+        # 场景 2：浮层原本可见，按 ESC 后关闭
+        mock_dd.is_visible.side_effect = [True, False]
+        res2 = asyncio.run(_guarantee_dropdown_closed(mock_page, mock_target, mock_trigger, mock_dd))
+        self.assertTrue(res2)
+        mock_page.keyboard.press.assert_awaited_with("Escape")
+
+        # 场景 3：ESC 未能关闭，点击触发框后关闭
+        mock_page.keyboard.press.reset_mock()
+        mock_arrow = AsyncMock()
+        mock_arrow.is_visible.return_value = True
+        mock_trigger.locator.return_value.first = mock_arrow
+        mock_dd.is_visible.side_effect = [True, True, False]
+        res3 = asyncio.run(_guarantee_dropdown_closed(mock_page, mock_target, mock_trigger, mock_dd))
+        self.assertTrue(res3)
+        mock_arrow.click.assert_awaited()
+
+    def test_stable_locator_click_dismisses_obscuring_dropdown(self) -> None:
+        from qa_automation.interaction import _stable_locator_click
+
+        mock_page = AsyncMock()
+        mock_target = AsyncMock()
+
+        # 模拟目标保存按钮位于 (100, 500)，宽 80，高 30
+        mock_target.bounding_box.side_effect = [
+            {"x": 100.0, "y": 500.0, "width": 80.0, "height": 30.0},
+            {"x": 100.0, "y": 500.0, "width": 80.0, "height": 30.0},
+            {"x": 100.0, "y": 500.0, "width": 80.0, "height": 30.0},
+        ]
+        mock_target.is_enabled.return_value = True
+
+        # 模拟页面上有展开的多选下拉浮层位于 (50, 400)，宽 300，高 200（正巧遮挡了 (140, 515) 的保存按钮）
+        mock_floating = MagicMock()
+        mock_floating.count = AsyncMock(return_value=1)
+        mock_floating_dd = MagicMock()
+        mock_floating_dd.bounding_box = AsyncMock(return_value={"x": 50.0, "y": 400.0, "width": 300.0, "height": 200.0})
+        mock_floating.nth.return_value = mock_floating_dd
+        mock_page.locator = MagicMock(return_value=mock_floating)
+
+        with patch("qa_automation.interaction._stable_viewport_click", AsyncMock()) as mock_vp_click:
+            asyncio.run(_stable_locator_click(mock_page, mock_target))
+            # 必须检测到遮挡并自动派发 ESC
+            mock_page.keyboard.press.assert_awaited_with("Escape")
+            mock_vp_click.assert_awaited_once()
 
 if __name__ == "__main__":
     unittest.main()

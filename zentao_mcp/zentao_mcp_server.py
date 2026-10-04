@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-"""禅道 BUG 提交、多账户切换与回归测试分析 MCP Server（FastMCP 3.x，适配禅道开源版 17.1）
+"""禅道 BUG 提交、多账户切换与回归测试分析 MCP Server（FastMCP 4.x，适配禅道开源版 17.1）
 
 把「禅道 BUG 提交、图文正文内嵌、多账户切换、人员直派与缺陷修复进展/E2E回归报告生成」封装为标准 MCP 工具服务：
 1. 账号与连接管理：
@@ -46,7 +45,7 @@ import uuid
 from datetime import datetime
 from html import escape, unescape
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Any
 
 import openpyxl
 import requests
@@ -116,8 +115,9 @@ TYPE_MAP = {
     "接口问题": "codeerror",
 }
 TYPE_DEFAULT = "codeerror"
-DEFAULT_PRODUCT = "40"       # SCM
-DEFAULT_EXECUTION = "578"    # 生和堂APS
+# 默认归属可按部署环境覆盖:换环境(不同禅道库)时配置环境变量即可,无需改代码
+DEFAULT_PRODUCT = os.environ.get("ZENTAO_DEFAULT_PRODUCT", "40")       # SCM
+DEFAULT_EXECUTION = os.environ.get("ZENTAO_DEFAULT_EXECUTION", "578")  # 生和堂APS
 
 # ── 超时/重试预算（务必与 MCP 客户端上限对齐）─────────────────────────────
 # 实测：DSH 的 MCP 客户端 toolCallTimeoutMs = 60s。原配置 timeout=25 + RETRY=2
@@ -291,8 +291,8 @@ class ZentaoClient:
     def _json(r):
         try:
             return r.json()
-        except ValueError:
-            raise RuntimeError(f"响应非JSON(HTTP {r.status_code}): {r.text[:200]}")
+        except ValueError as err:
+            raise RuntimeError(f"响应非JSON(HTTP {r.status_code}): {r.text[:200]}") from err
 
     def login(self):
         # 整个登录过程持锁：避免并发工具同时发起登录、互相覆盖 self.token。
@@ -327,7 +327,7 @@ class ZentaoClient:
         finally:
             self._logging_in = False
 
-    def whoami(self) -> Dict[str, Any]:
+    def whoami(self) -> dict[str, Any]:
         """获取当前登录用户的详细信息。"""
         if self._current_user_profile:
             return self._current_user_profile
@@ -565,7 +565,7 @@ class ZentaoClient:
             (bugs, total, truncated)：bug 列表、产品 BUG 总数、是否因闸门/页上限而提前停止
         """
         dl = deadline or _Deadline()
-        bugs: List[Dict[str, Any]] = []
+        bugs: list[dict[str, Any]] = []
         seen_ids = set()                 # 去重：服务端若忽略 page，同一页会被重复追加
         page = 1
         total = 0
@@ -682,7 +682,7 @@ class ZentaoClient:
         """把 BUG 关联到指定需求（REST PUT /bugs/{id} 的 `story` 字段，17.1 实测可用）。"""
         return self.update_bug(bug_id, {"story": int(story_id)})
 
-    def upload_image(self, image_path: str) -> Dict[str, Any]:
+    def upload_image(self, image_path: str) -> dict[str, Any]:
         """通过 REST API /files 上传图片（imgFile 字段，适配 KindEditor）。"""
         path = Path(image_path)
         if not path.is_file():
@@ -790,7 +790,7 @@ class ZentaoClient:
             build_data:  callable(kuid) -> dict，构造表单字段
         """
         last = ""
-        for attempt in range(2):
+        for _attempt in range(2):
             self._web_login()
             page = self.s.get(form_page, timeout=self.timeout)
             m = re.search(r"var kuid\s*=\s*'([0-9a-f]+)'", page.text)
@@ -909,7 +909,7 @@ class ZentaoClient:
             build,
         )
 
-    def attach_image_to_bug(self, bug_id: int, image_path: str, caption: str = "问题截图") -> Dict[str, Any]:
+    def attach_image_to_bug(self, bug_id: int, image_path: str, caption: str = "问题截图") -> dict[str, Any]:
         """上传图片并内嵌至 BUG 正文 steps。
 
         ⚠ steps 是「整字段覆盖」，天然是 read-modify-write（禅道 17.1 的 PUT 无版本校验）。
@@ -982,43 +982,48 @@ class ZentaoClient:
         return True, f"附件已上传（fileID={file_id or '未知'}）", detail
 
     def _web_login(self):
-        if self._web_logged:
-            return
-        s = self.s
-        s.headers.update({
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self.base_web}/user-login.html",
-            "Origin": self.base_web,
-        })
-        s.get(f"{self.base_web}/user-login.html", timeout=self.timeout)
-        rand = s.get(f"{self.base_web}/user-refreshRandom.html",
-                     timeout=self.timeout).text.strip()
-        if not rand:
-            raise RuntimeError("web 登录失败：user-refreshRandom 返回空 rand")
-        pwd_enc = hashlib.md5(
-            (hashlib.md5(self.password.encode()).hexdigest() + rand).encode()
-        ).hexdigest()
-        r = s.post(
-            f"{self.base_web}/user-login.html",
-            data={
-                "account": self.account,
-                "password": pwd_enc,
-                "passwordStrength": "1",
-                "referer": "/zentao/",
-                "verifyRand": rand,
-                "keepLogin": "1",
-                "captcha": "",
-            },
-            allow_redirects=False,
-            timeout=self.timeout,
-        )
-        try:
-            data = r.json()
-        except ValueError:
-            raise RuntimeError(f"web 登录失败（HTTP {r.status_code}，响应非JSON）")
-        if data.get("result") != "success":
-            raise RuntimeError(f"web 登录失败: {data.get('message')}")
-        self._web_logged = True
+        # 三步登录序列必须整体持锁：只靠 _LockedSession 的单请求粒度串行时，
+        # 两个线程会交叉执行（登录页 → refreshRandom → POST），交叉覆盖共享
+        # Session 的 cookie 与 verifyRandom，把会话写坏。与 REST login() 同一语义；
+        # _lock 是 RLock，同线程重入安全。
+        with self._lock:
+            if self._web_logged:
+                return
+            s = self.s
+            s.headers.update({
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.base_web}/user-login.html",
+                "Origin": self.base_web,
+            })
+            s.get(f"{self.base_web}/user-login.html", timeout=self.timeout)
+            rand = s.get(f"{self.base_web}/user-refreshRandom.html",
+                         timeout=self.timeout).text.strip()
+            if not rand:
+                raise RuntimeError("web 登录失败：user-refreshRandom 返回空 rand")
+            pwd_enc = hashlib.md5(
+                (hashlib.md5(self.password.encode()).hexdigest() + rand).encode()
+            ).hexdigest()
+            r = s.post(
+                f"{self.base_web}/user-login.html",
+                data={
+                    "account": self.account,
+                    "password": pwd_enc,
+                    "passwordStrength": "1",
+                    "referer": "/zentao/",
+                    "verifyRand": rand,
+                    "keepLogin": "1",
+                    "captcha": "",
+                },
+                allow_redirects=False,
+                timeout=self.timeout,
+            )
+            try:
+                data = r.json()
+            except ValueError as err:
+                raise RuntimeError(f"web 登录失败（HTTP {r.status_code}，响应非JSON）") from err
+            if data.get("result") != "success":
+                raise RuntimeError(f"web 登录失败: {data.get('message')}")
+            self._web_logged = True
 
     def _get_edit_uid(self, bug_id):
         r = self.s.get(f"{self.base_web}/bug-edit-{bug_id}.html", timeout=self.timeout)
@@ -1037,13 +1042,28 @@ class ZentaoClient:
         return m.group(1)
 
 
+def _resolve_zentao_password(account: str = "") -> str:
+    """从环境解析禅道密码:优先按账号覆盖 ZENTAO_PASSWORD_<账号大写>，其次通用 ZENTAO_PASSWORD。
+
+    密码不作为工具必填入参的原因：工具签名会进 inputSchema 并随每轮对话下发给模型，
+    显式传参的密码会留在会话日志与模型上下文里。环境变量注入是默认路径，
+    显式传参保留作临时覆盖的逃生通道。
+    """
+    if account:
+        env_key = "ZENTAO_PASSWORD_" + re.sub(r"[^A-Z0-9]+", "_", account.upper()).strip("_")
+        value = os.environ.get(env_key, "")
+        if value:
+            return value
+    return os.environ.get("ZENTAO_PASSWORD", "")
+
+
 def _get_client() -> ZentaoClient:
     with _STATE_LOCK:
         if _STATE["client"]:
             return _STATE["client"]
         url = os.environ.get("ZENTAO_URL", "")
         account = os.environ.get("ZENTAO_ACCOUNT", "")
-        password = os.environ.get("ZENTAO_PASSWORD", "")
+        password = _resolve_zentao_password(account)
         if not (url and account and password):
             raise RuntimeError(
                 "禅道未连接。请先调用 zentao_connect(url, account, password) 或在环境配置 "
@@ -1224,6 +1244,30 @@ def _steps_html(
         parts.append(_steps_plain_lines_to_p(clean_expected))
 
     return "".join(parts)
+
+
+# 正文小节边界：下一个小节标记，或 _steps_html 插在 [结果] 与 [期望] 之间的图片段。
+_STEPS_SECTION_BOUNDARY_RE = re.compile(
+    r"<p>\s*\[(?:接口信息|步骤|结果|期望)\]\s*</p>|<p><img\b"
+)
+
+
+def _replace_steps_section(html: str, marker: str, new_body: str) -> str:
+    """只重写正文中 [marker] 小节的正文，其余部分（含 <img> 与根因级排版）原样保留。
+
+    update_bug 的 expected/actual 是「单小节更新」语义，但 steps 在禅道是整字段存储——
+    旧实现只传 expected 时会把 steps 重建为仅含 [期望] 的正文，原有步骤与截图被静默清空
+    （丢图有告警护栏，丢文字却没有）。无该小节时把新内容追加到末尾：老格式正文没有标记，
+    追加不会丢任何既有内容；若新正文漏抄了旧图，下方的丢图护栏仍会告警。
+    """
+    tag_re = re.compile(rf"<p>\s*\[{re.escape(marker)}\]\s*</p>")
+    m = tag_re.search(html or "")
+    if not m:
+        return f"{html or ''}<p>[{marker}]</p>{new_body}"
+    content_start = m.end()
+    boundary = _STEPS_SECTION_BOUNDARY_RE.search(html, content_start)
+    end = boundary.start() if boundary else len(html)
+    return html[:content_start] + new_body + html[end:]
 
 
 def _md_cell(v) -> str:
@@ -1419,7 +1463,7 @@ def _build_regression_matrix(bug_id, title: str, resolved_by: str, activated_cou
     return md
 
 
-def _build_regression_report(bug: dict) -> str:
+def _build_regression_report(bug: dict, base_web: str = "") -> str:
     """根据 BUG 核心数据与流转历史构建端到端回归测验指南 Markdown 文档。"""
     bug_id = bug.get('id')
     title = bug.get('title')
@@ -1489,7 +1533,10 @@ def _build_regression_report(bug: dict) -> str:
     md.append(f"# BUG #{bug_id} 缺陷修复进展汇报与端到端（E2E）回归测验指南")
     md.append("")
     md.append(f"> **状态看板**：`{status_cn}` | **生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ")
-    md.append(f"> **禅道详情**：http://192.168.200.53/zentao/bug-view-{bug_id}.html")
+    # 详情链接从当前连接的服务器拼出,不再硬编码某个部署环境的 IP
+    report_base = (base_web or os.environ.get("ZENTAO_URL", "")).rstrip("/")
+    md.append(f"> **禅道详情**：{report_base}/bug-view-{bug_id}.html" if report_base
+              else f"> **禅道详情**：BUG #{bug_id}")
     md.append("")
 
     md.append("## 一、缺陷基本档案与归属")
@@ -1586,14 +1633,25 @@ def _build_regression_report(bug: dict) -> str:
 # ============================ MCP 工具定义 ============================
 
 @_tool
-def zentao_connect(url: str, account: str, password: str) -> str:
+def zentao_connect(url: str = "", account: str = "", password: str = "") -> str:
     """连接禅道系统并登录换取 Token。
+
+    凭据优先级：显式传参 > 环境变量 ZENTAO_URL / ZENTAO_ACCOUNT / ZENTAO_PASSWORD
+    （密码另支持按账号覆盖 ZENTAO_PASSWORD_<账号大写>）。建议凭据走环境变量注入，
+    避免密码进入 inputSchema、会话日志与模型上下文。
 
     Args:
         url: 禅道地址，如 http://192.168.200.53/zentao
         account: 登录账号
-        password: 登录密码
+        password: 登录密码（建议留空，走环境变量注入）
     """
+    url = (url or os.environ.get("ZENTAO_URL", "")).strip()
+    account = (account or os.environ.get("ZENTAO_ACCOUNT", "")).strip()
+    password = password or _resolve_zentao_password(account)
+    if not (url and account and password):
+        raise RuntimeError(
+            "缺少连接凭据：请显式传参，或配置环境变量 ZENTAO_URL / ZENTAO_ACCOUNT / ZENTAO_PASSWORD"
+        )
     with _STATE_LOCK:       # 与 _get_client 同一把锁：避免"替换单例"与"读取单例"并发
         c = ZentaoClient(url, account, password)
         c.login()
@@ -1603,16 +1661,25 @@ def zentao_connect(url: str, account: str, password: str) -> str:
 
 
 @_tool
-def switch_account(account: str, password: str, url: str = "") -> str:
+def switch_account(account: str = "", password: str = "", url: str = "") -> str:
     """切换当前登录的禅道操作账户（可随时切换不同研发或测试人员身份）。
+
+    密码建议留空走环境变量注入（ZENTAO_PASSWORD 或按账号 ZENTAO_PASSWORD_<账号大写>）。
 
     Args:
         account: 新账号用户名（如 'lihaizhen', 'wangpeng', 'hujiabin'）
-        password: 新账号密码
+        password: 新账号密码（建议留空，走环境变量注入）
         url: 禅道地址（若留空则沿用当前连接的服务器地址）
     """
     current = _STATE.get("client")
-    target_url = url or (current.base_web if current else "http://192.168.200.53/zentao")
+    target_url = (url or (current.base_web if current else "") or os.environ.get("ZENTAO_URL", "")).strip()
+    account = (account or os.environ.get("ZENTAO_ACCOUNT", "")).strip()
+    password = password or _resolve_zentao_password(account)
+    if not (target_url and account and password):
+        raise RuntimeError(
+            "缺少切换凭据：请显式传参，或配置环境变量 ZENTAO_URL / ZENTAO_PASSWORD"
+            "（按账号覆盖用 ZENTAO_PASSWORD_<账号大写>）"
+        )
     with _STATE_LOCK:
         c = ZentaoClient(target_url, account, password)
         c.login()
@@ -1811,7 +1878,7 @@ def list_stories(product: str = DEFAULT_PRODUCT, keyword: str = "", limit: int =
     limit = max(1, int(limit or 20))          # limit<=0 会让循环在第一页就 break，静默漏结果
     kw = keyword.strip().lower()
     dl = _Deadline()
-    hits: List[Dict[str, Any]] = []
+    hits: list[dict[str, Any]] = []
     scanned, total, page = 0, 0, 1
     truncated = False
     while page <= STORY_SCAN_MAX_PAGES:
@@ -1993,7 +2060,7 @@ def export_bug_regression_report(bug_id: int, output_file: str = "") -> str:
     """
     c = _get_client()
     bug = c.get_bug(bug_id)
-    report_md = _build_regression_report(bug)
+    report_md = _build_regression_report(bug, c.base_web)
 
     if output_file:
         out_path = Path(output_file)
@@ -2096,7 +2163,7 @@ def create_bug(
     """
     c = _get_client()
     pid = c.find_product(product)
-    notes: List[str] = []
+    notes: list[str] = []
     module_id = 0
     if module:
         module_id = c.find_module(pid, module) or 0
@@ -2256,9 +2323,9 @@ def update_bug(
         severity: 新严重程度 1-4（0=不修改，按影响面自评）
         pri: 新优先级 1-4（0=不修改，按紧急度自评）
         type_name: 新 BUG 类型中文名（代码错误/用户体验等，空则不修改）
-        steps: 新重现步骤（全空则不修改；全量覆盖语义，需带上已有 <img> 标签与根因级排版）
-        expected: 新预期结果
-        actual: 新实际结果
+        steps: 新重现步骤（全空则保留原正文；传入即全量覆盖，需带上已有 <img> 标签与根因级排版）
+        expected: 新预期结果（只更新正文 [期望] 小节，原有步骤与截图保留）
+        actual: 新实际结果（只更新正文 [结果] 小节，原有步骤与截图保留）
         module: 新模块名称或 ID（留空保持根模块 0，严禁自选子模块）
         keywords: 新关键词（必须遵循规范：<用例编号>,<要点1>,<要点2>）
         assigned_to: 新指派人员（支持中文真实姓名如 '万棚', '赵浩源', '李科勇'）
@@ -2269,9 +2336,9 @@ def update_bug(
     payload = {}
 
     # 单次读取当前单据，供 module / story / image_path 三处复用（旧实现最多重复读 3 次）
-    cur: Optional[Dict[str, Any]] = None
+    cur: dict[str, Any] | None = None
 
-    def _current() -> Dict[str, Any]:
+    def _current() -> dict[str, Any]:
         nonlocal cur
         if cur is None:
             cur = c.get_bug(bug_id)
@@ -2286,7 +2353,22 @@ def update_bug(
     if type_name:
         payload["type"] = _resolve_type(type_name)
     if steps or expected or actual:
-        payload["steps"] = _steps_html(steps, expected, actual)
+        if steps:
+            payload["steps"] = _steps_html(steps, expected, actual)
+        else:
+            # steps 全空：按契约只更新 expected/actual 对应小节，保留原有步骤
+            # 正文与 <img>。整字段覆盖会把正文重建为仅含新小节，原内容静默清空。
+            merged = _current().get("steps") or ""
+            if actual:
+                merged = _replace_steps_section(
+                    merged, "结果", _steps_plain_lines_to_p(_sanitize_path_arrows(actual))
+                )
+            if expected:
+                merged = _replace_steps_section(
+                    merged, "期望", _steps_plain_lines_to_p(_sanitize_path_arrows(expected))
+                )
+            if merged.strip():
+                payload["steps"] = merged
     if module:
         pid = c.find_product(str(_current().get("product")))
         mid = c.find_module(pid, module)
@@ -2338,7 +2420,7 @@ def update_bug(
     warn = ""
     if "steps" in payload:
         src_re = re.compile(r'src=["\']([^"\']+)["\']')
-        old_srcs = set(src_re.findall((_current().get("steps") or "")))
+        old_srcs = set(src_re.findall(_current().get("steps") or ""))
         new_srcs = set(src_re.findall(payload["steps"]))
         dropped = sorted(old_srcs - new_srcs)
         if dropped:
@@ -2469,7 +2551,7 @@ def submit_bugs_from_xlsx(
     # 同目录放两份清单会互相覆盖（A 单的记录被 B 单冲掉 → A 重跑就重复建单）。
     record_path = path.with_suffix(".submitted.json")
     legacy_path = path.parent / "zentao_submitted.json"
-    record: Dict[str, Any] = {}
+    record: dict[str, Any] = {}
     for rp in (legacy_path, record_path):
         if rp.exists():
             try:
@@ -2482,7 +2564,7 @@ def submit_bugs_from_xlsx(
     remote_titles = c.list_bug_titles(pid)
 
     created, skipped, failed = [], [], []
-    module_cache: Dict[str, Any] = {}
+    module_cache: dict[str, Any] = {}
     dl = _Deadline()
     hit_gate = False
     for n, b in enumerate(bugs, 1):

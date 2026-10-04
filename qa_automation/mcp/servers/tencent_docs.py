@@ -9,24 +9,24 @@
 5. 单行/批量原子聚合回写（支持扩展列与防限流）；
 6. 行维度物理增删（官方 sheet.delete_dimension / sheet.insert_dimension，
    支持按主键/用例编号定位、条数上限保护、表头保护与 dry-run 预览）。
+
+所有 JSON-RPC 传输统一走 :mod:`qa_automation.tencent_sheet` 的 ``TencentSheetClient``
+（pacing/429 退避/错误语义化),本模块不再有独立的 HTTP 路径。
 """
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
-import json
 import logging
 import os
 from datetime import datetime
 from typing import Any
 
-import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from ...config import TENCENT_DOCS_MCP_URL, resolve_tencent_docs_token
+from ...completeness import completeness_report
 from ...tencent_sheet import (
     SheetBatchUpdateResult,
     SheetConnectResult,
@@ -43,57 +43,9 @@ from ...tencent_sheet import (
     parse_file_id,
     tencent_sheet_manager,
 )
+from ..metrics import instrument_tool
 
 logger = logging.getLogger(__name__)
-
-
-async def _call_mcp_tool(
-    client: httpx.AsyncClient,
-    tool_name: str,
-    arguments: dict[str, Any],
-    token: str,
-) -> dict[str, Any]:
-    """通过 JSON-RPC 调用腾讯文档 MCP 接口并解析结果（兼容上游标准协议）。"""
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments,
-        },
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": token,
-    }
-    response = await client.post(
-        TENCENT_DOCS_MCP_URL,
-        json=payload,
-        headers=headers,
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    resp_data = response.json()
-    if "error" in resp_data:
-        raise RuntimeError(f"Tencent Docs MCP RPC error: {resp_data['error']}")
-
-    result = resp_data.get("result", {})
-    if "structuredContent" in result and isinstance(result["structuredContent"], dict):
-        return result["structuredContent"]
-
-    content = result.get("content", [])
-    if not content or not isinstance(content, list):
-        return {}
-
-    first_text = content[0].get("text", "")
-    if not first_text:
-        return {}
-
-    try:
-        return json.loads(first_text, strict=False)
-    except Exception:
-        return {"raw_text": first_text, "csv_data": first_text}
 
 
 def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
@@ -105,8 +57,14 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
 
     @mcp.tool(
         tags={"tencent_sheet", "tencent_docs"},
-        annotations={"title": "连接腾讯文档表格", "readOnlyHint": False},
+        annotations={
+            "title": "连接腾讯文档表格",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+        },
     )
+    @instrument_tool
     def tencent_sheet_connect(
         url_or_file_id: str | None = None,
         token: str | None = None,
@@ -134,6 +92,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         tags={"tencent_sheet", "tencent_docs"},
         annotations={"title": "列出子表清单", "readOnlyHint": True},
     )
+    @instrument_tool
     def tencent_sheet_list_sheets(
         url_or_file_id: str | None = None,
         token: str | None = None,
@@ -143,25 +102,28 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         若传入 url_or_file_id 则直接列出目标文档的所有子表；未传入时自动使用当前已连接文档。
         """
         try:
-            if url_or_file_id or not tencent_sheet_manager.active_file_id:
-                tencent_sheet_manager.connect(url_or_file_id=url_or_file_id, token=token)
+            # connect 与读取 _sheets_by_name 必须在同一把状态锁内完成,
+            # 否则并发 connect 会读到自己文档之外的子表清单。
+            with tencent_sheet_manager._state_lock:
+                if url_or_file_id or not tencent_sheet_manager.active_file_id:
+                    tencent_sheet_manager.connect(url_or_file_id=url_or_file_id, token=token)
 
-            active_id = tencent_sheet_manager.active_tab_id
-            active_name = tencent_sheet_manager.active_tab_sheet
+                active_id = tencent_sheet_manager.active_tab_id
+                active_name = tencent_sheet_manager.active_tab_sheet
 
-            sheets = [
-                {
-                    "sheet_name": s["sheet_name"],
-                    "sheet_id": s["sheet_id"],
-                    "row_count": s["row_count"],
-                    "col_count": s["col_count"],
-                    "hidden": s.get("hidden", False),
-                    "sheet_type": s.get("sheet_type", "worksheet"),
-                    "is_active": (s["sheet_id"] == active_id or s["sheet_name"] == active_name),
-                }
-                for s in tencent_sheet_manager._sheets_by_name.values()
-                if not s.get("hidden")
-            ]
+                sheets = [
+                    {
+                        "sheet_name": s["sheet_name"],
+                        "sheet_id": s["sheet_id"],
+                        "row_count": s["row_count"],
+                        "col_count": s["col_count"],
+                        "hidden": s.get("hidden", False),
+                        "sheet_type": s.get("sheet_type", "worksheet"),
+                        "is_active": (s["sheet_id"] == active_id or s["sheet_name"] == active_name),
+                    }
+                    for s in tencent_sheet_manager._sheets_by_name.values()
+                    if not s.get("hidden")
+                ]
             return sheets
         except TencentDocError as e:
             raise ToolError(f"获取子表清单失败: {e}") from e
@@ -172,6 +134,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         tags={"tencent_sheet", "tencent_docs"},
         annotations={"title": "获取单行数据详情", "readOnlyHint": True},
     )
+    @instrument_tool
     def tencent_sheet_get_row(
         sheet_name: str | None = None,
         row_id: str | None = None,
@@ -220,6 +183,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         tags={"tencent_sheet", "tencent_docs"},
         annotations={"title": "多维度检索表格行数据", "readOnlyHint": True},
     )
+    @instrument_tool
     def tencent_sheet_query_rows(
         sheet_name: str | None = None,
         keyword: str | None = None,
@@ -247,7 +211,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             keyword: 全局搜索关键字（在整行所有列中模糊匹配）
             filters: 自定义字段键值对过滤条件（如 {"分类": "工艺规则", "状态": "启用"}）
             id_pattern: 主键编号包含的关键词（亦可用 case_id_pattern 传入）
-            limit: 返回条数上限（默认 20，最大 100）
+            limit: 每页返回条数上限（默认 20，最大 100）；结果含 has_more/next_offset，必须翻到 has_more=false 才算查完
             offset: 分页偏移量（默认 0）
             case_id_pattern: 兼容历史用例编号搜索参数
             level: 兼容级别过滤
@@ -258,13 +222,15 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             result_filter: 兼容执行结果过滤
         """
         try:
-            limit = min(max(limit, 1), 100)
-            items = tencent_sheet_manager.query_rows(
+            limit = min(max(int(limit), 1), 100)
+            offset = max(0, int(offset))
+            # Fetch one lookahead row so clients can tell whether another page exists.
+            fetched_items = tencent_sheet_manager.query_rows(
                 sheet_name=sheet_name,
                 keyword=keyword,
                 filters=filters,
                 id_pattern=id_pattern or case_id_pattern,
-                limit=limit,
+                limit=limit + 1,
                 offset=offset,
                 level=level,
                 module=module,
@@ -274,11 +240,37 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
                 result_filter=result_filter,
             )
             sheet_id, sheet_info = tencent_sheet_manager.resolve_sheet(sheet_name)
+            has_more = len(fetched_items) > limit
+            items = fetched_items[:limit]
+            next_offset = offset + len(items) if has_more else None
+            coverage = completeness_report(
+                scope={
+                    "kind": "sheet_query_page",
+                    "sheet_id": sheet_id,
+                    "offset": offset,
+                    "filters": {
+                        "keyword": keyword,
+                        "fields": filters,
+                        "id_pattern": id_pattern or case_id_pattern,
+                    },
+                },
+                returned_count=len(items),
+                total_count=None if has_more else len(items),
+                limit=limit,
+                truncated=has_more,
+                has_more=has_more,
+                reasons=["limit"] if has_more else [],
+            )
             return SheetQueryResult(
                 sheet_name=sheet_info.get("sheet_name", sheet_name or ""),
                 sheet_id=sheet_id,
                 count=len(items),
                 items=items,
+                limit=limit,
+                offset=offset,
+                has_more=has_more,
+                next_offset=next_offset,
+                coverage=coverage,
             )
         except TencentDocError as e:
             raise ToolError(f"检索表格行失败: {e}") from e
@@ -287,8 +279,14 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
 
     @mcp.tool(
         tags={"tencent_sheet", "tencent_docs"},
-        annotations={"title": "更新单行表格数据", "readOnlyHint": False},
+        annotations={
+            "title": "更新单行表格数据",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+        },
     )
+    @instrument_tool
     def tencent_sheet_update_row(
         sheet_name: str | None = None,
         row_id: str | None = None,
@@ -336,8 +334,14 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
 
     @mcp.tool(
         tags={"tencent_sheet", "tencent_docs"},
-        annotations={"title": "批量更新多行表格数据", "readOnlyHint": False},
+        annotations={
+            "title": "批量更新多行表格数据",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+        },
     )
+    @instrument_tool
     def tencent_sheet_batch_update(
         sheet_name: str | None = None,
         updates: list[dict[str, Any]] | None = None,
@@ -376,6 +380,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             "idempotentHint": False,
         },
     )
+    @instrument_tool
     def tencent_sheet_delete_rows(
         row_ids: list[str] | None = None,
         case_ids: list[str] | None = None,
@@ -386,19 +391,12 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
     ) -> SheetDimensionResult:
         """物理删除腾讯文档在线表格中的整行数据（官方 sheet.delete_dimension，不可撤销）。
 
-        与 tencent_sheet_batch_update 的本质区别：本工具**真正移除行结构**——被删行下方
-        的数据整体上移、子表总行数减少；后者只是把单元格内容改写/清空，行结构不变。
-        因此删除后行号会变化，涉及多行操作务必重新解析行号。
-
-        两种定位方式可单用也可混用，命中结果自动去重、行号越界值会被列入 not_found_indices：
-        - row_ids / case_ids：按主键列（默认「用例编号」，支持多别名）解析为行号；
-        - row_indices：直接给出 0-based 全表行号（含表头行，第 0 行即表头）。
-
-        安全约束：
-        1. 默认保护表头（allow_header=False 时第 0 行永不删除）；
-        2. 单次最多删除 200 行，超出请分批调用；
-        3. 删除按行号降序执行，避免删行导致行号漂移而误删；
-        4. 建议先 dry_run=True 预览命中范围，确认无误后再实际删除。
+        与 tencent_sheet_batch_update 的本质区别：本工具**真正移除行结构**（被删行下方
+        数据整体上移、总行数减少），后者只改写内容不动行结构；删除后行号会变化，
+        涉及多行操作务必重新解析行号。两种定位方式可单用也可混用，命中自动去重、
+        行号越界值列入 not_found_indices：row_ids/case_ids 按主键列解析为行号；
+        row_indices 直接给 0-based 全表行号（第 0 行即表头）。默认保护表头、单次最多
+        200 行、按行号降序执行防漂移误删；建议先 dry_run=True 预览。
 
         Args:
             row_ids: 主键/用例编号列表，如 ["APS_YJGL_0132", "APS_YJGL_0133"]
@@ -432,6 +430,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             "idempotentHint": False,
         },
     )
+    @instrument_tool
     def tencent_sheet_insert_rows(
         row_indices: list[int] | None = None,
         count: int = 1,
@@ -472,6 +471,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         tags={"tencent_sheet", "tencent_docs"},
         annotations={"title": "读取表格单元格切片", "readOnlyHint": True},
     )
+    @instrument_tool
     def tencent_sheet_read_cells(
         sheet_name: str | None = None,
         start_row: int = 0,
@@ -536,10 +536,12 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         else os.getenv("QA_AUTOMATION_ENABLE_TESTCASE_ALIASES", "false").lower() in ("true", "1")
     )
     if enable_testcase_aliases:
+
         @mcp.tool(
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "连接腾讯文档用例表格(兼容别名)", "readOnlyHint": False},
         )
+        @instrument_tool
         def testcase_connect(
             url_or_file_id: str | None = None,
             token: str | None = None,
@@ -551,6 +553,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "列出用例子表清单(兼容别名)", "readOnlyHint": True},
         )
+        @instrument_tool
         def testcase_list_sheets(
             url_or_file_id: str | None = None,
             token: str | None = None,
@@ -562,6 +565,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "获取单条测试用例详情(兼容别名)", "readOnlyHint": True},
         )
+        @instrument_tool
         def testcase_get(
             sheet_name: str | None = None,
             case_id: str | None = None,
@@ -582,6 +586,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "多维度检索测试用例(兼容别名)", "readOnlyHint": True},
         )
+        @instrument_tool
         def testcase_query(
             sheet_name: str | None = None,
             case_id_pattern: str | None = None,
@@ -616,6 +621,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "单条用例测试结果回写(兼容别名)", "readOnlyHint": False},
         )
+        @instrument_tool
         def testcase_update_result(
             sheet_name: str | None = None,
             case_id: str = "",
@@ -640,6 +646,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "批量回写测试结果(兼容别名)", "readOnlyHint": False},
         )
+        @instrument_tool
         def testcase_batch_update_results(
             sheet_name: str | None = None,
             updates: list[dict[str, Any]] | None = None,
@@ -654,6 +661,7 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             tags={"testcase", "tencent_docs", "compatibility"},
             annotations={"title": "读取表格原始单元格数据(兼容别名)", "readOnlyHint": True},
         )
+        @instrument_tool
         def testcase_read_cells(
             sheet_name: str | None = None,
             start_row: int = 0,
@@ -674,8 +682,11 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
     # 历史保留工具：update_test_case_result（保持既有测试与旧调用方 100% 契约兼容）
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
-    async def update_test_case_result(
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False}
+    )
+    @instrument_tool
+    def update_test_case_result(
         file_id: str,
         sheet_id: str,
         case_id: str,
@@ -694,211 +705,88 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             execution_date: 写入「执行时间」列的文本；省略时取当天，格式 YYYY/M/D，精确到日
         """
         clean_fid, _ = parse_file_id(file_id)
-        file_id = clean_fid or file_id
-        token = resolve_tencent_docs_token()
+        target_file = clean_fid or file_id
         if not execution_date:
             now = datetime.now()
             execution_date = f"{now.year}/{now.month}/{now.day}"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # 1. 获取表头以动态解析字段列
-            async def get_header() -> list[str]:
-                data = await _call_mcp_tool(
-                    client,
-                    "sheet.get_cell_data",
-                    {
-                        "file_id": file_id,
-                        "sheet_id": sheet_id,
-                        "start_row": 0,
-                        "end_row": 0,
-                        "start_col": 0,
-                        "end_col": 30,
-                        "return_csv": True,
-                    },
-                    token,
-                )
-                csv_data = data.get("csv_data", "")
-                reader = csv.reader(io.StringIO(csv_data))
-                return next(reader, [])
-
-            async def get_case_column() -> list[str]:
-                data = await _call_mcp_tool(
-                    client,
-                    "sheet.get_cell_data",
-                    {
-                        "file_id": file_id,
-                        "sheet_id": sheet_id,
-                        "start_row": 0,
-                        "end_row": 5000,
-                        "start_col": 0,
-                        "end_col": 0,
-                        "return_csv": True,
-                    },
-                    token,
-                )
-                csv_data = data.get("csv_data", "")
-                reader = csv.reader(io.StringIO(csv_data))
-                return [row[0].strip() if row else "" for row in reader]
-
-            try:
-                headers, case_rows = await asyncio.gather(get_header(), get_case_column())
-            except Exception as e:
-                err_str = str(e)
-                if "60871" in err_str or "grid range" in err_str:
-                    try:
-                        meta = await _call_mcp_tool(
-                            client,
-                            "sheet.get_sheet_info",
-                            {"file_id": file_id},
-                            token,
-                        )
-                        s_list = meta if isinstance(meta, list) else meta.get("sheets", [])
-                        row_cnt = 500
-                        for s in s_list:
-                            if s.get("sheet_id") == sheet_id:
-                                row_cnt = s.get("row_count") or 500
-                                break
-                        safe_end = max(0, row_cnt - 1)
-                        data = await _call_mcp_tool(
-                            client,
-                            "sheet.get_cell_data",
-                            {
-                                "file_id": file_id,
-                                "sheet_id": sheet_id,
-                                "start_row": 0,
-                                "end_row": safe_end,
-                                "start_col": 0,
-                                "end_col": 0,
-                                "return_csv": True,
-                            },
-                            token,
-                        )
-                        csv_data = data.get("csv_data", "")
-                        reader = csv.reader(io.StringIO(csv_data))
-                        case_rows = [row[0].strip() if row else "" for row in reader]
-                        headers = await get_header()
-                    except Exception as fallback_err:
-                        logger.exception("Failed fallback reading sheet")
-                        return {
-                            "status": "error",
-                            "file_id": file_id,
-                            "sheet_id": sheet_id,
-                            "case_id": case_id,
-                            "message": f"读取表格数据失败: {fallback_err}",
-                        }
-                else:
-                    logger.exception("Failed to read sheet metadata from Tencent Docs")
+        try:
+            # 连接/定位/回写全程持状态锁(与 list_sheets 同口径,防并发串文档)。
+            # 定位走 manager 的分块主键索引(60871 安全、写前行漂移校验),
+            # 回写走聚合提交引擎(自带 pacing 与 429 退避)——不再有独立 HTTP 路径。
+            with tencent_sheet_manager._state_lock:
+                if target_file != tencent_sheet_manager.active_file_id:
+                    tencent_sheet_manager.connect(url_or_file_id=target_file)
+                resolved_cols = tencent_sheet_manager.resolve_target_columns(sheet_id)
+                missing_cols = [
+                    label
+                    for canonical, label in (
+                        ("result", "测试结果/结果/状态"),
+                        ("executor", "执行人/测试人/负责人"),
+                        ("execute_time", "执行时间/测试时间/日期"),
+                    )
+                    if canonical not in resolved_cols
+                ]
+                if missing_cols:
                     return {
                         "status": "error",
-                        "file_id": file_id,
+                        "file_id": target_file,
                         "sheet_id": sheet_id,
                         "case_id": case_id,
-                        "message": f"读取表格数据失败: {e}",
+                        "message": (
+                            f"子表「{sheet_id}」表头未识别到字段列：{'、'.join(missing_cols)}。"
+                            "为避免把结果写进无关列（历史版本此处会静默回退到固定列号），"
+                            "请先修正表头，或改用 tencent_sheet_batch_update_rows 显式指定列名。"
+                        ),
                     }
-
-            # 2. 动态解析字段所在列索引（带基线回退机制）
-            case_col = 0
-            result_col = 10
-            executor_col = 11
-            time_col = 12
-
-            for idx, col_name in enumerate(headers):
-                name = col_name.strip()
-                if "用例编号" in name or "用例ID" in name:
-                    case_col = idx
-                elif "测试结果" in name or "执行结果" in name or "结果" in name or "状态" in name:
-                    result_col = idx
-                elif "执行人" in name or "测试人" in name or "负责人" in name:
-                    executor_col = idx
-                elif "执行时间" in name or "测试时间" in name or "日期" in name:
-                    time_col = idx
-
-            # 3. 定位目标用例所在行
-            clean_case_id = case_id.strip()
-            if clean_case_id not in case_rows:
-                return {
-                    "status": "error",
-                    "file_id": file_id,
-                    "sheet_id": sheet_id,
-                    "case_id": case_id,
-                    "message": f"未在子表「{sheet_id}」的首列中找到用例编号「{case_id}」",
-                }
-
-            target_row = case_rows.index(clean_case_id)
-
-            # 4. 批量更新单元格数值
-            values = [
-                {
-                    "row": target_row,
-                    "col": result_col,
-                    "value_type": "STRING",
-                    "string_value": test_result,
-                },
-                {
-                    "row": target_row,
-                    "col": executor_col,
-                    "value_type": "STRING",
-                    "string_value": executor,
-                },
-                {
-                    "row": target_row,
-                    "col": time_col,
-                    "value_type": "STRING",
-                    "string_value": execution_date,
-                },
-            ]
-
-            try:
-                update_res = await _call_mcp_tool(
-                    client,
-                    "sheet.set_range_value",
-                    {
-                        "file_id": file_id,
-                        "sheet_id": sheet_id,
-                        "values": values,
-                    },
-                    token,
+                detail = tencent_sheet_manager.get_row(sheet_name=sheet_id, row_id=case_id)
+                tencent_sheet_manager.update_row(
+                    sheet_name=sheet_id,
+                    row_id=case_id,
+                    result=test_result,
+                    executor=executor,
+                    execute_time=execution_date,
                 )
-                if update_res.get("error"):
-                    return {
-                        "status": "error",
-                        "file_id": file_id,
-                        "sheet_id": sheet_id,
-                        "case_id": case_id,
-                        "message": f"写入单元格失败: {update_res['error']}",
-                    }
-            except Exception as e:
-                logger.exception("Failed to update cells in Tencent Docs")
-                return {
-                    "status": "error",
-                    "file_id": file_id,
-                    "sheet_id": sheet_id,
-                    "case_id": case_id,
-                    "message": f"提交更新失败: {e}",
-                }
-
+            row_number = int(detail.get("row_index") or 0)
             return {
                 "status": "ok",
-                "file_id": file_id,
+                "file_id": target_file,
                 "sheet_id": sheet_id,
                 "case_id": case_id,
-                "row_index": target_row,
-                "row_number": target_row + 1,
+                "row_index": row_number - 1 if row_number > 0 else None,
+                "row_number": row_number or None,
                 "updated_fields": {
                     "测试结果": test_result,
                     "执行人": executor,
                     "执行时间": execution_date,
                 },
                 "columns_resolved": {
-                    "用例编号": case_col,
-                    "测试结果": result_col,
-                    "执行人": executor_col,
-                    "执行时间": time_col,
+                    "用例编号": resolved_cols.get("id"),
+                    "测试结果": resolved_cols.get("result"),
+                    "执行人": resolved_cols.get("executor"),
+                    "执行时间": resolved_cols.get("execute_time"),
                 },
                 "message": (
-                    f"用例「{case_id}」(第 {target_row + 1} 行) 更新成功："
+                    f"用例「{case_id}」(第 {row_number} 行) 更新成功："
                     f"测试结果={test_result}，执行人={executor}，执行时间={execution_date}"
                 ),
+            }
+        except TencentDocError as e:
+            logger.warning("update_test_case_result failed for case %s: %s", case_id, e)
+            return {
+                "status": "error",
+                "file_id": target_file,
+                "sheet_id": sheet_id,
+                "case_id": case_id,
+                "message": str(e),
+            }
+        except Exception as e:
+            logger.exception("update_test_case_result unexpected failure")
+            return {
+                "status": "error",
+                "file_id": target_file,
+                "sheet_id": sheet_id,
+                "case_id": case_id,
+                "message": f"提交更新失败: {e}",
             }
 
     return mcp

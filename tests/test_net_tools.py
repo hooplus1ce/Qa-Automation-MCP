@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from qa_automation.net import (
     BODY_LIMIT,
@@ -11,6 +12,7 @@ from qa_automation.net import (
     PageNetworkListener,
     _truncate_body,
     _truncate_text,
+    net_listen_snapshot,
 )
 
 
@@ -59,36 +61,65 @@ class NetToolsTests(unittest.TestCase):
 
         # 匹配
         self.assertTrue(
-            listener._matches_filter(
-                "https://example.com/api/v1/users", "POST", "fetch"
-            )
+            listener._matches_filter("https://example.com/api/v1/users", "POST", "fetch")
         )
         self.assertTrue(
-            listener._matches_filter(
-                "https://example.com/orders/create", "PUT", "fetch"
-            )
+            listener._matches_filter("https://example.com/orders/create", "PUT", "fetch")
         )
 
         # 方法不匹配
         self.assertFalse(
-            listener._matches_filter(
-                "https://example.com/api/v1/users", "GET", "fetch"
-            )
+            listener._matches_filter("https://example.com/api/v1/users", "GET", "fetch")
         )
 
         # 资源类型不匹配
         self.assertFalse(
-            listener._matches_filter(
-                "https://example.com/api/v1/users", "POST", "document"
-            )
+            listener._matches_filter("https://example.com/api/v1/users", "POST", "document")
         )
 
         # URL 不匹配
         self.assertFalse(
-            listener._matches_filter(
-                "https://example.com/other/path", "POST", "fetch"
-            )
+            listener._matches_filter("https://example.com/other/path", "POST", "fetch")
         )
+
+
+class NetworkSnapshotCompletenessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_uses_lookahead_and_reports_more_packets(self) -> None:
+        packets = [
+            SimpleNamespace(url=f"https://example.test/{i}", to_dict=lambda i=i: {"id": i})
+            for i in range(3)
+        ]
+        listener = SimpleNamespace(packets=packets)
+        with (
+            patch("qa_automation.net.current_page", new=AsyncMock(return_value=object())),
+            patch("qa_automation.net.get_or_create_listener", new=AsyncMock(return_value=listener)),
+        ):
+            first = await net_listen_snapshot(limit=1)
+            second = await net_listen_snapshot(limit=1, offset=1)
+
+        self.assertEqual(first["matched_count"], 1)
+        self.assertEqual(first["packets"], [{"id": 2}])
+        self.assertTrue(first["has_more"])
+        self.assertEqual(first["next_offset"], 1)
+        self.assertFalse(first["coverage"]["complete_for_scope"])
+        self.assertEqual(second["packets"], [{"id": 1}])
+        self.assertTrue(second["has_more"])
+        self.assertEqual(second["next_offset"], 2)
+
+    async def test_snapshot_reports_complete_when_queue_is_exhausted(self) -> None:
+        listener = SimpleNamespace(
+            packets=[SimpleNamespace(url="https://example.test/1", to_dict=lambda: {"id": 1})]
+        )
+        with (
+            patch("qa_automation.net.current_page", new=AsyncMock(return_value=object())),
+            patch("qa_automation.net.get_or_create_listener", new=AsyncMock(return_value=listener)),
+        ):
+            result = await net_listen_snapshot(limit=20)
+
+        self.assertFalse(result["has_more"])
+        self.assertEqual(result["total_count"], 1)
+        self.assertIsNone(result["next_offset"])
+        self.assertTrue(result["coverage"]["complete_for_scope"])
 
 
 if __name__ == "__main__":

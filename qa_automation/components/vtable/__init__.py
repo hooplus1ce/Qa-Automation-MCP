@@ -16,6 +16,7 @@ from ...browser import (
     _page_id,
     _page_viewport_size,
 )
+from ...completeness import completeness_report
 from ...config import (
     OVERLAY_RESULT_LIMIT,
     OVERLAY_SETTLE_LIMIT_MS,
@@ -24,6 +25,10 @@ from ...config import (
 )
 from ...mouse import _ensure_cursor_helper, _smooth_mouse_move_to, _stable_viewport_click
 from ...workspace import resolve_workspace_path
+from .autofit import (
+    _autofit_columns_impl,
+    autofit_columns,
+)
 from .binding import (
     _resolve_vtable_cell_impl,
     _wrap,
@@ -39,6 +44,12 @@ from .binding import (
 from .binding import (
     resolve_vtable_cell as resolve_vtable_cell,  # 有意再导出
 )
+from .column_ops import (
+    _reorder_column_impl,
+    _resize_column_impl,
+    reorder_column,
+    resize_column,
+)
 from .scripts import (
     CELL_RELATIVE_LOC,
     CLASSIFY_CELL,
@@ -53,7 +64,6 @@ from .verification import (
 )
 
 _MAX_READ_CELLS = 2_000
-
 
 
 async def _trusted_viewport_click(
@@ -150,7 +160,8 @@ async def _do_click(
     if result["status"] == "failed":
         return result
     try:
-        await frame.evaluate(_wrap(WAIT_RENDER))
+        # rAF 在后台/隐藏 tab 停摆时 promise 永不 resolve，必须加上界防挂死
+        await asyncio.wait_for(frame.evaluate(_wrap(WAIT_RENDER)), timeout=2.0)
         return result
     except Exception as e:
         return {"status": "failed", "reason": f"click-error: {e}"}
@@ -237,13 +248,10 @@ async def _click_cell_impl(
             _release_overlay_frame_listener,
             _stop_overlay_observers_best_effort,
         )
+
         try:
-            frame_listener, _ = await _acquire_overlay_frame_listener(
-                page, persistent=False
-            )
-            await _arm_overlay_init_script(
-                page, settle_ms=settle_ms, persistent=False
-            )
+            frame_listener, _ = await _acquire_overlay_frame_listener(page, persistent=False)
+            await _arm_overlay_init_script(page, settle_ms=settle_ms, persistent=False)
             installed = await _install_overlay_observers(page, reset=True)
             await frame_listener.wait_pending()
             frame_listener.take_buffers()
@@ -251,9 +259,7 @@ async def _click_cell_impl(
         except Exception as exc:
             cleanup_errors = await _stop_overlay_observers_best_effort(page)
             cleanup_errors.extend(
-                await _release_overlay_frame_listener(
-                    page, frame_listener, persistent=False
-                )
+                await _release_overlay_frame_listener(page, frame_listener, persistent=False)
             )
             return {
                 "status": "failed",
@@ -334,6 +340,7 @@ async def _click_cell_impl(
     finally:
         if observe_after:
             from ...overlay import _finalize_overlay_observation
+
             await _finalize_overlay_observation(
                 page, installed, response, settle_ms=settle_ms, max_results=max_results
             )
@@ -362,15 +369,14 @@ async def _click_cell_impl(
         before_state["screenshot_digest"] = before_screenshot.get("digest")
 
     from ...interaction.contract import _interaction_contract
+
     return _interaction_contract(
         response,
         action="dblclick" if double_click else "click",
         target={"kind": "vtable-cell", "col": col, "row": row},
         before_state=before_state,
         after_state={
-            "scenegraph_paints": (verification.get("scenegraph") or {}).get(
-                "after_paints", []
-            ),
+            "scenegraph_paints": (verification.get("scenegraph") or {}).get("after_paints", []),
             "visible_overlay_count": len(response.get("visible_overlays") or []),
         },
         evidence=proof,
@@ -500,6 +506,54 @@ async def cell_info(
         )
 
 
+async def _click_vtable_cell_by_field_impl(
+    field: str,
+    record_index: int | list[int],
+    *,
+    double_click: bool = False,
+    button: str = "left",
+    verify: bool = True,
+    observe_after: bool = False,
+    settle_ms: int = 300,
+    max_results: int = OVERLAY_RESULT_LIMIT,
+    frame: str | None = None,
+    table_index: int | None = None,
+) -> dict:
+    """Unlocked field-addressed cell click; callers must already hold ``_action_lock``."""
+    resolved = await _resolve_vtable_cell_impl(
+        field,
+        record_index,
+        frame=frame,
+        table_index=table_index,
+    )
+    if resolved.get("status") != "ok":
+        return resolved
+    address = resolved["address"]
+    result = await _click_cell_impl(
+        int(address["col"]),
+        int(address["row"]),
+        double_click=double_click,
+        button=button,
+        verify=verify,
+        observe_after=observe_after,
+        settle_ms=settle_ms,
+        max_results=max_results,
+        frame_name=frame,
+        table_index=table_index,
+    )
+    result["target"] = {
+        "field": field,
+        "record_index": record_index,
+        "col": int(address["col"]),
+        "row": int(address["row"]),
+        "resolved_by": resolved.get("resolved_by"),
+        "table_index": table_index,
+    }
+    if result.get("interaction"):
+        result["interaction"]["target"].update(result["target"])
+    return result
+
+
 async def click_vtable_cell_by_field(
     field: str,
     record_index: int | list[int],
@@ -515,49 +569,26 @@ async def click_vtable_cell_by_field(
 ) -> dict:
     """Resolve a business field/record through VTable APIs, then trusted-click it."""
     async with _action_lock:
-        resolved = await _resolve_vtable_cell_impl(
+        return await _click_vtable_cell_by_field_impl(
             field,
             record_index,
-            frame=frame,
-            table_index=table_index,
-        )
-        if resolved.get("status") != "ok":
-            return resolved
-        address = resolved["address"]
-        result = await _click_cell_impl(
-            int(address["col"]),
-            int(address["row"]),
             double_click=double_click,
             button=button,
             verify=verify,
             observe_after=observe_after,
             settle_ms=settle_ms,
             max_results=max_results,
-            frame_name=frame,
+            frame=frame,
             table_index=table_index,
         )
-        result["target"] = {
-            "field": field,
-            "record_index": record_index,
-            "col": int(address["col"]),
-            "row": int(address["row"]),
-            "resolved_by": resolved.get("resolved_by"),
-            "table_index": table_index,
-        }
-        if result.get("interaction"):
-            result["interaction"]["target"].update(result["target"])
-        return result
+
 
 async def _table_meta_impl(
     frame: str | None = None,
     table_index: int | None = None,
 ) -> dict:
     page = await _current_page_impl()
-    frame_obj = (
-        await resolve_frame(page, frame)
-        if frame is not None
-        else await vtable_frame(page)
-    )
+    frame_obj = await resolve_frame(page, frame) if frame is not None else await vtable_frame(page)
     try:
         await ensure_vtable(frame_obj, table_index)
     except Exception as e:
@@ -584,6 +615,7 @@ async def table_meta(
     async with _action_lock:
         return await _table_meta_impl(frame=frame, table_index=table_index)
 
+
 async def _cells_read_impl(
     col0: int,
     row0: int,
@@ -603,11 +635,7 @@ async def _cells_read_impl(
             "read a smaller range and paginate."
         )
     page = await _current_page_impl()
-    frame_obj = (
-        await resolve_frame(page, frame)
-        if frame is not None
-        else await vtable_frame(page)
-    )
+    frame_obj = await resolve_frame(page, frame) if frame is not None else await vtable_frame(page)
     try:
         await ensure_vtable(frame_obj, table_index)
     except Exception as e:
@@ -621,16 +649,37 @@ async def _cells_read_impl(
         _wrap4(READ_CELLS),
         [col0, row0, col1, row1],
     )
+    values = (result or {}).get("values", [])
+    returned_cells = sum(len(row) for row in values if isinstance(row, list))
+    truncated = returned_cells < requested_cells
+    normalized_range = {
+        "col0": min(col0, col1),
+        "row0": min(row0, row1),
+        "col1": max(col0, col1),
+        "row1": max(row0, row1),
+    }
     return {
         "status": "ok",
         "page_id": _page_id(page),
         "frame": await _frame_context_details(page, frame_obj),
         "table_index": table_index,
         "range": result,
-        "rows": len((result or {}).get("values", [])),
-        "cells": requested_cells,
+        "requested_range": normalized_range,
+        "rows": len(values),
+        "cells": returned_cells,
+        "requested_cells": requested_cells,
         "limit": _MAX_READ_CELLS,
-        "truncated": False,
+        "truncated": truncated,
+        "coverage": completeness_report(
+            scope={"kind": "vtable_cell_range", "table_index": table_index, **normalized_range},
+            returned_count=returned_cells,
+            total_count=requested_cells,
+            limit=_MAX_READ_CELLS,
+            truncated=truncated,
+            has_more=truncated,
+            reasons=["range_read_incomplete"] if truncated else [],
+            unit="cells",
+        ),
     }
 
 
@@ -665,8 +714,7 @@ async def _drop_files_impl(
     if not files:
         raise ValueError("files must contain at least one workspace file")
     resolved_files = [
-        str(resolve_workspace_path(path, must_exist=True, require_file=True))
-        for path in files
+        str(resolve_workspace_path(path, must_exist=True, require_file=True)) for path in files
     ]
     page = await _current_page_impl()
     frame = (
@@ -702,8 +750,20 @@ async def _drop_files_impl(
             "col": col,
             "row": row,
         }
-    x = (rel.get("left", 0) + rel.get("right", 0)) / 2
-    y = (rel.get("top", 0) + rel.get("bottom", 0)) / 2
+    # CELL_RELATIVE_LOC 返回的已是相对 canvas 的中心点 {x, y}；left/right 等
+    # 四角字段仅是 JS 侧对旧 rect 命名风格的兼容兜底，不能在此直接求中点。
+    raw_x = rel.get("x") if "x" in rel else (rel.get("left", 0) + rel.get("right", 0)) / 2
+    raw_y = rel.get("y") if "y" in rel else (rel.get("top", 0) + rel.get("bottom", 0)) / 2
+    try:
+        x, y = float(raw_x), float(raw_y)
+    except (TypeError, ValueError):
+        return {
+            "status": "failed",
+            "reason": f"cell-relative-rect-malformed: {rel!r}",
+            "page_id": _page_id(page),
+            "col": col,
+            "row": row,
+        }
     locator = frame.locator(".vtable canvas").first
     if not await locator.count():
         locator = frame.locator(".vtable").first
@@ -718,6 +778,7 @@ async def _drop_files_impl(
         "files": resolved_files,
         "position": {"x": x, "y": y},
     }
+
 
 async def drop_files(
     col: int,
@@ -737,4 +798,3 @@ async def drop_files(
             frame_name=frame,
             table_index=table_index,
         )
-

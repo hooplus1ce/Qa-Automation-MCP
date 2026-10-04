@@ -345,7 +345,8 @@ async def ensure_cell_visible(page: Page, frame: Frame, col: int, row: int) -> b
     deadline = time.monotonic() + 0.35
     while time.monotonic() < deadline:
         for _ in range(SCROLL_WAIT_RAF):
-            await frame.evaluate(_wrap(WAIT_RENDER))
+            # rAF 在后台/隐藏 tab 停摆时 promise 永不 resolve，必须加上界防挂死
+            await asyncio.wait_for(frame.evaluate(_wrap(WAIT_RENDER)), timeout=2.0)
         if await cell_visible(frame, col, row):
             return True
         await asyncio.sleep(0.03)

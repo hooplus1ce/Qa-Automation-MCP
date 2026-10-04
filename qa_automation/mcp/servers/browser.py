@@ -14,7 +14,9 @@ from ..metrics import instrument_tool
 def create_server() -> FastMCP:
     mcp = FastMCP("Browser Lifecycle")
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False},
+    )
     @instrument_tool
     async def browser_open(url: str, headless: bool = True) -> dict:
         """打开 Playwright 浏览器并导航到目标页面(后续工具复用同一浏览器)。
@@ -25,7 +27,9 @@ def create_server() -> FastMCP:
         """
         return await automation.open_url(url, headless=headless)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
+    )
     @instrument_tool
     async def browser_start(
         port: int = 9222,
@@ -51,7 +55,9 @@ def create_server() -> FastMCP:
             timeout_ms=timeout_ms,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
+    )
     @instrument_tool
     async def browser_connect(cdp_url: str | None = None, port: int = 9222) -> dict:
         """经 CDP 连接一个已运行的浏览器，默认连接 9222 端口。
@@ -69,7 +75,9 @@ def create_server() -> FastMCP:
         """
         return await automation.connect_browser(cdp_url, port=port)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False},
+    )
     @instrument_tool
     async def browser_session(
         action: Literal["list", "create", "select", "save", "close", "reset_viewport"] = "list",
@@ -92,13 +100,17 @@ def create_server() -> FastMCP:
             storage_state_path=storage_state_path,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def browser_pages() -> dict:
         """列出所有 BrowserContext 的标签页及稳定 page_id，并标记当前选中页。"""
         return await automation.list_pages()
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
+    )
     @instrument_tool
     async def browser_select_page(page_id: str) -> dict:
         """显式选中一个 page_id；后续页面、iframe、浮层和 VTable 工具固定使用该页。
@@ -108,7 +120,9 @@ def create_server() -> FastMCP:
         """
         return await automation.select_page(page_id)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
+    )
     @instrument_tool
     async def browser_reset_viewport() -> dict:
         """重置浏览器视口为全屏自然视口并清除任何残留的 CDP 设备模拟。
@@ -119,7 +133,9 @@ def create_server() -> FastMCP:
         """
         return await automation.reset_viewport()
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": True},
+    )
     @instrument_tool
     async def browser_close() -> dict:
         """关闭 Playwright 浏览器,释放资源。
@@ -128,7 +144,9 @@ def create_server() -> FastMCP:
         """
         return await automation.close_browser()
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def browser_login(
         username: str | None = None,
@@ -141,17 +159,16 @@ def create_server() -> FastMCP:
     ) -> dict:
         """登录 / 恢复 / 切换 APS 账号会话的统一入口（账号档案 + 登录态缓存 + 验证码两段式）。
 
-        支持在当前页面直接原地切换账号（自动清空旧会话并注入新账号 Cookie 刷新后台，无需在页面内点击退出登录）。
-        凭据解析优先级：显式传参 > 账号档案（profiles.toml，支持按 profile 档案名、username 或 role 角色关键词匹配）> 环境变量
-        QA_AUTOMATION_LOGIN_USER / QA_AUTOMATION_LOGIN_PASSWORD / QA_AUTOMATION_APS_URL。
-        三者都缺或传入未知 profile 时返回可用档案列表（含角色说明），不回退到内置口令。
+        支持在当前页面直接原地切换账号（自动清空旧会话并注入新 Cookie，无需手动退出登录）。
+        凭据解析优先级：显式传参 > 账号档案（profiles.toml，按档案名/username/role 关键词匹配）
+        > 环境变量。三者都缺或传入未知 profile 时返回可用档案列表，不回退到内置口令。
 
         典型用法：
-          - 免参登录/恢复：browser_login()                     # 用默认档案，命中缓存则秒级恢复
-          - 原地切换账号：  browser_login(profile="<档案名或角色名>") # 直接切换当前页登录账号（如超管/系统管理员/权限测试）
-          - 强制重新登录：  browser_login(profile="<档案名>", force=True) # 忽略缓存重新调接口获取新 Token
-          - 验证码两段式：  先 browser_login(profile=...) 拿到验证码图片，
-                            识别后 browser_login(profile=..., captcha="1234") 完成登录
+          - 免参登录/恢复：browser_login()                     # 默认档案，命中缓存秒级恢复
+          - 原地切换账号：  browser_login(profile="<档案名或角色名>")
+          - 强制重新登录：  browser_login(profile=..., force=True)  # 忽略缓存取新 Token
+          - 验证码两段式：  先 browser_login(profile=...) 拿验证码图片，
+                            识别后 browser_login(profile=..., captcha="1234")
 
         Args:
             username: 登录账号；显式传入时优先于账号档案与环境变量
@@ -172,7 +189,9 @@ def create_server() -> FastMCP:
             max_retries=max_retries,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def browser_inject_cookies(
         cookies: list[dict] | None = None,
@@ -198,7 +217,15 @@ def create_server() -> FastMCP:
             domain=domain,
         )
 
-    @mcp.tool(name="run_js")
+    @mcp.tool(
+        name="run_js",
+        annotations={
+            "read_only_hint": False,
+            "destructive_hint": True,
+            "idempotent_hint": False,
+            "open_world_hint": True,
+        },
+    )
     @instrument_tool
     async def run_js(
         script: str,
@@ -208,10 +235,10 @@ def create_server() -> FastMCP:
     ) -> Any:
         """【受限逃生通道】在浏览器当前页面或指定 frame 中执行 JavaScript 脚本并返回结果。
 
-        ⚠️【AI 强制行为准则与调用约束】⚠️
-        1. 严禁主动调用：除非人类用户在提示词中显式、明确指令要求执行 JS（例如：“请用 run_js 执行...”、“执行一段 JS 脚本...”），否则 AI 严禁擅自调用本工具！
-        2. 常规自动化严禁替代：常规点击、输入、下拉选择、表格数据读取、弹层断言等，必须使用专属高阶工具（ui_click / ui_interact / antd_select / vtable_cell_click / wait_message 等），严禁擅自手写 querySelector/click 脚本替代。
-        3. 适用场景：仅用于用户明确要求的底层调试、读取特殊的全局内存变量（如 window.__store__）、或极端自定义控件的逃生操作。
+        除非人类用户在提示词中显式、明确要求执行 JS，严禁主动调用本工具；常规点击/输入/选择/
+        表格读取/弹层断言必须用专属高阶工具，严禁手写 querySelector/click 脚本替代。
+        仅适用于用户明确要求的底层调试、读取特殊全局内存变量（如 window.__store__）、
+        或极端自定义控件的逃生操作。
 
         Args:
             script: 要执行的 JavaScript 代码。支持表达式（如 'window.innerWidth'）、异步函数或包含 return 的代码块
@@ -224,6 +251,78 @@ def create_server() -> FastMCP:
             arg=arg,
             frame=frame,
             timeout_ms=timeout_ms,
+        )
+
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False},
+    )
+    @instrument_tool
+    async def browser_upload_file(
+        files: list[str],
+        css: str | None = None,
+        xpath: str | None = None,
+        text: str | None = None,
+        role: str | None = None,
+        name: str | None = None,
+        frame: str | None = None,
+        timeout_ms: int = 10_000,
+    ) -> dict:
+        """点击触发元素上传工作区文件，或直接为页面里的 <input type=file> 赋值。
+
+        两种模式（二选一）：
+          - 传入触发元素定位（css/xpath/text/role 任意一种）→ 点击该元素，用
+            Playwright expect_file_chooser 截获"选择文件"系统对话框并注入文件；
+            适配"点击按钮弹出文件选择框"的常见上传交互，iframe 内控件亦可。
+          - 全部省略 → 在目标 frame（默认激活业务 iframe → 顶层文档）自动查找
+            input[type=file] 直接 set_input_files，隐藏 input 也能赋值。
+
+        Args:
+            files: 待上传文件路径列表；相对路径按使用方工作区根解析，不得越出工作区
+            css: 触发元素 CSS 选择器（优先级最高；也用于直接定位 input[type=file]）
+            xpath: 触发元素 XPath 表达式（不带 xpath= 前缀）
+            text: 触发元素可见文本（精确匹配，如 "选择文件"、"导 入"）
+            role: 触发元素 ARIA 角色（与 name 配对使用，如 button）
+            name: 与 role 配对的无障碍名
+            frame: 目标 frame：省略=激活业务 iframe 优先；可传 main/top/active 或 frame_id
+            timeout_ms: 点击/等待文件选择框/赋值的整体超时毫秒数（默认 10000）
+        """
+        return await automation.upload_files(
+            files,
+            css=css,
+            xpath=xpath,
+            text=text,
+            role=role,
+            name=name,
+            frame=frame,
+            timeout_ms=timeout_ms,
+        )
+
+    @mcp.tool(
+        annotations={"read_only_hint": True, "destructive_hint": False, "idempotent_hint": False},
+    )
+    @instrument_tool
+    async def browser_wait_download(
+        timeout_ms: int = 30_000,
+        filename_contains: str | None = None,
+        include_recent_seconds: int = 60,
+    ) -> dict:
+        """等待下载文件写完并返回其在工作区产物目录中的路径。
+
+        页面触发的下载会由监听器/CDP 自动保存到工作区 downloads 目录；本工具
+        轮询该目录，判定"连续两次扫描文件大小与修改时间未再变化"即认为写完。
+        典型用法：先点击导出/下载按钮，再调用本工具拿文件路径交给后续工具。
+        超时不会抛错，返回 status=timeout 与当前目录快照便于排查。
+
+        Args:
+            timeout_ms: 最长等待毫秒数（默认 30000）
+            filename_contains: 文件名过滤子串（不区分大小写），如 "xlsx"、"对账单"
+            include_recent_seconds: 把最近 N 秒内已写完的文件也纳入候选（默认 60），
+                覆盖"下载在调用本工具前已完成"的场景；0 表示只等调用之后新出现的文件
+        """
+        return await automation.wait_download(
+            timeout_ms=timeout_ms,
+            filename_contains=filename_contains,
+            include_recent_seconds=include_recent_seconds,
         )
 
     return mcp

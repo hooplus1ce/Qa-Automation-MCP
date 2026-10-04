@@ -33,6 +33,7 @@ from .browser import (
     _session_summary,
     _start_browser_impl,
     _state,
+    _wait_download_impl,
     _wait_for_cdp,
     browser_login,
     browser_session,
@@ -48,19 +49,27 @@ from .browser import (
     select_page,
     set_page_preference_probe,
     start_browser,
+    wait_download,
 )
 from .components.vtable import (
+    _autofit_columns_impl,
     _cells_read_impl,
     _click_cell_impl,
+    _click_vtable_cell_by_field_impl,
     _do_click,
     _drop_files_impl,
+    _reorder_column_impl,
+    _resize_column_impl,
     _table_meta_impl,
     _trusted_viewport_click,
+    autofit_columns,
     cell_info,
     cells_read,
     click_cell,
     click_vtable_cell_by_field,
     drop_files,
+    reorder_column,
+    resize_column,
     table_meta,
 )
 from .components.vtable.analysis import (
@@ -137,10 +146,13 @@ from .config import (
 from .interaction import (
     _click_dom_impl,
     _dom_interact_impl,
+    _mouse_drag_session_impl,
     _perform_dom_action,
+    _upload_files_impl,
     click_dom,
     dom_interact,
     mouse_drag,
+    upload_files,
 )
 from .interaction.contract import _interaction_contract
 from .interaction.locator import (
@@ -282,6 +294,8 @@ __all__ = [
     "reset_viewport",
     "inject_cookies",
     "run_js",
+    "upload_files",
+    "wait_download",
     "vtable_frame",
     "active_application_frame",
     "resolve_frame",
@@ -296,6 +310,9 @@ __all__ = [
     "drop_files",
     "vtable_analysis",
     "discover_vtables",
+    "reorder_column",
+    "resize_column",
+    "autofit_columns",
     # DOM Interaction
     "click_dom",
     "click_dom_and_observe",

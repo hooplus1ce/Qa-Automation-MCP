@@ -49,7 +49,9 @@ async def _force_maximize(page) -> None:
     await _set_window_state(page, "maximized")
 
 
+@pytest.mark.browser
 @pytest.mark.skipif(not LIVE, reason="需要 QA_AUTOMATION_LIVE_CDP=1 与在线 CDP 浏览器")
+@unittest.skipUnless(LIVE, "需要 QA_AUTOMATION_LIVE_CDP=1 与在线 CDP 浏览器")
 class LiveViewportGuardTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         from playwright.async_api import async_playwright

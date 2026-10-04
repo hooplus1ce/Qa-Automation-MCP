@@ -13,7 +13,10 @@ from ..metrics import instrument_tool
 def create_server() -> FastMCP:
     mcp = FastMCP("Network Monitoring")
 
-    @mcp.tool(name="net_listen_start")
+    @mcp.tool(
+        name="net_listen_start",
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False},
+    )
     @instrument_tool
     async def net_listen_start(
         urls: list[str] | str | None = None,
@@ -38,7 +41,10 @@ def create_server() -> FastMCP:
             clear_queue=clear_queue,
         )
 
-    @mcp.tool(name="net_listen_wait")
+    @mcp.tool(
+        name="net_listen_wait",
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def net_listen_wait(
         pattern: str | None = None,
@@ -63,7 +69,10 @@ def create_server() -> FastMCP:
             drain=drain,
         )
 
-    @mcp.tool(name="net_listen_wait_silent")
+    @mcp.tool(
+        name="net_listen_wait_silent",
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def net_listen_wait_silent(
         timeout: float = 5.0,
@@ -80,24 +89,33 @@ def create_server() -> FastMCP:
             min_silent_ms=min_silent_ms,
         )
 
-    @mcp.tool(name="net_listen_snapshot")
+    @mcp.tool(
+        name="net_listen_snapshot",
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def net_listen_snapshot(
         pattern: str | None = None,
         limit: int = 20,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """获取当前已捕获网络数据包的只读快照列表（不阻塞、不出队）。
 
         Args:
             pattern: URL 正则或关键字过滤
-            limit: 最多返回的最新数据包数量（默认 20）
+            limit: 每页最多返回的数据包数量（默认 20，最大 500）
+            offset: 匹配包的分页偏移量（默认 0）；按 newest_first 顺序读取，结果返回 next_offset
         """
         return await net_ops.net_listen_snapshot(
             pattern=pattern,
             limit=limit,
+            offset=offset,
         )
 
-    @mcp.tool(name="net_listen_stop")
+    @mcp.tool(
+        name="net_listen_stop",
+        annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
+    )
     @instrument_tool
     async def net_listen_stop() -> dict[str, Any]:
         """停止当前页面的网络请求监听器并释放事件资源。"""

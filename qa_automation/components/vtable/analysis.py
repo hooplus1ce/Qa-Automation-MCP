@@ -136,6 +136,7 @@ def _analysis_layout_signature(
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
 
+
 def _remember_analysis(
     *,
     page_id: str,
@@ -185,9 +186,7 @@ async def _vtable_analysis_impl(
     page = await _current_page_impl()
     try:
         frame_obj = (
-            await resolve_frame(page, frame)
-            if frame is not None
-            else await vtable_frame(page)
+            await resolve_frame(page, frame) if frame is not None else await vtable_frame(page)
         )
         tables = await _vtable_directory(page, frame_obj)
         frame_details = await _frame_context_details(page, frame_obj)
@@ -207,9 +206,7 @@ async def _vtable_analysis_impl(
 
     selected: dict[str, Any] | None = None
     if table_index is not None:
-        selected = next(
-            (item for item in tables if item["table_index"] == int(table_index)), None
-        )
+        selected = next((item for item in tables if item["table_index"] == int(table_index)), None)
         if selected is None:
             return {
                 "status": "failed",
@@ -250,7 +247,11 @@ async def _vtable_analysis_impl(
         frame_offset = await _frame_page_offset(page, frame_obj)
         viewport = await _page_viewport_size(page)
     except Exception as exc:
-        return {"status": "failed", "page_id": _page_id(page), "reason": f"vtable-analysis-error: {exc}"}
+        return {
+            "status": "failed",
+            "page_id": _page_id(page),
+            "reason": f"vtable-analysis-error: {exc}",
+        }
 
     def converted(geometry: Any, source: str) -> dict[str, Any] | None:
         return _analysis_geometry(
@@ -274,6 +275,9 @@ async def _vtable_analysis_impl(
         if not isinstance(raw_column, dict):
             continue
         header: list[dict[str, Any]] = []
+        header_text_geom = None
+        separator_geom = None
+        header_icons: list[dict[str, Any]] = []
         for raw_header in raw_column.get("header") or []:
             if not isinstance(raw_header, dict):
                 continue
@@ -290,12 +294,37 @@ async def _vtable_analysis_impl(
                 if normalized_mode == "full":
                     icon["evidence"] = raw_icon.get("evidence") or []
                 icons.append(icon)
-            item: dict[str, Any] = {"row": raw_header.get("row"), "icons": icons}
-            if normalized_mode == "full":
-                item["geometry"] = converted(raw_header.get("geometry"), "VTable.getCellRelativeRect")
-            if icons or normalized_mode == "full":
-                header.append(item)
+                header_icons.append(icon)
 
+            raw_text = raw_header.get("text")
+            conv_text = None
+            if raw_text:
+                conv_text = converted(raw_text, "vtable-scenegraph.text")
+                if conv_text:
+                    header_text_geom = conv_text
+
+            raw_sep = raw_header.get("separator")
+            conv_sep = None
+            if raw_sep:
+                conv_sep = converted(raw_sep, "VTable.columnSeparator")
+                if conv_sep:
+                    conv_sep["draggable"] = bool(raw_sep.get("draggable", True))
+                    separator_geom = conv_sep
+
+            item: dict[str, Any] = {"row": raw_header.get("row"), "icons": icons}
+            if raw_text and conv_text:
+                item["text"] = output_geometry(conv_text)
+            if raw_sep and conv_sep:
+                sep_item_out = output_geometry(conv_sep)
+                if isinstance(sep_item_out, dict):
+                    sep_item_out["draggable"] = conv_sep.get("draggable", True)
+                item["separator"] = sep_item_out
+            if normalized_mode == "full":
+                item["geometry"] = converted(
+                    raw_header.get("geometry"), "VTable.getCellRelativeRect"
+                )
+            if icons or normalized_mode == "full" or raw_text or raw_sep:
+                header.append(item)
         sample_cells: list[dict[str, Any]] = []
         for raw_cell in raw_column.get("sample_cells") or []:
             if not isinstance(raw_cell, dict):
@@ -331,11 +360,15 @@ async def _vtable_analysis_impl(
             }
             editor = raw_cell.get("editor") or {}
             if editor.get("available"):
-                sample["editor"] = editor if normalized_mode == "full" else {
-                    "opens_dom_input_on": interaction.get("activation"),
-                    "click_opens_dom_input": bool(editor.get("click_opens_dom_input")),
-                    "expected_dom_tags": editor.get("expected_dom_tags") or [],
-                }
+                sample["editor"] = (
+                    editor
+                    if normalized_mode == "full"
+                    else {
+                        "opens_dom_input_on": interaction.get("activation"),
+                        "click_opens_dom_input": bool(editor.get("click_opens_dom_input")),
+                        "expected_dom_tags": editor.get("expected_dom_tags") or [],
+                    }
+                )
             if targets:
                 sample["targets"] = targets
             if include_values and "value" in raw_cell:
@@ -347,11 +380,18 @@ async def _vtable_analysis_impl(
             "field": str(raw_column.get("field") or "")[:160],
             "title": str(raw_column.get("title") or "")[:160],
         }
+        if header_text_geom:
+            column["header_text"] = output_geometry(header_text_geom)
+        if separator_geom:
+            sep_col_out = output_geometry(separator_geom)
+            if isinstance(sep_col_out, dict):
+                sep_col_out["draggable"] = separator_geom.get("draggable", True)
+            column["separator"] = sep_col_out
         if header:
             if normalized_mode == "full":
                 column["header"] = header
             else:
-                column["header_icons"] = [icon for item in header for icon in item["icons"]]
+                column["header_icons"] = header_icons
         if sample_cells:
             column["sample_cells"] = sample_cells
         columns.append(column)
@@ -359,12 +399,72 @@ async def _vtable_analysis_impl(
     meta = {
         key: raw_meta.get(key)
         for key in (
-            "rowCount", "colCount", "headerRowCount", "frozenRowCount", "frozenColCount",
-            "editCellTrigger", "scrollLeft", "scrollTop",
+            "rowCount",
+            "colCount",
+            "headerRowCount",
+            "frozenRowCount",
+            "frozenColCount",
+            "editCellTrigger",
+            "scrollLeft",
+            "scrollTop",
         )
     }
     meta["scannedColumns"] = len(columns)
     meta["sampleRowsPerColumn"] = options["sample_rows"]
+    raw_truncated = raw.get("truncated") or {}
+    available_columns = int(meta.get("colCount") or 0)
+    available_rows = max(0, int(meta.get("rowCount") or 0) - int(meta.get("headerRowCount") or 1))
+    requested_fields = options["fields"]
+    found_fields = [str(column.get("field") or "") for column in columns]
+    missing_fields = [field for field in requested_fields if field not in found_fields]
+    unresolved_fields = missing_fields if raw_truncated.get("columns") else []
+    sample_rows_truncated = bool(raw_truncated.get("sample_rows"))
+    columns_truncated = bool(raw_truncated.get("columns"))
+    coverage = {
+        "complete_for_scope": not columns_truncated
+        and not sample_rows_truncated
+        and not missing_fields,
+        "scope": {
+            "kind": "vtable_interaction_analysis",
+            "frame_id": frame_details.get("frame_id"),
+            "table_index": selected_index,
+            "mode": normalized_mode,
+            "requested_fields": requested_fields or None,
+            "visible_only": visible_only,
+            "include_values": bool(include_values),
+        },
+        "columns": {
+            "available_count": available_columns,
+            "returned_count": len(columns),
+            "scan_limit": 100 if requested_fields else options["max_columns"],
+            "truncated": columns_truncated,
+            "requested_fields": requested_fields,
+            "found_fields": found_fields,
+            "missing_fields": missing_fields if not columns_truncated else [],
+            "unresolved_fields": unresolved_fields,
+        },
+        "sample_rows": {
+            "unit": "rows_per_column",
+            "available_rows_per_column": available_rows,
+            "requested_rows_per_column": options["sample_rows"],
+            "columns_sampled": len(raw.get("columns") or []),
+            "sampled_cells_count": len(raw.get("columns") or []) * options["sample_rows"],
+            "returned_interaction_cells_count": sum(
+                len(column.get("sample_cells") or []) for column in columns
+            ),
+            "truncated": sample_rows_truncated,
+        },
+        "reasons": [
+            reason
+            for reason, active in (
+                ("column_scan_limit", columns_truncated),
+                ("sample_row_limit", sample_rows_truncated),
+                ("requested_field_not_found", bool(missing_fields) and not columns_truncated),
+                ("requested_field_search_incomplete", bool(unresolved_fields)),
+            )
+            if active
+        ],
+    }
     frame_id = str(frame_details.get("frame_id") or "")
     signature = _analysis_layout_signature(raw, frame_id, selected_index)
     analysis_id = _remember_analysis(
@@ -388,7 +488,12 @@ async def _vtable_analysis_impl(
             "cell": "VTable.getCellRelativeRect",
             "target": "vtable-scenegraph.globalAABBBounds",
         },
-        "analysis": {"meta": meta, "columns": columns, "truncated": raw.get("truncated") or {}},
+        "analysis": {
+            "meta": meta,
+            "columns": columns,
+            "truncated": raw_truncated,
+            "coverage": coverage,
+        },
     }
 
 

@@ -12,7 +12,9 @@ from ..metrics import instrument_tool
 def create_server() -> FastMCP:
     mcp = FastMCP("Page Automation")
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def ui_click(
         role: str | None = None,
@@ -85,7 +87,9 @@ def create_server() -> FastMCP:
             compact=compact,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def ui_mouse_drag(
         start_x: float,
@@ -102,20 +106,14 @@ def create_server() -> FastMCP:
     ) -> dict:
         """模拟真实鼠标拖拽轨迹将目标对象从起始位置平移至目标位置。
 
-        【重要前置约束】：
-        调用本工具执行拖拽前，调用方必须先获取待拖拽对象的起始坐标（start_x, start_y）与目标位置的结束坐标（end_x, end_y）：
-        - 若为 VTable 等 Canvas 绘制的列表/表格（例如表头列拖拽重排顺序、列宽拖拽调整）：请先调用
-          vtable_analysis 获取待拖动列头与目标列头的 point 视口坐标；
-        - 若为常规 DOM 元素、滑块或可拖拽条目：请先调用 ui_analyze_scope 或 ui_snapshot
-          获取起始控件与目标落点的绝对视口坐标（page_box）。
+        调用前必须先取得起止坐标：VTable 表头列拖拽/调宽推荐直接用专属工具
+        vtable_reorder_column / vtable_resize_column(内置防图标拦截)；自行拖拽时坐标取自
+        ui_snapshot 的 [box] 或 vtable_analysis 的 point。若自行拖拽 Canvas 列表，
+        重排起点务必落在列标题文字区、调宽起点压在分界线上——落在功能图标上会被拦截。
 
-        本工具使用底层真实事件流（移动至起点 → 按下 mousePressed → 连续 24+ 步平滑细密轨迹移动
-        mouseMoved → 释放 mouseReleased），带全流程虚拟光标拖拽可视化，既能完美触发 Canvas 列表内部
-        对连续 mousemove 轨迹有严格位移阈值要求的列拖拽重排与调宽，也能通用处理常规 DOM 元素的物理拖放。
-
-        【VTable 列拖拽注意】起点必须落在列标题文字区，切勿选在表头功能图标（排序/筛选/冻结/下拉，
-        坐标见 vtable_analysis 的 header_icons）上：这些图标会拦截 mousedown，导致按住拖动不进入列重排，
-        释放后仅等效一次单击、列序不变。可把起点取在标题文字左端以避开图标。
+        本工具走底层真实事件流(移动至起点 → 悬停建立状态 → mousePressed → 连续 24+ 步
+        平滑 mouseMoved → mouseReleased)，带虚拟光标拖拽可视化，既能触发 Canvas 内部
+        对连续 mousemove 轨迹有位移阈值要求的列拖拽，也适用常规 DOM 元素的物理拖放。
 
         Args:
             start_x: 拖拽起点 X：顶层页面视口 CSS 像素，原点为视口左上角，越出视口直接报错
@@ -145,25 +143,28 @@ def create_server() -> FastMCP:
             visual_ghost=visual_ghost,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def overlay_scan(max_results: int = 20, scope: str = "active") -> dict:
         """扫描 APS 页面当前可见的 Ant Design Portal / ARIA 浮层。
 
-        默认 scope=active 只扫描主文档和当前激活 iframe；没有活动 iframe 时只扫描
-        主文档，scope=all 才扫描所有 iframe。返回 kind、文本、role、稳定 CSS selector、
-        overlay_id、可选 parent_overlay_id、rendered/viewport_visible/actionable 状态、
-        box/page_box 以及所属 frame。静态扫描不安装 MutationObserver。
-        对短暂 message/toast，请改用 ui_interact 或
+        默认 scope=active 只扫主文档和当前激活 iframe，scope=all 才扫所有 iframe；
+        没有活动 iframe 时只扫主文档。返回 kind、文本、role、稳定 CSS selector、
+        overlay_id、可见/可交互状态、box/page_box 与所属 frame。静态扫描不安装
+        MutationObserver；短暂 message/toast 请改用 ui_interact 或
         vtable_cell_click(observe_after=True)。
 
         Args:
-            max_results: 返回浮层条目上限（默认 20，最小按 1 处理）；调小会丢掉排序靠后的浮层
+            max_results: 返回浮层条目上限（默认 20，最小按 1 处理）；若 overlays.truncated/has_more 为 true，必须补扫剩余浮层
             scope: 扫描范围：active（默认）=主文档+激活 iframe，all=全部 iframe；focused 等同 active
         """
         return await automation.scan_overlays(max_results=max_results, scope=scope)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def ui_page_context(max_results: int = 10) -> dict:
         """返回当前页面、活动 iframe 和聚焦浮层的紧凑上下文。
@@ -172,11 +173,13 @@ def create_server() -> FastMCP:
         才继续调用 ui_snapshot。
 
         Args:
-            max_results: 同时限制列出的 frame 个数与可见浮层条数（默认 10）；调小会丢掉靠后的 iframe
+            max_results: 同时限制列出的 frame 个数与可见浮层条数（默认 10）；检查 coverage.frames 和 coverage.visible_overlays，未完整时继续用 frame_id 定向检查
         """
         return await automation.page_context(max_results=max_results)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def ui_analyze_scope(max_controls: int = 40, max_overlays: int = 10) -> dict:
         """只分析当前活动页面范围或所聚焦浮层内的可操作控件。
@@ -185,14 +188,14 @@ def create_server() -> FastMCP:
         激活的 AntD Tab iframe。结果是紧凑 role/name/CSS 定位清单，不展开整页 DOM。
 
         Args:
-            max_controls: 可操作控件条目上限（默认 40）；调小会截断长表单，响应 truncated 标记溢出
+            max_controls: 可操作控件条目上限（默认 40）；响应含 control_total_count 与 coverage.controls，若不完整需提高上限或按 focus layer/selector 定向扫描
             max_overlays: 参与裁剪判断的浮层条目上限（默认 10）
         """
-        return await automation.analyze_scope(
-            max_controls=max_controls, max_overlays=max_overlays
-        )
+        return await automation.analyze_scope(max_controls=max_controls, max_overlays=max_overlays)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def overlay_observe(
         settle_ms: int = 300, stop: bool = True, max_results: int = 20
@@ -200,7 +203,7 @@ def create_server() -> FastMCP:
         """在限定窗口内收集 APS Ant Design 浮层事件，覆盖全部 iframe。
 
         适合已由其他工具或人工操作触发页面后的诊断；默认取样后停止监听。
-        事件缓冲区溢出时返回 events_truncated 和 dropped_event_count。
+        事件缓冲区溢出返回 events_truncated/dropped_event_count；响应上限另由 events_limit_truncated 和 coverage.events 标记。
 
         Args:
             settle_ms: 观察窗口毫秒数（默认 300，限 0–2000，越界报错）；调小会漏掉慢动画浮层。
@@ -213,7 +216,9 @@ def create_server() -> FastMCP:
             settle_ms=settle_ms, stop=stop, max_results=max_results
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
+    )
     @instrument_tool
     async def ui_interact(
         action: str,
@@ -240,17 +245,11 @@ def create_server() -> FastMCP:
     ) -> dict:
         """统一表单与复合交互入口：执行非点击类 DOM 操作（输入、按键、悬停、勾选）。
 
-        主要用于 fill/type 文本填入（必须带 value）、press 按键（必须带 key）、hover 悬停、check 复选等动作。
-        单纯点击控件请优先使用专用的 ui_click 工具，避免在通用交互间犹豫。
-
-        分析器返回 CSS 时优先 CSS；否则按 AX role/name/description、XPath、text/
-        placeholder 依次尝试。x/y 是顶层 viewport 绝对 CSS 像素，只在前述候选都无法
-        解析时作为可信点击回退。坐标应直接取自 `vtable_analysis`，带 analysis_id 会在
-        执行前校验页面、iframe、滚动和布局。expect_input=True 时会验证
-        本次交互后是否真的出现并聚焦 input/textarea/contenteditable。未显式指定
-        frame 时优先当前激活的 AntD Tab iframe，再回退顶层文档。分析结果中的
-        frame="active" / "top" 可固定上下文。默认点击后立即
-        观察 Portal、消息、下拉和通知，限制 max_results 以控制 MCP token。
+        主要用于 fill/type 文本填入（必须带 value）、press 按键（必须带 key）、hover、check；
+        单纯点击请优先使用 ui_click，操作 AntD 下拉框/日期框请用专用工具。
+        定位候选顺序与 ui_click 一致(CSS → AX → XPath → text → 坐标回退)；未显式指定
+        frame 时优先激活 iframe 再回退顶层。expect_input=True 时验证交互后是否真的
+        聚焦了可编辑控件。
 
         Args:
             action: 动作类型：click/dblclick/rightclick/hover/fill/type/press/check/uncheck/select；fill、type、select 必须带 value，press 必须带 key
@@ -301,7 +300,9 @@ def create_server() -> FastMCP:
             compact=compact,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def ui_snapshot(
         selector: str | None = None,
@@ -317,30 +318,15 @@ def create_server() -> FastMCP:
     ) -> dict:
         """【页面元素识别与观察首选工具】抓取页面 aria 快照(mode='ai' + boxes)，给 AI 一张精准的“语义之眼”。
 
-        【推荐优先级：最高】所有常规页面元素识别、文本提取、定位决策，必须首选本工具！
-        官方 Playwright MCP 范式:把 accessibility 树(含 [ref=xx] 引用和 [box=x,y,w,h]
-        视口坐标)喂给 AI。VTable 本体是 canvas(单元格不进 a11y 树,仍走确定性几何定位),
-        但工具栏/弹窗/编辑器输入框都在树里 —— 交互前先读快照,再决定点哪个。
-        selector 非空时只快照该选择器命中的子树。
+        所有常规页面元素识别、文本提取、定位决策必须首选本工具：把 accessibility 树
+        (含 [ref=xx] 引用和 [box=x,y,w,h] 视口坐标)喂给 AI，毫秒级响应且极省 Token。
+        交互前先读快照再决定点哪个；VTable 单元格在 canvas 里不进 aria 树，查表格请直接用 vtable_*。
 
-        优化与容错特性：
-        1. 智能多元素匹配（彻底消除 strict mode violation 报错）：
-           当 selector 命中多个元素（如 AntD 多个弹窗/Tab 栏/逗号联合选择器）时，
-           自动遍历快照前 max_elements 个元素，并标注匹配序号、可见性与对应的 `>> nth=X` 定位路径。
-        2. 支持 nth 参数：可直接传入 0-based 序号选取目标元素（如 nth=0 或 nth=1）。
-        3. 支持 visible_only：为 True 时自动过滤隐藏/未渲染元素，只快照当前真实可见的元素。
-        4. 超时与容错：selector 未命中时在 timeout 内等待后优雅返回 not_found 状态，避免长时间挂死。
-        5. 默认作用域是**激活的业务 iframe**而非顶层文档：iframe 套壳应用（APS 等）的内容
-           全在激活模块里，拍顶层文档只能得到侧边栏骨架。响应的 scope/frame_id 会说明拍了谁。
-        6. 默认剪除"整棵子树都没有可访问名"的结构包装节点（generic/listitem/list 等）。
-           实测某角色页顶层树 164 节点仅 37 个有名，七成 token 花在重复骨架上。
-           prune_stats 给出剪除量；需要原始树传 prune_noise=false。
-
-        frame 省略 → 激活的业务 iframe（无则主文档）;frame='main' → 强制顶层文档;
-        frame="active" → 当前激活的 AntD Tab iframe;
-        frame="vtable" → 自动定位含表格的 iframe;也可传 page_context、overlay 或
-        vtable_discover 返回的稳定 frame_id。深度最大为 8，快照最多返回 24,000 字符。
-        注意：表格数据在 canvas 里，aria 树读不到 —— 查表格请直接用 vtable_*。
+        关键行为：
+        - selector 命中多个元素时自动遍历前 max_elements 个，标注匹配序号、可见性与 `>> nth=X` 定位路径(消除 strict mode violation)。
+        - 默认作用域是**激活的业务 iframe**(iframe 套壳应用的内容都在激活模块里)，拍顶层只能得到侧边栏骨架；响应的 scope/frame_id 说明拍了谁。
+        - 默认剪除"整棵子树无可访问名"的结构包装节点(实测七成 token 花在重复骨架上)，prune_stats 给出剪除量。
+        - frame 语义见 Args；深度上限 8，快照最多返回 24,000 字符；selector 未命中时在 timeout 内优雅返回 not_found。
 
         Args:
             selector: CSS/XPath 选择器；省略则快照整个作用域根节点，非空则只拍其命中子树
@@ -367,7 +353,9 @@ def create_server() -> FastMCP:
             prune_noise=prune_noise,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={"read_only_hint": True},
+    )
     @instrument_tool
     async def ui_screenshot(
         role: str | None = None,
@@ -393,26 +381,15 @@ def create_server() -> FastMCP:
     ) -> dict:
         """【最低优先级 / 兜底工具】截取指定 DOM 元素或顶层 viewport 区域图像并保存到工作区。
 
-        ⚠️【AI 行为准则与优先级警告】⚠️
-        1. 最低优先级兜底工具：严禁在每次操作前常规化（routine）调用本工具识别页面！
-        2. 页面元素与信息识别首选语义工具：
-           - 页面结构/控件识别：必须首选 `ui_snapshot`（ARIA 语义树，带确定性 [ref] 和 [box] 坐标，无视觉畸变且省 Token）！
-           - 局部聚焦控件分析：使用 `ui_analyze_scope` 或 `ui_page_context`；
-           - 业务表格结构与数据：使用 `vtable_analysis` 或 `vtable_read_cells`；
-           - 全局提示与气泡：使用 `wait_message` 或 `overlay_scan`。
-        3. 坐标陷阱警示：严禁根据截图像素去反推或校准点击坐标！Windows 高分屏缩放（DPI/DSF）下，全屏截图可能产生灰边或缩放比例偏移（如 0.8x），依据图片像素计算坐标必然偏离真实目标；请直接使用 DOM / VTable / AX 报告的真实 CSS 坐标，或优先使用 CSS/Role/Text 语义选择器。
-        4. 何时才允许调用本工具：
-           - 仅当人类用户显式要求提供页面截图或留档时；
-           - 或页面遇到纯无语义 Canvas 渲染、图片验证码、极端白屏等必须依靠多模态视觉定位的极少数兜底场景。
+        仅允许两种场景调用：人类用户显式要求截图/留档；或页面遇到纯无语义 Canvas、
+        图片验证码、极端白屏等必须依靠视觉定位的死角。严禁常规化调用本工具识别页面，
+        严禁根据截图像素反推点击坐标(高分屏缩放会偏移)——语义工具优先级见系统指令。
 
         元素定位顺序与 ui_interact 相同：CSS → AX role/name/description → XPath →
         text/placeholder。frame 未指定时优先活动 iframe。若没有可用定位器，可传
         x/y/width/height 使用顶层 viewport CSS 像素矩形；不传定位器与坐标时默认捕获
-        当前完整视口（0,0 到 window.innerWidth/innerHeight）。截图不会静默把 iframe 内坐标
-        当成顶层坐标。截图会以 PNG/JPEG 文件保存到 .qa-automation/screenshots/，响应只
-        返回工作区文件路径（path）、裁剪框、frame、定位来源与摘要哈希，不再回传整图
-        base64，避免大图撑爆上下文；需要看像素内容时直接打开 path 对应文件即可。
-        filename 只能指定截图目录内的文件名。
+        当前完整视口。截图保存到 .qa-automation/screenshots/，响应只返回文件路径(path)、
+        裁剪框、frame、定位来源与摘要哈希，不回传整图 base64；需要看像素时打开 path 即可。
 
         Args:
             role: ARIA 角色名，与 name 走 get_by_role 匹配被摄元素

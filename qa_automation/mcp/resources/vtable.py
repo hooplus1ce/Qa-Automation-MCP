@@ -1,28 +1,19 @@
-"""VTable JavaScript resources exposed through MCP resource URIs."""
-
-from __future__ import annotations
-
-import json
+"""Compatibility imports for the pre-filesystem-provider resource path."""
 
 from fastmcp import FastMCP
 
-from ...components.vtable.scripts import VTABLE_SCRIPTS, inventory
+from qa_automation.mcp.components.resources.vtable import (
+    vtable_js_inventory,
+    vtable_js_script,
+)
 
 
 def create_server() -> FastMCP:
-    mcp = FastMCP("VTable Resources")
+    """Return the legacy standalone resource server for external callers."""
+    server = FastMCP("VTable Resources")
+    server.add_resource(vtable_js_inventory)
+    server.add_resource(vtable_js_script)
+    return server
 
-    @mcp.resource("vtable://js/index")
-    def vtable_js_inventory() -> str:
-        """VTable JS 脚本目录:所有脚本名与说明(JSON)。"""
-        return json.dumps(inventory(), ensure_ascii=False, indent=2)
 
-    @mcp.resource("vtable://js/{name}")
-    def vtable_js_script(name: str) -> str:
-        """按名称读取内化的 VTable JS 脚本。"""
-        script = VTABLE_SCRIPTS.get(name)
-        if script is None:
-            raise ValueError(f"未知脚本: {name}。可用: {', '.join(VTABLE_SCRIPTS)}")
-        return script
-
-    return mcp
+__all__ = ["create_server", "vtable_js_inventory", "vtable_js_script"]

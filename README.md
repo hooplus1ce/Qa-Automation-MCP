@@ -429,9 +429,10 @@ QA_AUTOMATION_DATA_DIR=.qa-automation/data
 - `QA_AUTOMATION_PROJECT_ROOT` 环境变量（推荐跨平台通用方案）：对于不支持 `"cwd"` 参数或不支持 `${workspaceFolder}` 变量展开的 Agent 客户端（如部分 CLI 工具或特定 IDE），可在 MCP 配置的 `"env"` 中直接添加 `"QA_AUTOMATION_PROJECT_ROOT": "D:/path/to/project"`，其优先级高于 `cwd`，所有产物均会自动落盘至该指定项目目录下；
 - `uv run --project D:/Developer/Hoolinks/Qa-Automation-MCP`：指定 MCP 依赖和源码；
 - `fastmcp run D:/Developer/Hoolinks/Qa-Automation-MCP/fastmcp.json`：官方声明式入口。
-当前 FastMCP 3.4.6 的 filesystem source 实际相对进程 `cwd` 解析，而不是按配置
-文件目录解析；因此本机 `fastmcp.json` 使用 MCP 服务文件的绝对路径，确保使用方
-项目工作区作为 `cwd` 时仍可加载服务。启动命令为：
+FastMCP 官方文档推荐使用相对 source 路径，但当前 FastMCP 4 CLI 实际仍按进程
+`cwd` 解析 filesystem source。为了让外部工作区通过 `.mcp.json` 调用时不依赖其
+工作目录，本仓库配置保留绝对入口路径；迁移到其他机器时只需替换仓库根路径。启动
+命令为：
 
 ```bash
 uv run \
@@ -476,22 +477,36 @@ Qa-Automation-MCP/
 ├── pyproject.toml                   # Python/uv 项目元数据
 ├── qa_automation/                   # 通用 UI 自动化测试框架
 │   ├── workspace.py                 # 使用方项目工作区与产物路径边界
-│   ├── browser.py                   # Chrome/CDP/Context/Page 生命周期
+│   ├── browser/                     # Chrome/CDP/Context/Page 生命周期
+│   │   ├── core.py                  # 浏览器与页面核心状态
+│   │   ├── cdp.py                   # CDP 连接与探测
+│   │   ├── login.py                 # 登录与会话恢复
+│   │   └── viewport.py              # 窗口与视口保护
 │   ├── interaction/                 # DOM 定位、交互、快照与证据契约
 │   ├── overlay/                     # Portal/ARIA 浮层观测
 │   ├── profiles.py                  # 页面 Profile 与定位策略
 │   ├── components/
 │   │   └── vtable/                  # 可选 VTable 组件适配器及 JS 资源
 │   ├── mcp/
-│   │   ├── server.py                # FastMCP 组合根和 stdio 入口
+│   │   ├── server.py                # 稳定 FastMCP/stdio 入口（mcp、main）
+│   │   ├── composition.py           # FastMCP 组合根与子服务器挂载
+│   │   ├── instructions.py          # 发给 MCP 客户端的运行指令
+│   │   ├── providers.py             # Apps、Skills、文件系统 provider
 │   │   ├── servers/                 # 浏览器/UI/VTable/诊断/演示子服务器
-│   │   ├── resources/               # MCP 资源
+│   │   ├── components/              # FastMCP 文件系统发现组件
+│   │   │   └── resources/           # VTable JS 资源（@resource）
+│   │   ├── resources/               # 旧资源路径的兼容导出
 │   │   ├── apps/                    # FastMCP Apps 与演示数据
 │   │   └── metrics.py               # 工具可观测性
 │   └── assets/                      # 框架运行资产
 ├── tests/
 └── docs/
 ```
+
+`mcp/components/` 遵循 FastMCP 官方 `FileSystemProvider` 约定：组件文件使用独立的
+`@tool`、`@resource` 或 `@prompt` 装饰器，组合根只声明 provider；需要共享浏览器状态
+或显式控制工具命名的领域服务器仍放在 `mcp/servers/`，由 `composition.py` 使用
+`mount()` 组合。这样新增静态资源不必修改入口文件，同时保留现有公共工具名。
 
 ## 替换为真实数据 / 真实执行
 

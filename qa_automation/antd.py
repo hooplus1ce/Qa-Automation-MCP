@@ -25,7 +25,9 @@ WAIT_MESSAGE_OBSERVER_JS = r"""async function({patternStr, timeoutMs}) {
     try {
         regex = new RegExp(patternStr, 'i');
     } catch(e) {
-        regex = new RegExp('.+', 'i');
+        // fail-closed：非法正则不匹配任何内容。旧版降级为 '.+' 会把第一条 toast
+        // 当作命中返回 found=true，产出假阳性（Python 侧已前置校验，此处是兜底）。
+        regex = null;
     }
 
     function getRoots() {
@@ -59,7 +61,7 @@ WAIT_MESSAGE_OBSERVER_JS = r"""async function({patternStr, timeoutMs}) {
                 var txt = String(n.textContent || n.innerText || '').replace(/\s+/g, ' ').trim();
                 if (!txt) continue;
                 allSeen.push(txt.slice(0, 200));
-                if (!matched && regex.test(txt)) {
+                if (!matched && regex && regex.test(txt)) {
                     var cls = String(n.className || '').toLowerCase();
                     var source = cls.indexOf('ant-notification-notice') >= 0 ? 'notification'
                                : cls.indexOf('layui-layer') >= 0 ? 'layer'
@@ -115,7 +117,8 @@ WAIT_MESSAGE_OBSERVER_JS = r"""async function({patternStr, timeoutMs}) {
                 text: null,
                 source: null,
                 level: null,
-                all: last.all
+                all: last.all,
+                pattern_ok: regex !== null
             });
         }, Math.max(timeoutMs, 50));
 
@@ -158,7 +161,8 @@ WAIT_MESSAGE_OBSERVER_JS = r"""async function({patternStr, timeoutMs}) {
                 text: null,
                 source: null,
                 level: null,
-                all: immediate.all
+                all: immediate.all,
+                pattern_ok: regex !== null
             });
         }
     });
@@ -197,12 +201,19 @@ async def wait_message(
     """等待或即时快照全局操作结果气泡（message / notification / Modal 提示 / layui-layer）。
 
     Args:
-        pattern: 正则或关键字（如 "保存成功"、"成功|完成"）；空表示匹配任意提示
+        pattern: 正则或关键字（如 "保存成功"、"成功|完成"）；空表示匹配任意提示。非法正则直接报错
         timeout: 0=即时快照不等待；>0=最长等待秒数（默认 5.0）
         raise_if_not_found: 超时未匹配时是否抛出异常（默认 True）
     """
     page = await current_page()
     clean_pat = (pattern or "").strip() or r".+"
+    if pattern:
+        # 显式传入的正则必须先在 Python 侧校验：旧版 JS 在 RegExp 编译失败时静默
+        # 降级为 '.+'，把第一条 toast 当作匹配成功返回 found=true（fail-open 假阳性）。
+        try:
+            re.compile(clean_pat, re.I)
+        except re.error as e:
+            raise ValueError(f"wait_message 的 pattern 不是合法正则: {e}") from None
     timeout_ms = int(max(timeout, 0.0) * 1000)
     start_t = time.time()
 
@@ -213,6 +224,11 @@ async def wait_message(
         )
     except Exception as exc:
         data = {"found": False, "text": None, "source": None, "level": None, "all": [], "error": str(exc)}
+
+    if pattern and data.get("pattern_ok") is False:
+        raise ValueError(
+            f"wait_message 的 pattern 无法在浏览器端编译为 RegExp: {pattern!r}"
+        )
 
     elapsed = round(time.time() - start_t, 3)
     found = bool(data.get("found"))
@@ -255,9 +271,87 @@ def _dropdown_score(
     gap = min(abs(d_t - t_b), abs(d_b - t_t))
     return (x_ratio, gap)
 
+async def _guarantee_dropdown_closed(
+    page: Page,
+    target: Page | Frame,
+    trigger_loc: Locator | None,
+    dropdown_loc: Locator | None,
+    max_wait_ms: int = 1500,
+) -> bool:
+    """确保下拉浮层彻底收起，防止遮挡页面下方的确定/保存按钮。
+
+    采用四段式稳妥收起与隐藏确认机制：
+    1. 键盘 ESC：向当前页面及目标 frame 派发 Escape 键；
+    2. 触发框复击：若浮层依然可见（部分多选框拦截了 ESC），点击 Select 触发框再次触发 toggle 关闭；
+    3. 安全中立空白区点击：若依然可见，点击触发框上方或空白处使其失焦（Blur）；
+    4. 轮询隐藏确认：等待浮层包含 .ant-select-dropdown-hidden 或被从 DOM 移除。
+    """
+    if dropdown_loc is None:
+        return True
+
+    try:
+        if not await dropdown_loc.is_visible():
+            return True
+    except Exception:
+        return True
+
+    # 阶段一：键盘 Escape 键收起（兼容顶层与 iframe 内部焦点）
+    try:
+        await page.keyboard.press("Escape")
+        if target != page and hasattr(target, "keyboard"):
+            try:
+                await target.keyboard.press("Escape")
+            except Exception:
+                pass
+        await page.wait_for_timeout(100)
+        if not await dropdown_loc.is_visible():
+            return True
+    except Exception:
+        pass
+
+    # 阶段二：点击触发框进行 toggle 关闭（多选下拉框的常见交互）
+    if trigger_loc is not None:
+        try:
+            arrow = trigger_loc.locator(".ant-select-arrow, .ant-select-suffix").first
+            if await arrow.is_visible():
+                await arrow.click()
+            else:
+                await trigger_loc.click()
+            await page.wait_for_timeout(120)
+            if not await dropdown_loc.is_visible():
+                return True
+        except Exception:
+            pass
+
+    # 阶段三：安全中立空白区微点击以触发全局 blur
+    if trigger_loc is not None:
+        try:
+            t_box = await trigger_loc.bounding_box()
+            if t_box:
+                safe_x = max(10.0, t_box["x"] + t_box["width"] / 2)
+                safe_y = max(10.0, t_box["y"] - 15.0)
+                await page.mouse.click(safe_x, safe_y)
+                await page.wait_for_timeout(100)
+                if not await dropdown_loc.is_visible():
+                    return True
+        except Exception:
+            pass
+
+    # 阶段四：轮询等待隐藏状态确认
+    deadline = time.monotonic() + (max_wait_ms / 1000)
+    while time.monotonic() < deadline:
+        try:
+            if not await dropdown_loc.is_visible():
+                return True
+        except Exception:
+            return True
+        await asyncio.sleep(0.05)
+
+    return False
+
 
 async def antd_select(
-    option_text: str,
+    option_text: str | list[str],
     css: str | None = None,
     xpath: str | None = None,
     text: str | None = None,
@@ -350,68 +444,86 @@ async def antd_select(
         else:
             raise RuntimeError("未找到与目标 Select 关联的下拉菜单浮层")
 
-    # 3. 在匹配到的下拉浮层中寻找目标选项
-    # 支持 v4/v5 (.ant-select-item-option) 与 v3 (.ant-select-dropdown-menu-item)
-    opt_locators = [
-        best_dropdown.locator(".ant-select-item-option").filter(has_text=option_text).first,
-        best_dropdown.locator(".ant-select-dropdown-menu-item").filter(has_text=option_text).first,
-        best_dropdown.get_by_text(option_text, exact=True).first,
-    ]
+    # 3. 规范化待选目标列表（支持单个选项、选项数组或逗号分隔多选）
+    if isinstance(option_text, list):
+        target_options = [str(o).strip() for o in option_text if str(o).strip()]
+    elif "," in option_text or "，" in option_text:
+        target_options = [s.strip() for s in re.split(r"[,，]", option_text) if s.strip()]
+    else:
+        target_options = [str(option_text).strip()]
 
-    clicked_option = False
-    for opt in opt_locators:
-        try:
-            if await opt.is_visible():
-                await opt.scroll_into_view_if_needed()
-                await opt.click()
-                clicked_option = True
-                break
-        except Exception:
-            continue
+    selected_options = []
+    for opt_title in target_options:
+        # 在匹配到的下拉浮层中寻找目标选项
+        # 支持 v4/v5 (.ant-select-item-option) 与 v3 (.ant-select-dropdown-menu-item)
+        opt_locators = [
+            best_dropdown.locator(".ant-select-item-option").filter(has_text=opt_title).first,
+            best_dropdown.locator(".ant-select-dropdown-menu-item").filter(has_text=opt_title).first,
+            best_dropdown.get_by_text(opt_title, exact=True).first,
+        ]
 
-    if not clicked_option:
-        # 收集当前可见选项供错误报告
-        visible_options = []
-        try:
-            items = best_dropdown.locator(".ant-select-item-option, .ant-select-dropdown-menu-item")
-            for j in range(min(await items.count(), 10)):
-                txt = (await items.nth(j).text_content() or "").strip()
-                if txt:
-                    visible_options.append(txt)
-        except Exception:
-            pass
-        opts_str = "、".join(repr(o) for o in visible_options) or "（空）"
-        raise RuntimeError(f"在下拉浮层中未找到选项 [{option_text}]。当前可见候选: {opts_str}")
+        clicked_option = False
+        for opt in opt_locators:
+            try:
+                if await opt.is_visible():
+                    await opt.scroll_into_view_if_needed()
+                    await opt.click()
+                    clicked_option = True
+                    selected_options.append(opt_title)
+                    break
+            except Exception:
+                continue
 
-    await page.wait_for_timeout(200)
+        if not clicked_option:
+            # 收集当前可见选项供错误报告
+            visible_options = []
+            try:
+                items = best_dropdown.locator(".ant-select-item-option, .ant-select-dropdown-menu-item")
+                for j in range(min(await items.count(), 10)):
+                    txt = (await items.nth(j).text_content() or "").strip()
+                    if txt:
+                        visible_options.append(txt)
+            except Exception:
+                pass
+            opts_str = "、".join(repr(o) for o in visible_options) or "（空）"
+            raise RuntimeError(f"在下拉浮层中未找到选项 [{opt_title}]。当前可见候选: {opts_str}")
 
-    # 4. 多选或浮层残留时按 ESC 收回
+        await page.wait_for_timeout(100)
+
+    await page.wait_for_timeout(150)
+
+    # 4. 多选或浮层残留时彻底收回（四段式保障，严防遮挡底部确定/保存按钮）
+    dropdown_closed = True
     if close_multi:
-        try:
-            if await best_dropdown.is_visible():
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(100)
-        except Exception:
-            pass
+        dropdown_closed = await _guarantee_dropdown_closed(
+            page, target, trigger_loc, best_dropdown, max_wait_ms=1200
+        )
 
     # 5. 校验已选值回读
-    displayed_value = ""
-    for sel in (".ant-select-selection-item", ".ant-select-selection-selected-value"):
-        val_node = trigger_loc.locator(sel).first
+    displayed_values: list[str] = []
+    for sel in (".ant-select-selection-item", ".ant-select-selection-selected-value", ".ant-select-selection-overflow-item"):
+        items = trigger_loc.locator(sel)
         try:
-            if await val_node.is_visible():
-                displayed_value = (await val_node.text_content() or "").strip()
-                if displayed_value:
-                    break
+            cnt = await items.count()
+            for i in range(cnt):
+                txt = (await items.nth(i).text_content() or "").strip()
+                if txt and txt not in displayed_values:
+                    displayed_values.append(txt)
         except Exception:
             continue
+
+    displayed_str = " / ".join(displayed_values)
+    first_option = target_options[0] if target_options else ""
+    opts_display = ", ".join(selected_options)
 
     return {
         "ok": True,
-        "selected_option": option_text,
-        "displayed_value": displayed_value or None,
-        "verified": (option_text in displayed_value) if displayed_value else None,
-        "message": f"已选择下拉选项 [{option_text}]" + (f"，当前展示 [{displayed_value}]" if displayed_value else ""),
+        "selected_option": first_option if len(target_options) == 1 else target_options,
+        "selected_options": selected_options,
+        "displayed_value": displayed_str or None,
+        "dropdown_closed": dropdown_closed,
+        "verified": all(any(opt in dv for dv in displayed_values) for opt in selected_options) if displayed_values else None,
+        "message": f"已选择下拉选项 [{opts_display}]" + (f"，当前展示 [{displayed_str}]" if displayed_str else "") + ("（浮层已收起）" if dropdown_closed else ""),
     }
 
 
@@ -621,6 +733,23 @@ async def nav_menu(
         pass
 
     breadcrumb_str = " > ".join(breadcrumbs) if breadcrumbs else clean_name
+
+    # iframe 一直未激活说明导航实际失败：旧版无条件 ok=True 会把失败报告为成功
+    # （fail-open）。这里如实返回 ok=False 并给出排查线索。
+    if active_frame_obj is None:
+        return {
+            "ok": False,
+            "menu_name": clean_name,
+            "reused_tab": reused,
+            "breadcrumb": breadcrumb_str,
+            "frame_id": None,
+            "frame_url": None,
+            "page_url": page.url,
+            "reason": (
+                f"等待 {timeout_ms}ms 后目标模块 iframe 未激活（{active_iframe_sel}）。"
+                "请核对菜单名是否正确、页面是否已跳转，或用 ui_snapshot 检查当前页面状态。"
+            ),
+        }
 
     return {
         "ok": True,

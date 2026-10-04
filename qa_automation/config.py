@@ -112,62 +112,62 @@ def credential_missing_message(*, user: bool, password: bool) -> str:
     )
 
 
+def _extract_token_from_mcp_config(cfg_path: Path) -> str | None:
+    """从本项目 .mcp.json 的 tencent-docs / qa-automation 服务条目提取令牌。"""
+    try:
+        if not (cfg_path.exists() and cfg_path.is_file()):
+            return None
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    servers = data.get("mcpServers", {})
+    for key in ("tencent-docs", "tencent_docs", "qa-automation-mcp", "qa-automation"):
+        target = servers.get(key)
+        if isinstance(target, dict):
+            t = (
+                target.get("headers", {}).get("Authorization")
+                or target.get("env", {}).get("TENCENT_DOCS_MCP_TOKEN")
+                or target.get("env", {}).get("TENCENT_DOCS_TOKEN")
+            )
+            if t and str(t).strip() and not str(t).startswith("<"):
+                return str(t).strip()
+    return None
+
+
 def resolve_tencent_docs_token() -> str:
-    """Resolve the Tencent Docs MCP token from explicit local configuration or environment."""
+    """Resolve the Tencent Docs MCP token from environment or the project's own .mcp.json.
+
+    安全边界：令牌只允许来自环境变量或本项目根目录的 .mcp.json（用户为本项目
+    显式配置的）。历史版本会从 CWD 向上遍历父目录、并扫描 mcporter / TRAE /
+    Cursor / Claude Desktop 等其他 MCP 客户端的全局配置文件「顺带」提取令牌——
+    任何能调用本 MCP 的会话都可借此收割其他应用的凭据，属越权读取面，已移除。
+    """
     for env_var in ("TENCENT_DOCS_MCP_TOKEN", "TENCENT_DOCS_TOKEN", "TENCENT_API_KEY"):
         token = os.getenv(env_var)
         if token and token.strip():
             return token.strip()
 
-    # 扫描当前工作目录、项目根目录以及父级目录下的 .mcp.json 与 .mcp.json.example
-    candidate_dirs = [Path.cwd(), Path(__file__).resolve().parent.parent]
+    # 仅限本项目自身的 .mcp.json：qa-automation 服务常以 --env-file .env 启动，
+    # env 缺失时兜底读取用户为本项目显式写入的 tencent-docs 令牌。
+    roots = [Path(__file__).resolve().parent.parent]
     if QA_AUTOMATION_PROJECT_ROOT:
-        candidate_dirs.append(Path(QA_AUTOMATION_PROJECT_ROOT))
-    for curr in list(candidate_dirs):
-        p = curr.resolve()
-        for _ in range(5):
-            if p not in candidate_dirs:
-                candidate_dirs.append(p)
-            if p.parent == p:
-                break
-            p = p.parent
-
-    candidate_files: list[Path] = []
-    for d in candidate_dirs:
-        for fname in (".mcp.json", ".mcp.json.example", "mcp.json"):
-            fpath = d / fname
-            if fpath not in candidate_files:
-                candidate_files.append(fpath)
-
-    # 常见 MCP 客户端全局配置文件
-    candidate_files.extend([
-        Path.home() / ".mcporter" / "mcporter.json",
-        Path(os.getenv("APPDATA", "")) / "TRAE SOLO CN" / "User" / "mcp.json",
-        Path(os.getenv("APPDATA", "")) / "Cursor" / "User" / "globalStorage" / "mcp.json",
-        Path(os.getenv("APPDATA", "")) / "Claude" / "claude_desktop_config.json",
-    ])
-
-    for cfg_path in candidate_files:
-        if cfg_path.exists() and cfg_path.is_file():
-            try:
-                data = json.loads(cfg_path.read_text(encoding="utf-8"))
-                servers = data.get("mcpServers", {})
-                for key in ("tencent-docs", "tencent_docs", "qa-automation-mcp", "qa-automation"):
-                    target = servers.get(key)
-                    if isinstance(target, dict):
-                        t = (
-                            target.get("headers", {}).get("Authorization")
-                            or target.get("env", {}).get("TENCENT_DOCS_MCP_TOKEN")
-                            or target.get("env", {}).get("TENCENT_DOCS_TOKEN")
-                        )
-                        if t and str(t).strip() and not str(t).startswith("<"):
-                            return str(t).strip()
-            except Exception:
-                pass
+        roots.append(Path(QA_AUTOMATION_PROJECT_ROOT))
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if root in seen:
+            continue
+        seen.add(root)
+        token = _extract_token_from_mcp_config(root / ".mcp.json")
+        if token:
+            return token
 
     raise RuntimeError(
         "Tencent Docs MCP token is not configured. Set TENCENT_DOCS_MCP_TOKEN "
-        "or configure it in the local MCP client settings."
+        "in .env (see .env.example), or configure it in this project's .mcp.json."
     )
 ACTIVE_PROFILE = active_profile()
 ACTIVE_IFRAME_SELECTOR = ACTIVE_PROFILE.active_iframe_selector

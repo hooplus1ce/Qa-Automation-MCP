@@ -16,6 +16,7 @@ from ..browser import (
     _frame_details,
     _page_id,
 )
+from ..completeness import completeness_report
 from ..config import (
     OVERLAY_ADAPTIVE_SETTLE,
     OVERLAY_PROBE_MS,
@@ -154,10 +155,7 @@ async def _install_overlay_observer_in_frame(
     page: Page, frame: Frame, *, reset: bool = True
 ) -> dict[str, Any]:
     result = await frame.evaluate(_overlay_script(_OVERLAY_OBSERVER_TEMPLATE, reset=reset))
-    items = [
-        {**_frame_details(page, frame), **item}
-        for item in result.get("baseline", [])
-    ]
+    items = [{**_frame_details(page, frame), **item} for item in result.get("baseline", [])]
     return {
         "reused": bool(result.get("reused", False)),
         "baseline": items,
@@ -190,7 +188,11 @@ async def _install_overlay_observers(page: Page, *, reset: bool = False) -> dict
             try:
                 details = _frame_details(page, frame)
             except Exception:
-                details = {"frame_id": f"frame-error:{id(frame)}", "frame_url": "", "frame_name": ""}
+                details = {
+                    "frame_id": f"frame-error:{id(frame)}",
+                    "frame_url": "",
+                    "frame_name": "",
+                }
             errors.append({**details, "reason": str(exc)[:500]})
     all_baseline = _dedupe_overlays(baseline)
     new_frame_baseline = _dedupe_overlays(new_frame_baseline)
@@ -198,8 +200,7 @@ async def _install_overlay_observers(page: Page, *, reset: bool = False) -> dict
         comparison_baseline = all_baseline
     else:
         new_keys = {
-            (item.get("frame_id", ""), item.get("fingerprint", ""))
-            for item in new_frame_baseline
+            (item.get("frame_id", ""), item.get("fingerprint", "")) for item in new_frame_baseline
         }
         comparison_baseline = [
             item
@@ -298,15 +299,11 @@ async def _finalize_overlay_observation(
         return
     frame_listener = installed.get("frame_listener")
     try:
-        drained = await _drain_overlay_observers(
-            page, stop=True, frame_listener=frame_listener
-        )
+        drained = await _drain_overlay_observers(page, stop=True, frame_listener=frame_listener)
     except Exception as exc:
         cleanup_errors = await _stop_overlay_observers_best_effort(page)
         cleanup_errors.extend(
-            await _release_overlay_frame_listener(
-                page, frame_listener, persistent=keep_listener
-            )
+            await _release_overlay_frame_listener(page, frame_listener, persistent=keep_listener)
         )
         response.update(
             {
@@ -337,15 +334,22 @@ async def _finalize_overlay_observation(
     raw_overlays = _new_overlays(baseline, raw_events, raw_current)
     # 一次几何计算供全部 enrich 共享,避免对每个 frame 重复做 CDP 往返
     geometry = await _frame_geometry(page)
+    effective_limit = max(1, int(max_results))
+    event_candidates = _dedupe_overlays(raw_events)
+    overlay_candidates = _dedupe_overlays(raw_overlays)
+    visible_candidates = _dedupe_overlays(raw_current)
     ui_events = await _enrich_overlay_items(
-        page, raw_events, max_results=max_results, geometry=geometry
+        page, event_candidates, max_results=effective_limit, geometry=geometry
     )
     overlays = await _enrich_overlay_items(
-        page, raw_overlays, max_results=max_results, geometry=geometry
+        page, overlay_candidates, max_results=effective_limit, geometry=geometry
     )
     visible_overlays = await _enrich_overlay_items(
-        page, raw_current, max_results=max_results, geometry=geometry
+        page, visible_candidates, max_results=effective_limit, geometry=geometry
     )
+    event_limit_truncated = len(event_candidates) > len(ui_events)
+    overlay_limit_truncated = len(overlay_candidates) > len(overlays)
+    visible_limit_truncated = len(visible_candidates) > len(visible_overlays)
     response.update(
         {
             **(installed.get("settle") or {}),
@@ -354,7 +358,8 @@ async def _finalize_overlay_observation(
                 await _enrich_overlay_items(
                     page, baseline, max_results=min(2, max_results), geometry=geometry
                 )
-                if max_results > 20 else []
+                if max_results > 20
+                else []
             ),
             "ui_events": ui_events,
             "overlays": overlays,
@@ -367,7 +372,52 @@ async def _finalize_overlay_observation(
                 *listener_errors,
             ],
             "events_truncated": bool(drained["events_truncated"]),
+            "events_limit_truncated": event_limit_truncated,
             "dropped_event_count": int(drained["dropped_event_count"]),
+            "event_count": len(event_candidates),
+            "events_returned_count": len(ui_events),
+            "overlays_total_count": len(overlay_candidates),
+            "overlays_returned_count": len(overlays),
+            "visible_overlays_total_count": len(visible_candidates),
+            "visible_overlays_returned_count": len(visible_overlays),
+            "coverage": {
+                "events": completeness_report(
+                    scope={"kind": "overlay_events", "frame_scope": "all"},
+                    returned_count=len(ui_events),
+                    total_count=len(event_candidates),
+                    limit=effective_limit,
+                    truncated=bool(drained["events_truncated"]) or event_limit_truncated,
+                    has_more=event_limit_truncated or bool(drained["events_truncated"]),
+                    complete_for_scope=not bool(drained["events_truncated"])
+                    and not event_limit_truncated,
+                    reasons=[
+                        reason
+                        for reason, active in (
+                            ("event_buffer_overflow", bool(drained["events_truncated"])),
+                            ("max_results", event_limit_truncated),
+                        )
+                        if active
+                    ],
+                ),
+                "overlays": completeness_report(
+                    scope={"kind": "new_overlays", "frame_scope": "all"},
+                    returned_count=len(overlays),
+                    total_count=len(overlay_candidates),
+                    limit=effective_limit,
+                    truncated=overlay_limit_truncated,
+                    has_more=overlay_limit_truncated,
+                    reasons=["max_results"] if overlay_limit_truncated else [],
+                ),
+                "visible_overlays": completeness_report(
+                    scope={"kind": "visible_overlays", "frame_scope": "all"},
+                    returned_count=len(visible_overlays),
+                    total_count=len(visible_candidates),
+                    limit=effective_limit,
+                    truncated=visible_limit_truncated,
+                    has_more=visible_limit_truncated,
+                    reasons=["max_results"] if visible_limit_truncated else [],
+                ),
+            },
             "observer_cleanup_failed": bool(drained["stop_errors"] or listener_errors),
         }
     )
@@ -382,30 +432,45 @@ async def _scan_overlays_impl(
     errors: list[dict[str, Any]] = []
     for frame in list(page.frames):
         try:
-            res = await frame.evaluate(
-                _overlay_script(_OVERLAY_OBSERVER_TEMPLATE, observe=False)
-            )
+            res = await frame.evaluate(_overlay_script(_OVERLAY_OBSERVER_TEMPLATE, observe=False))
             for item in res.get("current", []):
                 raw_items.append({**_frame_details(page, frame), **item})
         except Exception as exc:
             errors.append({**_frame_details(page, frame), "reason": str(exc)[:500]})
     filtered_raw = _filter_overlay_scope(raw_items, allowed_frame_ids)
-    items = await _enrich_overlay_items(page, filtered_raw, max_results=max_results)
+    unique_raw = _dedupe_overlays(filtered_raw)
+    effective_limit = max(1, int(max_results))
+    items = await _enrich_overlay_items(page, unique_raw, max_results=effective_limit)
+    returned_count = len(items)
+    total_count = len(unique_raw)
+    has_more = returned_count < total_count
     return {
         "status": "ok",
         "page_id": _page_id(page),
         "scope": scope,
         "overlays": items,
-        "count": len(items),
+        "count": returned_count,
+        "returned_count": returned_count,
+        "total_count": total_count,
+        "limit": effective_limit,
+        "has_more": has_more,
+        "truncated": has_more,
+        "coverage": completeness_report(
+            scope={"kind": "overlays", "frame_scope": scope},
+            returned_count=returned_count,
+            total_count=total_count,
+            limit=effective_limit,
+            truncated=has_more,
+            has_more=has_more,
+            reasons=["max_results"] if has_more else [],
+        ),
         "frame_count": _page_frame_count(page),
         "context": await _overlay_context(page, items),
         "errors": errors,
     }
 
 
-async def scan_overlays(
-    *, max_results: int = OVERLAY_RESULT_LIMIT, scope: str = "active"
-) -> dict:
+async def scan_overlays(*, max_results: int = OVERLAY_RESULT_LIMIT, scope: str = "active") -> dict:
     async with _action_lock:
         return await _scan_overlays_impl(max_results=max_results, scope=scope)
 
@@ -425,31 +490,34 @@ async def _observe_overlays_impl(
         frame_listener, listener_reused = await _acquire_overlay_frame_listener(
             page, persistent=not stop
         )
-        await _arm_overlay_init_script(
-            page, settle_ms=settle_ms, persistent=not stop
-        )
+        await _arm_overlay_init_script(page, settle_ms=settle_ms, persistent=not stop)
         installed = await _install_overlay_observers(page, reset=False)
         installed["frame_listener"] = frame_listener
         installed["reused"] = installed.get("reused", False) or listener_reused
         settle_info = await _await_overlay_settle(page, settle_ms)
-        drained = await _drain_overlay_observers(
-            page, stop=stop, frame_listener=frame_listener
-        )
+        drained = await _drain_overlay_observers(page, stop=stop, frame_listener=frame_listener)
         listener_errors = await _release_overlay_frame_listener(
             page, frame_listener, persistent=not stop
         )
         baseline = installed["baseline"]
         detected = _new_overlays(baseline, drained["events"], drained["current"])
         geometry = await _frame_geometry(page)
+        effective_limit = max(1, int(max_results))
+        event_candidates = _dedupe_overlays(drained["events"])
+        overlay_candidates = _dedupe_overlays(detected)
+        visible_candidates = _dedupe_overlays(drained["current"])
         events = await _enrich_overlay_items(
-            page, drained["events"], max_results=max_results, geometry=geometry
+            page, event_candidates, max_results=effective_limit, geometry=geometry
         )
         overlays = await _enrich_overlay_items(
-            page, detected, max_results=max_results, geometry=geometry
+            page, overlay_candidates, max_results=effective_limit, geometry=geometry
         )
         visible_overlays = await _enrich_overlay_items(
-            page, drained["current"], max_results=max_results, geometry=geometry
+            page, visible_candidates, max_results=effective_limit, geometry=geometry
         )
+        events_limit_truncated = len(event_candidates) > len(events)
+        overlays_limit_truncated = len(overlay_candidates) > len(overlays)
+        visible_limit_truncated = len(visible_candidates) > len(visible_overlays)
         return {
             "status": "ok",
             **settle_info,
@@ -467,18 +535,59 @@ async def _observe_overlays_impl(
                 *listener_errors,
             ],
             "events_truncated": bool(drained["events_truncated"]),
+            "events_limit_truncated": events_limit_truncated,
             "dropped_event_count": int(drained["dropped_event_count"]),
+            "event_count": len(event_candidates),
+            "events_returned_count": len(events),
+            "overlays_total_count": len(overlay_candidates),
+            "overlays_returned_count": len(overlays),
+            "visible_overlays_total_count": len(visible_candidates),
+            "visible_overlays_returned_count": len(visible_overlays),
+            "coverage": {
+                "events": completeness_report(
+                    scope={"kind": "overlay_events", "frame_scope": "all"},
+                    returned_count=len(events),
+                    total_count=len(event_candidates),
+                    limit=effective_limit,
+                    truncated=bool(drained["events_truncated"]) or events_limit_truncated,
+                    has_more=events_limit_truncated or bool(drained["events_truncated"]),
+                    complete_for_scope=not bool(drained["events_truncated"])
+                    and not events_limit_truncated,
+                    reasons=[
+                        reason
+                        for reason, active in (
+                            ("event_buffer_overflow", bool(drained["events_truncated"])),
+                            ("max_results", events_limit_truncated),
+                        )
+                        if active
+                    ],
+                ),
+                "overlays": completeness_report(
+                    scope={"kind": "new_overlays", "frame_scope": "all"},
+                    returned_count=len(overlays),
+                    total_count=len(overlay_candidates),
+                    limit=effective_limit,
+                    truncated=overlays_limit_truncated,
+                    has_more=overlays_limit_truncated,
+                    reasons=["max_results"] if overlays_limit_truncated else [],
+                ),
+                "visible_overlays": completeness_report(
+                    scope={"kind": "visible_overlays", "frame_scope": "all"},
+                    returned_count=len(visible_overlays),
+                    total_count=len(visible_candidates),
+                    limit=effective_limit,
+                    truncated=visible_limit_truncated,
+                    has_more=visible_limit_truncated,
+                    reasons=["max_results"] if visible_limit_truncated else [],
+                ),
+            },
             "stopped": stop,
-            "observer_cleanup_failed": bool(
-                stop and (drained["stop_errors"] or listener_errors)
-            ),
+            "observer_cleanup_failed": bool(stop and (drained["stop_errors"] or listener_errors)),
         }
     except Exception as exc:
         cleanup_errors = await _stop_overlay_observers_best_effort(page)
         cleanup_errors.extend(
-            await _release_overlay_frame_listener(
-                page, frame_listener, persistent=False
-            )
+            await _release_overlay_frame_listener(page, frame_listener, persistent=False)
         )
         return {
             "status": "failed",
@@ -498,9 +607,7 @@ async def observe_overlays(
     max_results: int = OVERLAY_RESULT_LIMIT,
 ) -> dict:
     async with _action_lock:
-        return await _observe_overlays_impl(
-            settle_ms=settle_ms, stop=stop, max_results=max_results
-        )
+        return await _observe_overlays_impl(settle_ms=settle_ms, stop=stop, max_results=max_results)
 
 
 async def _click_dom_and_observe_impl(
@@ -527,9 +634,7 @@ async def _click_dom_and_observe_impl(
         "frame": frame,
     }
     try:
-        frame_listener, _ = await _acquire_overlay_frame_listener(
-            page, persistent=False
-        )
+        frame_listener, _ = await _acquire_overlay_frame_listener(page, persistent=False)
         await _arm_overlay_init_script(
             page,
             settle_ms=settle_ms,
@@ -542,6 +647,7 @@ async def _click_dom_and_observe_impl(
         installed["frame_listener"] = frame_listener
 
         import qa_automation as _pkg
+
         click_fn = getattr(_pkg, "_click_dom_impl", None)
         if click_fn is not None:
             response = await click_fn(
@@ -554,6 +660,7 @@ async def _click_dom_and_observe_impl(
             )
         else:
             from ..interaction import _click_dom_impl
+
             response = await _click_dom_impl(
                 role,
                 name=name,
@@ -581,9 +688,7 @@ async def _click_dom_and_observe_impl(
         elif frame_listener is not None:
             cleanup_errors = await _stop_overlay_observers_best_effort(page)
             cleanup_errors.extend(
-                await _release_overlay_frame_listener(
-                    page, frame_listener, persistent=False
-                )
+                await _release_overlay_frame_listener(page, frame_listener, persistent=False)
             )
             if cleanup_errors:
                 response["observer_errors"] = cleanup_errors

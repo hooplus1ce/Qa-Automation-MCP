@@ -16,13 +16,14 @@ from ..browser import (
     _frame_id,
     _page_id,
 )
-from ..components.vtable.binding import resolve_frame
+from ..components.vtable.binding import active_application_frame, resolve_frame
 from ..config import (
     ANALYSIS_MAX_AGE_SECONDS,
     OVERLAY_RESULT_LIMIT,
     OVERLAY_SETTLE_LIMIT_MS,
 )
 from ..mouse import _ensure_cursor_helper, _smooth_mouse_move_to, _stable_viewport_click
+from ..workspace import resolve_workspace_path
 from .contract import _interaction_contract
 from .locator import _find_interaction_locator, _perform_antd_select
 from .snapshot import _focused_editable
@@ -55,6 +56,32 @@ async def _stable_locator_click(
         raise RuntimeError("target did not reach a visible position")
     if hasattr(target, "is_enabled") and not await target.is_enabled():
         raise RuntimeError("target is disabled")
+    target_cx = initial["x"] + initial["width"] / 2
+    target_cy = initial["y"] + initial["height"] / 2
+
+    # 下拉浮层遮挡防护：若页面存在未收起的 AntD 下拉菜单浮层正遮挡目标点击点（如确定/保存按钮），自动按 ESC 收起它
+    try:
+        floating = page.locator(".ant-select-dropdown:not(.ant-select-dropdown-hidden)")
+        f_count = await floating.count()
+        if f_count > 0:
+            dismissed = False
+            for idx in range(min(f_count, 3)):
+                f_box = await floating.nth(idx).bounding_box()
+                if f_box:
+                    covered_x = f_box["x"] <= target_cx <= (f_box["x"] + f_box["width"])
+                    covered_y = f_box["y"] <= target_cy <= (f_box["y"] + f_box["height"])
+                    if covered_x and covered_y:
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.1)
+                        dismissed = True
+                        break
+            if dismissed:
+                refreshed_box = await target.bounding_box()
+                if refreshed_box and refreshed_box["width"] > 0:
+                    initial = {key: float(refreshed_box[key]) for key in ("x", "y", "width", "height")}
+    except Exception:
+        pass
+
 
     async def final_point() -> dict[str, float]:
         box = await target.bounding_box()
@@ -575,6 +602,73 @@ async def dom_interact(
         )
 
 
+async def _mouse_drag_session_impl(
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+    *,
+    steps: int = 24,
+    button: str = "left",
+    hold_ms: int = 80,
+    settle_ms: int = 200,
+    observe_after: bool = False,
+    max_results: int = OVERLAY_RESULT_LIMIT,
+    visual_ghost: bool = True,
+) -> dict[str, Any]:
+    """Unlocked mouse drag incl. page acquisition & overlay arming.
+
+    Callers must already hold ``_action_lock`` (e.g. ``execute_chain``); the
+    public :func:`mouse_drag` is the locked wrapper.
+    """
+    page = await _current_page_impl()
+    installed = None
+    listener = None
+    if observe_after:
+        from ..overlay import (
+            _acquire_overlay_frame_listener,
+            _arm_overlay_init_script,
+            _install_overlay_observers,
+        )
+
+        listener, _ = await _acquire_overlay_frame_listener(page, persistent=False)
+        await _arm_overlay_init_script(page, settle_ms=settle_ms, persistent=False)
+        installed = await _install_overlay_observers(page, reset=True)
+    result: dict[str, Any] = {}
+    try:
+        from ..mouse import _mouse_drag_impl
+
+        result = await _mouse_drag_impl(
+            page,
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            steps=steps,
+            button=button,
+            hold_ms=hold_ms,
+            settle_ms=settle_ms,
+            visual_ghost=visual_ghost,
+        )
+        result["page_id"] = _page_id(page)
+    finally:
+        if installed is not None:
+            from ..overlay import _finalize_overlay_observation
+
+            await _finalize_overlay_observation(
+                page, installed, result, settle_ms=settle_ms, max_results=max_results
+            )
+        elif listener is not None:
+            from ..overlay import (
+                _release_overlay_frame_listener,
+                _stop_overlay_observers_best_effort,
+            )
+
+            await _stop_overlay_observers_best_effort(page)
+            await _release_overlay_frame_listener(page, listener, persistent=False)
+    return result
+
+
 async def mouse_drag(
     start_x: float,
     start_y: float,
@@ -591,52 +685,144 @@ async def mouse_drag(
 ) -> dict[str, Any]:
     """Execute a realistic physical mouse drag from (start_x, start_y) to (end_x, end_y)."""
     async with _action_lock:
-        page = await _current_page_impl()
-        installed = None
-        listener = None
-        if observe_after:
-            from ..overlay import (
-                _acquire_overlay_frame_listener,
-                _arm_overlay_init_script,
-                _install_overlay_observers,
-            )
+        return await _mouse_drag_session_impl(
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            steps=steps,
+            button=button,
+            hold_ms=hold_ms,
+            settle_ms=settle_ms,
+            observe_after=observe_after,
+            max_results=max_results,
+            visual_ghost=visual_ghost,
+        )
 
-            listener, _ = await _acquire_overlay_frame_listener(page, persistent=False)
-            await _arm_overlay_init_script(page, settle_ms=settle_ms, persistent=False)
-            installed = await _install_overlay_observers(page, reset=True)
-        result: dict[str, Any] = {}
+
+async def _upload_files_impl(
+    files: list[str],
+    *,
+    css: str | None = None,
+    xpath: str | None = None,
+    text: str | None = None,
+    role: str | None = None,
+    name: str | None = None,
+    frame: str | None = None,
+    timeout_ms: int = 10_000,
+) -> dict[str, Any]:
+    """Upload workspace files via a click-triggered file chooser or a raw file input.
+
+    两种模式：
+      - 传入触发元素定位(css/xpath/text/role) → expect_file_chooser 截获"点击按钮
+        弹出的系统文件选择框"并 set_files，兼容 iframe 内的控件；
+      - 未传触发元素 → 在目标 frame 内自动寻找 input[type=file] 直接 set_input_files，
+        隐藏的 input 也可以。
+    """
+    if not files:
+        raise ValueError("files must contain at least one workspace file")
+    resolved = [
+        str(resolve_workspace_path(path, must_exist=True, require_file=True))
+        for path in files
+    ]
+    page = await _current_page_impl()
+    timeout_seconds = max(timeout_ms, 1_000) / 1000
+
+    if any([css, xpath, text, role]):
+        locator, target_frame, source = await _find_interaction_locator(
+            page,
+            role=role,
+            name=name,
+            text=text,
+            css=css,
+            xpath=xpath,
+            frame=frame,
+            timeout_ms=timeout_ms,
+        )
+        async with page.expect_file_chooser(timeout=timeout_seconds * 1000) as chooser_info:
+            await locator.click(timeout=timeout_seconds * 1000)
+        chooser = await chooser_info.value
+        is_multiple = bool(chooser.is_multiple())
+        if not is_multiple and len(resolved) > 1:
+            raise ValueError(
+                "file chooser accepts a single file only; pass one path or use a multi-file input"
+            )
+        await chooser.set_files(resolved, timeout=timeout_seconds * 1000)
+        element_tag: str | None = None
         try:
-            from ..mouse import _mouse_drag_impl
+            element_tag = await chooser.element().evaluate("el => el.tagName.toLowerCase()")
+        except Exception:
+            element_tag = None
+        return {
+            "status": "uploaded",
+            "mode": "file-chooser",
+            "page_id": _page_id(page),
+            "trigger_frame": _frame_id(page, target_frame),
+            "trigger_source": source,
+            "element_tag": element_tag,
+            "is_multiple": is_multiple,
+            "files": resolved,
+        }
 
-            result = await _mouse_drag_impl(
-                page,
-                start_x,
-                start_y,
-                end_x,
-                end_y,
-                steps=steps,
-                button=button,
-                hold_ms=hold_ms,
-                settle_ms=settle_ms,
-                visual_ghost=visual_ghost,
-            )
-            result["page_id"] = _page_id(page)
-        finally:
-            if installed is not None:
-                from ..overlay import _finalize_overlay_observation
+    if frame is not None:
+        candidate_frames = [await resolve_frame(page, frame)]
+    else:
+        candidate_frames = []
+        active = await active_application_frame(page)
+        if active is not None:
+            candidate_frames.append(active)
+        candidate_frames.append(page.main_frame)
 
-                await _finalize_overlay_observation(
-                    page, installed, result, settle_ms=settle_ms, max_results=max_results
-                )
-            elif listener is not None:
-                from ..overlay import (
-                    _release_overlay_frame_listener,
-                    _stop_overlay_observers_best_effort,
-                )
+    input_locator = None
+    target_frame = None
+    search_errors: list[str] = []
+    for candidate in candidate_frames:
+        try:
+            scoped = candidate.locator("input[type=file]")
+            if await scoped.count() > 0:
+                input_locator = scoped.first
+                target_frame = candidate
+                break
+        except Exception as exc:
+            search_errors.append(str(exc))
+    if input_locator is None:
+        raise ValueError(
+            "no <input type=file> found in scope; supply a trigger locator "
+            f"(css/xpath/text/role) instead. frame search: {search_errors or 'no matches'}"
+        )
+    await input_locator.set_files(resolved, timeout=timeout_seconds * 1000)
+    return {
+        "status": "uploaded",
+        "mode": "set-input-files",
+        "page_id": _page_id(page),
+        "frame": _frame_id(page, target_frame),
+        "files": resolved,
+    }
 
-                await _stop_overlay_observers_best_effort(page)
-                await _release_overlay_frame_listener(page, listener, persistent=False)
-        return result
+
+async def upload_files(
+    files: list[str],
+    *,
+    css: str | None = None,
+    xpath: str | None = None,
+    text: str | None = None,
+    role: str | None = None,
+    name: str | None = None,
+    frame: str | None = None,
+    timeout_ms: int = 10_000,
+) -> dict[str, Any]:
+    """Upload workspace files; serialize with the global action lock."""
+    async with _action_lock:
+        return await _upload_files_impl(
+            files,
+            css=css,
+            xpath=xpath,
+            text=text,
+            role=role,
+            name=name,
+            frame=frame,
+            timeout_ms=timeout_ms,
+        )
 
 
 __all__ = [
@@ -647,4 +833,5 @@ __all__ = [
     "typewriter_fill",
     "typewriter_keyboard_type",
     "typewriter_type",
+    "upload_files",
 ]

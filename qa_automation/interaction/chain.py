@@ -33,6 +33,10 @@ ACTION_KINDS = frozenset(
         "drag",
         "cell_click",
         "cell_click_field",
+        "reorder_column",
+        "resize_column",
+        "vtable_reorder_column",
+        "vtable_resize_column",
         "wait",
     }
 )
@@ -53,7 +57,7 @@ _LOCATOR_KEYS = (
 
 #: Optional value/key plumbing for fill/type/press plus frame steering.
 _DOM_EXTRA_KEYS = ("value", "key", "frame", "timeout_ms", "expect_input", "in_iframe")
-_SUCCESS_STATUSES = frozenset({"acted", "clicked", "ok", "selected", "dragged", "waited"})
+_SUCCESS_STATUSES = frozenset({"acted", "clicked", "ok", "selected", "dragged", "waited", "reordered", "resized", "already-in-place", "already-fit"})
 
 
 async def analyze_page_compact() -> dict:
@@ -174,6 +178,12 @@ async def _chain_observation(url_before: str | None) -> dict:
 
 
 async def _execute_one(action: str, item: dict) -> dict:
+    """Run one action via the *unlocked* impl primitives.
+
+    The caller (``execute_chain``) holds ``_action_lock`` for the whole batch so
+    no other MCP tool can switch page/session between steps; calling the locked
+    public wrappers here would self-deadlock on the non-reentrant asyncio lock.
+    """
     if action == "wait":
         ms = max(0, min(int(item.get("ms", 100)), 30_000))
         await asyncio.sleep(ms / 1000)
@@ -184,7 +194,7 @@ async def _execute_one(action: str, item: dict) -> dict:
         missing = [name for name in required if item.get(name) is None]
         if missing:
             return _failed(action, f"missing required coordinates: {', '.join(missing)}")
-        raw = await automation.mouse_drag(
+        raw = await automation._mouse_drag_session_impl(
             float(item["start_x"]),
             float(item["start_y"]),
             float(item["end_x"]),
@@ -203,14 +213,14 @@ async def _execute_one(action: str, item: dict) -> dict:
             row = int(item["row"])
         except (KeyError, TypeError, ValueError):
             return _failed(action, "cell_click requires integer col and row")
-        raw = await automation.click_cell(
+        raw = await automation._click_cell_impl(
             col,
             row,
             double_click=bool(item.get("double_click", False)),
             button=str(item.get("button", "left")),
             verify=bool(item.get("verify", True)),
             observe_after=False,
-            frame=item.get("frame"),
+            frame_name=item.get("frame"),
             table_index=item.get("table_index"),
         )
         return _trim_result(action, raw)
@@ -225,13 +235,34 @@ async def _execute_one(action: str, item: dict) -> dict:
             and all(isinstance(i, int) for i in record_index)
         ):
             return _failed(action, "cell_click_field requires integer record_index")
-        raw = await automation.click_vtable_cell_by_field(
+        raw = await automation._click_vtable_cell_by_field_impl(
             field,
             record_index,
             double_click=bool(item.get("double_click", False)),
             button=str(item.get("button", "left")),
             verify=bool(item.get("verify", True)),
             observe_after=False,
+            frame=item.get("frame"),
+            table_index=item.get("table_index"),
+        )
+        return _trim_result(action, raw)
+    if action in {"reorder_column", "vtable_reorder_column"}:
+        raw = await automation._reorder_column_impl(
+            from_col=item.get("from_col"),
+            to_col=item.get("to_col"),
+            from_field=item.get("from_field"),
+            to_field=item.get("to_field"),
+            frame=item.get("frame"),
+            table_index=item.get("table_index"),
+        )
+        return _trim_result(action, raw)
+
+    if action in {"resize_column", "vtable_resize_column"}:
+        raw = await automation._resize_column_impl(
+            col=item.get("col"),
+            field=item.get("field"),
+            target_width=item.get("target_width"),
+            delta_width=item.get("delta_width"),
             frame=item.get("frame"),
             table_index=item.get("table_index"),
         )
@@ -243,7 +274,7 @@ async def _execute_one(action: str, item: dict) -> dict:
     settle_ms = item.get("settle_ms")
     if not isinstance(settle_ms, int) or settle_ms < 0:
         settle_ms = 80
-    raw = await automation.dom_interact(
+    raw = await automation._dom_interact_impl(
         action, observe_after=False, settle_ms=settle_ms, **kwargs
     )
     return _trim_result(action, raw)
@@ -258,12 +289,16 @@ async def execute_chain(
 ) -> dict:
     """Execute batched actions sequentially against the live page.
 
-    Each step is hard-bounded by ``step_timeout_ms`` (0 disables); after the
-    chain, one unifying observation records visible overlays and URL change
-    (sleep 150ms, then scan). Returns ``{"results": [...], "executed": n,
-    "truncated": bool, "observation": {...}}`` where ``executed`` counts
-    successful actions. With ``stop_on_error=True`` the first failure stops the
-    chain; with ``False`` remaining actions still run.
+    The whole batch runs under the global ``_action_lock`` so no concurrent MCP
+    tool can switch page/session between steps — without it, an interleaved
+    ``select_page``/``browser_session`` call could land steps 2..N on a
+    different page (or another account's isolated context). Each step is
+    hard-bounded by ``step_timeout_ms`` (0 disables); after the chain, one
+    unifying observation records visible overlays and URL change (sleep 150ms,
+    then scan). Returns ``{"results": [...], "executed": n, "truncated": bool,
+    "observation": {...}}`` where ``executed`` counts successful actions. With
+    ``stop_on_error=True`` the first failure stops the chain; with ``False``
+    remaining actions still run.
     """
     if not isinstance(actions, list):
         raise ValueError("actions must be a list of dicts")
@@ -273,34 +308,35 @@ async def execute_chain(
     url_before = await _page_url()
     results: list[dict] = []
     executed = 0
-    for raw_item in actions[:max_actions]:
-        if not isinstance(raw_item, dict):
-            results.append(_failed("?", "action entry must be a dict"))
-            if stop_on_error:
+    async with automation._action_lock:
+        for raw_item in actions[:max_actions]:
+            if not isinstance(raw_item, dict):
+                results.append(_failed("?", "action entry must be a dict"))
+                if stop_on_error:
+                    break
+                continue
+            action = str(raw_item.get("action") or "").strip().lower()
+            if not action or action not in ACTION_KINDS:
+                results.append(_failed(action or "?", f"unsupported action: {action!r}"))
+                if stop_on_error:
+                    break
+                continue
+            try:
+                if step_timeout_ms:
+                    result = await asyncio.wait_for(
+                        _execute_one(action, raw_item), timeout=step_timeout_ms / 1000
+                    )
+                else:
+                    result = await _execute_one(action, raw_item)
+            except TimeoutError:
+                result = _failed(action, f"step timeout after {step_timeout_ms}ms")
+            except Exception as exc:  # noqa: BLE001 - per-action guard, chain must survive
+                result = _failed(action, f"{type(exc).__name__}: {exc}")
+            results.append(result)
+            if result.get("ok"):
+                executed += 1
+            elif stop_on_error:
                 break
-            continue
-        action = str(raw_item.get("action") or "").strip().lower()
-        if not action or action not in ACTION_KINDS:
-            results.append(_failed(action or "?", f"unsupported action: {action!r}"))
-            if stop_on_error:
-                break
-            continue
-        try:
-            if step_timeout_ms:
-                result = await asyncio.wait_for(
-                    _execute_one(action, raw_item), timeout=step_timeout_ms / 1000
-                )
-            else:
-                result = await _execute_one(action, raw_item)
-        except TimeoutError:
-            result = _failed(action, f"step timeout after {step_timeout_ms}ms")
-        except Exception as exc:  # noqa: BLE001 - per-action guard, chain must survive
-            result = _failed(action, f"{type(exc).__name__}: {exc}")
-        results.append(result)
-        if result.get("ok"):
-            executed += 1
-        elif stop_on_error:
-            break
     observation = await _chain_observation(url_before)
     return {
         "results": results,

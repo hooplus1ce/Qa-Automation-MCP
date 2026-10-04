@@ -26,6 +26,7 @@ from ..browser import (
     _read_viewport_or_none,
     _restore_window_and_viewport,
 )
+from ..completeness import completeness_report
 from ..components.vtable.binding import (
     active_application_frame,
     resolve_frame,
@@ -156,6 +157,8 @@ _COMPACT_CONTROL_SCAN = r"""
   const query = customControlSelector ? `${baseQuery},${customControlSelector}` : baseQuery;
   const candidates = Array.from(scopeRoot.querySelectorAll(query));
   const controls = [];
+  const resultLimit = Math.max(1, Math.floor(Number(maxResults) || 40));
+  let totalCount = 0;
   let truncated = false;
 
   for (const el of candidates) {
@@ -178,7 +181,7 @@ _COMPACT_CONTROL_SCAN = r"""
       el.classList.contains('ant-select-selection') ? 'combobox' : 'control'
     );
     const rect = el.getBoundingClientRect();
-    controls.push({
+    const control = {
       role,
       name: nameFor(el),
       description: trim(el.getAttribute('aria-description') || el.getAttribute('title')) || null,
@@ -221,13 +224,12 @@ _COMPACT_CONTROL_SCAN = r"""
         width: Math.round(rect.width * 100) / 100,
         height: Math.round(rect.height * 100) / 100,
       },
-    });
-    if (controls.length >= maxResults) {
-      truncated = true;
-      break;
-    }
+    };
+    totalCount += 1;
+    if (controls.length < resultLimit) controls.push(control);
+    else truncated = true;
   }
-  return { controls, truncated, messages: [] };
+  return { controls, total_count: totalCount, truncated, limit: resultLimit, messages: [] };
 }
 """
 
@@ -438,9 +440,11 @@ async def _dom_snapshot_impl(
         prune_stats: dict[str, int] = {}
         if prune_noise:
             snapshot, prune_stats = prune_anonymous_branches(snapshot)
-        truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+        source_chars = len(snapshot)
+        truncated = source_chars > _MAX_SNAPSHOT_CHARACTERS
         if truncated:
             snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+        snapshot_chars = min(source_chars, _MAX_SNAPSHOT_CHARACTERS)
         return {
             "status": "ok",
             "selector": selector,
@@ -452,7 +456,24 @@ async def _dom_snapshot_impl(
             "depth": kwargs.get("depth"),
             "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
             "truncated": truncated,
+            "character_truncated": truncated,
             "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "coverage": completeness_report(
+                scope={
+                    "kind": "aria_snapshot",
+                    "frame": scope_resolved,
+                    "selector": selector,
+                    "depth": kwargs.get("depth"),
+                    "visible_only": visible_only,
+                    "prune_noise": prune_noise,
+                },
+                returned_count=snapshot_chars,
+                limit=_MAX_SNAPSHOT_CHARACTERS,
+                truncated=truncated,
+                complete_for_scope=not truncated,
+                unit="characters",
+                reasons=["character_limit"] if truncated else [],
+            ),
             "noise_pruned": prune_stats.get("removed_nodes", 0) > 0,
             "prune_stats": {**prune_stats, "raw_chars": raw_chars, "chars": len(snapshot)}
             if prune_noise
@@ -461,7 +482,7 @@ async def _dom_snapshot_impl(
             "hint": None
             if not prune_noise
             else "已剪除无名结构包装子树；需要原始 aria 树时传 prune_noise=false，"
-                 "需要业务表格数据请改用 vtable_*（canvas 不进 aria 树）",
+            "需要业务表格数据请改用 vtable_*（canvas 不进 aria 树）",
         }
 
     # 2. Selector provided: construct locator with error handling
@@ -501,6 +522,13 @@ async def _dom_snapshot_impl(
             "frame": frame,
             "match_count": 0,
             "snapshot": "",
+            "coverage": completeness_report(
+                scope={"kind": "selector", "selector": selector, "frame": frame or "active"},
+                returned_count=0,
+                total_count=0,
+                truncated=False,
+                has_more=False,
+            ),
             "message": f"Selector '{selector}' did not match any elements in frame '{frame or 'active'}'.",
         }
 
@@ -525,7 +553,8 @@ async def _dom_snapshot_impl(
                 "snapshot": "",
             }
 
-        truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+        source_chars = len(snapshot)
+        truncated = source_chars > _MAX_SNAPSHOT_CHARACTERS
         if truncated:
             snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
 
@@ -541,7 +570,23 @@ async def _dom_snapshot_impl(
             "depth": kwargs.get("depth"),
             "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
             "truncated": truncated,
+            "character_truncated": truncated,
             "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "coverage": completeness_report(
+                scope={
+                    "kind": "selector_nth",
+                    "selector": selector,
+                    "nth": nth,
+                    "frame": frame or "active",
+                    "depth": kwargs.get("depth"),
+                },
+                returned_count=min(source_chars, _MAX_SNAPSHOT_CHARACTERS),
+                limit=_MAX_SNAPSHOT_CHARACTERS,
+                truncated=truncated,
+                complete_for_scope=not truncated,
+                unit="characters",
+                reasons=["character_limit"] if truncated else [],
+            ),
             "snapshot": snapshot,
         }
 
@@ -576,7 +621,8 @@ async def _dom_snapshot_impl(
                 "snapshot": "",
             }
 
-        truncated = len(snapshot) > _MAX_SNAPSHOT_CHARACTERS
+        source_chars = len(snapshot)
+        truncated = source_chars > _MAX_SNAPSHOT_CHARACTERS
         if truncated:
             snapshot = snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
 
@@ -591,7 +637,22 @@ async def _dom_snapshot_impl(
             "depth": kwargs.get("depth"),
             "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
             "truncated": truncated,
+            "character_truncated": truncated,
             "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+            "coverage": completeness_report(
+                scope={
+                    "kind": "selector_single",
+                    "selector": selector,
+                    "frame": frame or "active",
+                    "depth": kwargs.get("depth"),
+                },
+                returned_count=min(source_chars, _MAX_SNAPSHOT_CHARACTERS),
+                limit=_MAX_SNAPSHOT_CHARACTERS,
+                truncated=truncated,
+                complete_for_scope=not truncated,
+                unit="characters",
+                reasons=["character_limit"] if truncated else [],
+            ),
             "snapshot": snapshot,
         }
 
@@ -635,19 +696,25 @@ async def _dom_snapshot_impl(
             part = await loc.aria_snapshot(**kwargs)
             header = f"/* Match {idx + 1} of {total_count} ({vis_tag}): {nth_selector} */\n"
             snapshot_parts.append(header + part)
-            metadata_elements.append({
-                "index": idx,
-                "visible": vis,
-                "selector": nth_selector,
-            })
+            metadata_elements.append(
+                {
+                    "index": idx,
+                    "visible": vis,
+                    "selector": nth_selector,
+                }
+            )
         except Exception as exc:
-            snapshot_parts.append(f"/* Match {idx + 1} of {total_count} ({vis_tag}): error capturing snapshot ({exc}) */")
-            metadata_elements.append({
-                "index": idx,
-                "visible": vis,
-                "selector": nth_selector,
-                "error": str(exc),
-            })
+            snapshot_parts.append(
+                f"/* Match {idx + 1} of {total_count} ({vis_tag}): error capturing snapshot ({exc}) */"
+            )
+            metadata_elements.append(
+                {
+                    "index": idx,
+                    "visible": vis,
+                    "selector": nth_selector,
+                    "error": str(exc),
+                }
+            )
 
     if total_count > len(elements_to_snapshot):
         remaining = total_count - len(elements_to_snapshot)
@@ -657,9 +724,14 @@ async def _dom_snapshot_impl(
         )
 
     combined_snapshot = "\n\n".join(snapshot_parts)
-    truncated = len(combined_snapshot) > _MAX_SNAPSHOT_CHARACTERS
-    if truncated:
-        combined_snapshot = combined_snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+    source_chars = len(combined_snapshot)
+    character_truncated = source_chars > _MAX_SNAPSHOT_CHARACTERS
+    elements_truncated = len(elements_to_snapshot) < len(candidates)
+    truncated = character_truncated or elements_truncated
+    if character_truncated:
+        combined_snapshot = (
+            combined_snapshot[:_MAX_SNAPSHOT_CHARACTERS] + "\n… [snapshot truncated]"
+        )
 
     return {
         "status": "ok",
@@ -667,13 +739,42 @@ async def _dom_snapshot_impl(
         "frame": frame,
         "match_count": total_count,
         "shown_count": len(elements_to_snapshot),
+        "visible_count": len(candidates),
+        "excluded_by_visibility_count": total_count - len(candidates),
         "matched_elements": metadata_elements,
         "mode": kwargs["mode"],
         "boxes": kwargs["boxes"],
         "depth": kwargs.get("depth"),
         "depth_clamped": requested_depth is not None and requested_depth > _MAX_SNAPSHOT_DEPTH,
         "truncated": truncated,
+        "character_truncated": character_truncated,
+        "elements_truncated": elements_truncated,
         "character_limit": _MAX_SNAPSHOT_CHARACTERS,
+        "coverage": completeness_report(
+            scope={
+                "kind": "selector_matches",
+                "selector": selector,
+                "frame": frame or "active",
+                "depth": kwargs.get("depth"),
+                "visible_only": visible_only,
+            },
+            returned_count=len(elements_to_snapshot),
+            total_count=len(candidates),
+            limit=cap,
+            truncated=truncated,
+            has_more=elements_truncated,
+            complete_for_scope=not truncated,
+            unit="elements",
+            reasons=[
+                reason
+                for reason, active in (
+                    ("max_elements", elements_truncated),
+                    ("character_limit", character_truncated),
+                    ("visibility_filter", total_count > len(candidates)),
+                )
+                if active
+            ],
+        ),
         "snapshot": combined_snapshot,
     }
 
@@ -712,6 +813,7 @@ async def _analyze_scope_impl(
     max_overlays: int = 10,
 ) -> dict:
     from ..overlay import _scan_overlays_impl
+
     page = await _current_page_impl()
     active_frame = await active_application_frame(page)
     overlays_resp = await _scan_overlays_impl(max_results=max_overlays, scope="active")
@@ -721,9 +823,7 @@ async def _analyze_scope_impl(
     scope_selector = None
     mode = "active_application"
     if focus is not None:
-        target_frame = await resolve_frame(
-            page, focus.get("frame_id") or focus.get("frame_name")
-        )
+        target_frame = await resolve_frame(page, focus.get("frame_id") or focus.get("frame_name"))
         scope_selector = focus.get("selector")
         mode = "focus_layer"
 
@@ -751,7 +851,7 @@ async def _analyze_scope_impl(
                 "disabled": c["disabled"],
                 "readonly": c["readonly"],
                 "state": c["state"],
-                "ref": f"c{idx+1}",
+                "ref": f"c{idx + 1}",
                 "frame": "active" if target_frame == active_frame else "top",
                 "frame_id": _frame_id(page, target_frame),
                 "scope": mode,
@@ -808,26 +908,44 @@ async def _analyze_scope_impl(
             "kind": focus.get("kind") if focus else None,
             "selector": scope_selector,
             "frame": _frame_details(page, target_frame),
-        } if focus else {
+        }
+        if focus
+        else {
             "mode": mode,
-            "active_iframe": await _frame_context_details(page, active_frame) if active_frame else None,
+            "active_iframe": await _frame_context_details(page, active_frame)
+            if active_frame
+            else None,
         },
         "focus_layer": focus,
         "messages": scan_result.get("messages") or [],
         "controls": controls,
         "control_count": len(controls),
+        "control_total_count": int(scan_result.get("total_count") or len(controls)),
+        "control_limit": int(scan_result.get("limit") or max(1, int(max_controls))),
         "truncated": bool(scan_result.get("truncated")),
+        "coverage": {
+            "controls": completeness_report(
+                scope={
+                    "kind": "interactive_controls",
+                    "frame_id": _frame_id(page, target_frame),
+                    "mode": mode,
+                    "selector": scope_selector,
+                },
+                returned_count=len(controls),
+                total_count=int(scan_result.get("total_count") or len(controls)),
+                limit=int(scan_result.get("limit") or max(1, int(max_controls))),
+                truncated=bool(scan_result.get("truncated")),
+                reasons=["max_controls"] if scan_result.get("truncated") else [],
+            ),
+            "overlays": overlays_resp.get("coverage"),
+        },
         "errors": [],
     }
 
 
-async def analyze_scope(
-    *, max_controls: int = 40, max_overlays: int = 10
-) -> dict:
+async def analyze_scope(*, max_controls: int = 40, max_overlays: int = 10) -> dict:
     async with _action_lock:
-        return await _analyze_scope_impl(
-            max_controls=max_controls, max_overlays=max_overlays
-        )
+        return await _analyze_scope_impl(max_controls=max_controls, max_overlays=max_overlays)
 
 
 def _image_size(image: bytes) -> dict[str, int] | None:
@@ -1027,9 +1145,7 @@ async def _screenshot_element_impl(
     if clip_size != dom_clip_size:
         # DOM CSS 空间与裁剪框空间尺寸不同,两套都可能成为残留值
         guard_sizes.append(clip_size)
-    expected_size = (
-        (viewport_before["w"], viewport_before["h"]) if viewport_before else None
-    )
+    expected_size = (viewport_before["w"], viewport_before["h"]) if viewport_before else None
     viewport_guard: dict[str, Any] | None = None
     try:
         image = await asyncio.wait_for(
@@ -1086,11 +1202,11 @@ async def _screenshot_element_impl(
     expected_extensions = {".png"} if image_format == "png" else {".jpg", ".jpeg"}
     requested_filename = filename
     if requested_filename:
-        suffix = "." + requested_filename.rsplit(".", 1)[-1].lower() if "." in requested_filename else ""
+        suffix = (
+            "." + requested_filename.rsplit(".", 1)[-1].lower() if "." in requested_filename else ""
+        )
         if suffix and suffix not in expected_extensions:
-            raise ValueError(
-                f"filename extension must match image_format={image_format!r}"
-            )
+            raise ValueError(f"filename extension must match image_format={image_format!r}")
         if not suffix:
             requested_filename = f"{requested_filename}.{image_format}"
     output_path = artifact_file(
@@ -1123,7 +1239,9 @@ async def _screenshot_element_impl(
             "css": css,
             "role": role,
             "name": name,
-        } if locator_source else None,
+        }
+        if locator_source
+        else None,
     }
     image_size = _image_size(image)
     if image_size:
@@ -1157,8 +1275,10 @@ async def screenshot_element(**kwargs: Any) -> dict[str, Any]:
     async with _action_lock:
         return await _screenshot_element_impl(**kwargs)
 
+
 async def _page_context_impl(*, max_results: int = 10) -> dict:
     from ..overlay import _scan_overlays_impl
+
     page = await _current_page_impl()
     title = ""
     try:
@@ -1167,14 +1287,19 @@ async def _page_context_impl(*, max_results: int = 10) -> dict:
         pass
     active = await active_application_frame(page)
     frames = list(page.frames)
+    effective_limit = max(1, int(max_results))
     frame_items = []
-    for frame in frames[: max(1, int(max_results))]:
+    for frame in frames[:effective_limit]:
         is_active = active is not None and frame == active
         if is_active:
             # 活动 frame 由下面的 active_iframe 完整描述一次即可；这里只留引用，
             # 否则同一坨 frame_url 会在一次 ui_page_context 里重复出现两次。
             frame_items.append(
-                {**_frame_details(page, frame), "scope": "active_iframe", "described_in": "active_iframe"}
+                {
+                    **_frame_details(page, frame),
+                    "scope": "active_iframe",
+                    "described_in": "active_iframe",
+                }
             )
             continue
         detail = await _frame_context_details(page, frame)
@@ -1188,6 +1313,9 @@ async def _page_context_impl(*, max_results: int = 10) -> dict:
         "url": page.url,
         "title": title,
         "frame_count": len(frames),
+        "frames_returned_count": len(frame_items),
+        "frames_limit": effective_limit,
+        "frames_truncated": len(frame_items) < len(frames),
         "active_iframe": (
             await _frame_context_details(page, active, full_url=True)
             if active is not None
@@ -1196,6 +1324,20 @@ async def _page_context_impl(*, max_results: int = 10) -> dict:
         "frames": frame_items,
         "focus_layer": overlays.get("context", {}).get("focus_layer"),
         "visible_overlays": overlays.get("overlays", []),
+        "coverage": {
+            "frames": completeness_report(
+                scope={
+                    "kind": "page_frames",
+                    "active_iframe_described_separately": active is not None,
+                },
+                returned_count=len(frame_items),
+                total_count=len(frames),
+                limit=effective_limit,
+                truncated=len(frame_items) < len(frames),
+                reasons=["max_results"] if len(frame_items) < len(frames) else [],
+            ),
+            "visible_overlays": overlays.get("coverage"),
+        },
         "observer_errors": overlays.get("observer_errors", []),
     }
 

@@ -38,7 +38,7 @@ def create_server() -> FastMCP:
     @mcp.tool(name="antd_select")
     @instrument_tool
     async def antd_select(
-        option_text: str,
+        option_text: str | list[str],
         css: str | None = None,
         xpath: str | None = None,
         text: str | None = None,
@@ -52,13 +52,13 @@ def create_server() -> FastMCP:
         解决 AntD 弹窗内下拉误抓顶部导航菜单遗留浮层、以及点击后未真实落值的顽固问题。
 
         Args:
-            option_text: 目标选项文本（如 "按部门审批"）
+            option_text: 目标选项文本（如 "按部门审批"；多选下拉框可传数组 ["选项A", "选项B"] 或逗号分隔字符串 "选项A, 选项B"，将连续点击并自动收起）
             css: Select 触发框 CSS 选择器（如 ".ant-select" 或具有业务语义的容器选择器）
             xpath: 触发框 XPath
             text: 触发框上原有的可见文本
             search_text: 若下拉框支持搜索过滤，展开后输入的搜索关键字
             frame: 目标 frame（默认自动判定 active iframe 或顶层）
-            close_multi: 选择完成后自动派发 ESC 键收起浮层，防止遮挡后续表单控件（默认 True）
+            close_multi: 选择完成后启用四段式（ESC -> 触发框 -> 安全空白区 -> 等待隐藏）自动彻底收回下拉浮层，确保不遮挡底部“确定/保存”按钮（默认 True）
             timeout_ms: 整体执行超时毫秒数（默认 5000ms）
         """
         return await antd_ops.antd_select(

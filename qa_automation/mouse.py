@@ -359,9 +359,14 @@ async def _smooth_mouse_move_to(
     try:
         if getattr(page, "url", None) and page.url != "about:blank":
             await _ensure_cursor_helper(page)
-            # 在浏览器内核渲染层直接以 requestAnimationFrame (60-144 FPS) 硬件加速驱动平滑轨迹，彻底避免 Python 跨进程 IPC 掉帧
-            await page.evaluate(
-                f"window.__qa_automation_glide_cursor && window.__qa_automation_glide_cursor({target_x:.1f}, {target_y:.1f}, {duration_ms})"
+            # 在浏览器内核渲染层直接以 requestAnimationFrame (60-144 FPS) 硬件加速驱动平滑轨迹，彻底避免 Python 跨进程 IPC 掉帧。
+            # rAF 在后台/隐藏 tab 会整体停摆，promise 永不 resolve——必须加上界，
+            # 超时落入下方 Python 细密轨迹回退，否则会永久占死 _action_lock。
+            await asyncio.wait_for(
+                page.evaluate(
+                    f"window.__qa_automation_glide_cursor && window.__qa_automation_glide_cursor({target_x:.1f}, {target_y:.1f}, {duration_ms})"
+                ),
+                timeout=duration_ms / 1000 + 2.0,
             )
             glided = True
     except Exception:
@@ -620,6 +625,8 @@ async def _mouse_drag_impl(
                     pass
 
             await page.mouse.move(start_x, start_y)
+            # 允许 Canvas 列表 (如 VTable 列宽分界线 / 表头拖拽) 与 DOM 响应 mousemove 建立 hover / col-resize 状态
+            await asyncio.sleep(0.06)
             await page.mouse.down(button=button)
 
             if hold_ms > 0:

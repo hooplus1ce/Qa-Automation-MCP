@@ -56,7 +56,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "</script>"
             "<iframe id='application' srcdoc=\""
             + FRAME_DOCUMENT.replace("&", "&amp;").replace('"', "&quot;")
-            + "\"></iframe>"
+            + '"></iframe>'
         )
         await self.page.locator("iframe").wait_for()
         await self.page.frames[1].get_by_role("button", name="Open modal").wait_for()
@@ -171,7 +171,9 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         message = next(item for item in result["ui_events"] if item["text"] == "Saved from iframe")
         self.assertEqual(message["kind"], "notification")
         self.assertEqual(message["frame_name"], "application")
-        self.assertFalse(any(item["text"] == "Saved from iframe" for item in result["visible_overlays"]))
+        self.assertFalse(
+            any(item["text"] == "Saved from iframe" for item in result["visible_overlays"])
+        )
 
     async def test_top_level_portal_is_collected(self) -> None:
         result = await automation.click_dom_and_observe(
@@ -247,7 +249,9 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "</script>"
         )
 
-        result = await automation.click_dom_and_observe("button", name="Update message", settle_ms=80)
+        result = await automation.click_dom_and_observe(
+            "button", name="Update message", settle_ms=80
+        )
 
         self.assertEqual(result["status"], "clicked")
         updated = next(item for item in result["ui_events"] if item["text"] == "updated")
@@ -269,13 +273,9 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["status"], "clicked")
-        message = next(
-            item for item in result["ui_events"] if item["text"] == "committed"
-        )
+        message = next(item for item in result["ui_events"] if item["text"] == "committed")
         self.assertIn(message["event"], {"added", "removed"})
-        self.assertFalse(
-            any(item["text"] == "committed" for item in result["visible_overlays"])
-        )
+        self.assertFalse(any(item["text"] == "committed" for item in result["visible_overlays"]))
 
     async def test_frame_id_survives_frame_reordering(self) -> None:
         await self.page.set_content(
@@ -305,9 +305,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["observer_cleanup_failed"])
         self.assertFalse(
-            await self.page.evaluate(
-                "key => Boolean(window[key])", automation.OVERLAY_OBSERVER_KEY
-            )
+            await self.page.evaluate("key => Boolean(window[key])", automation.OVERLAY_OBSERVER_KEY)
         )
 
     async def test_stream_baseline_advances_when_not_stopped(self) -> None:
@@ -351,9 +349,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             " document.body.append(node);"
             "};</script>"
         )
-        result = await automation.click_dom_and_observe(
-            "button", name="Open filter", settle_ms=20
-        )
+        result = await automation.click_dom_and_observe("button", name="Open filter", settle_ms=20)
         self.assertEqual(result["status"], "clicked")
         popup = next(item for item in result["overlays"] if item["text"] == "Filter options")
         self.assertEqual(popup["kind"], "dropdown")
@@ -383,8 +379,15 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(result["interaction"]),
             {
-                "target", "frame", "locator", "coordinate", "action",
-                "before_state", "after_state", "evidence", "confidence",
+                "target",
+                "frame",
+                "locator",
+                "coordinate",
+                "action",
+                "before_state",
+                "after_state",
+                "evidence",
+                "confidence",
             },
         )
 
@@ -401,7 +404,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "<div class='ant-tabs-tabpane' role='tabpanel' aria-hidden='false'>"
             "<iframe name='focused-module' srcdoc=\""
             + frame_document.replace("&", "&amp;").replace('"', "&quot;")
-            + "\"></iframe></div>"
+            + '"></iframe></div>'
         )
         await self.page.locator("iframe").wait_for()
         await self.page.frames[1].get_by_role("button", name="Confirm").wait_for()
@@ -417,10 +420,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Top background", names)
         self.assertTrue(all(control["frame"] == "active" for control in result["controls"]))
         self.assertTrue(
-            all(
-                "locator" not in control and "box" not in control
-                for control in result["controls"]
-            )
+            all("locator" not in control and "box" not in control for control in result["controls"])
         )
 
     async def test_antd_select_uses_portal_in_active_iframe(self) -> None:
@@ -442,7 +442,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
             "<div class='ant-tabs-tabpane' role='tabpanel' aria-hidden='false'>"
             "<iframe name='select-module' srcdoc=\""
             + frame_document.replace("&", "&amp;").replace('"', "&quot;")
-            + "\"></iframe></div>"
+            + '"></iframe></div>'
         )
         await self.page.locator("iframe").wait_for()
         frame = self.page.frames[1]
@@ -547,7 +547,8 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["interaction"]["target"]["field"], "sku")
         self.assertTrue(
             next(
-                item for item in result["interaction"]["evidence"]
+                item
+                for item in result["interaction"]["evidence"]
                 if item["type"] == "scenegraph-changed"
             )["matched"]
         )
@@ -737,7 +738,6 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context["page_id"], second_id)
         self.assertEqual((await automation.current_page()), second)
 
-
     async def test_modal_resolves_to_inner_dialog_geometry_and_compact_changes(self) -> None:
         await self.page.set_content(
             "<button id='open-modal'>Open</button>"
@@ -791,7 +791,9 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(messages), 1)
         self.assertNotIn("move-up-enter", messages[0]["selector"])
 
-    async def test_iframe_control_click_glides_to_exact_viewport_center_without_double_offset(self) -> None:
+    async def test_iframe_control_click_glides_to_exact_viewport_center_without_double_offset(
+        self,
+    ) -> None:
         await self.page.set_content(
             "<iframe name='offset-frame' style='position:absolute;left:200px;top:150px;width:400px;height:300px;border:none;' "
             "srcdoc=\"<button id='target-btn' style='position:absolute;left:50px;top:30px;width:100px;height:40px;'>Click Target</button>\"></iframe>"
@@ -801,6 +803,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_move(page, target_x, target_y):
             coords.append((target_x, target_y))
+
         with patch("qa_automation.interaction._smooth_mouse_move_to", side_effect=record_move):
             result = await automation.dom_interact(
                 "click",
@@ -816,6 +819,65 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         # True viewport center is (250 + 50 = 300, 180 + 20 = 200)
         self.assertAlmostEqual(glide_x, 300.0, delta=2)
         self.assertAlmostEqual(glide_y, 200.0, delta=2)
+
+    async def test_overlay_scan_reports_total_and_truncation(self) -> None:
+        await self.page.set_content(
+            "<div id='a' role='dialog' style='width:100px;height:50px'>A</div>"
+            "<div id='b' role='dialog' style='position:absolute;left:120px;width:100px;height:50px'>B</div>"
+            "<div id='c' role='dialog' style='position:absolute;left:240px;width:100px;height:50px'>C</div>"
+        )
+
+        result = await automation.scan_overlays(scope="all", max_results=1)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["returned_count"], 1)
+        self.assertEqual(result["total_count"], 3)
+        self.assertTrue(result["has_more"])
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["coverage"]["complete_for_scope"])
+        self.assertEqual(result["coverage"]["reasons"], ["max_results"])
+
+    async def test_control_scan_reports_exact_total_beyond_return_limit(self) -> None:
+        await self.page.set_content(
+            "<button>One</button><button>Two</button><button>Three</button>"
+        )
+
+        result = await automation.analyze_scope(max_controls=1)
+
+        self.assertEqual(result["control_count"], 1)
+        self.assertEqual(result["control_total_count"], 3)
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["coverage"]["controls"]["complete_for_scope"])
+        self.assertTrue(result["coverage"]["controls"]["has_more"])
+
+    async def test_vtable_analysis_honors_zero_samples_and_reports_missing_scope(self) -> None:
+        await self._mount_fake_vtable()
+
+        result = await automation.vtable_analysis(max_columns=1, sample_rows=0)
+        coverage = result["analysis"]["coverage"]
+
+        self.assertEqual(len(result["analysis"]["columns"]), 1)
+        self.assertEqual(result["analysis"]["columns"][0].get("sample_cells", []), [])
+        self.assertEqual(coverage["sample_rows"]["requested_rows_per_column"], 0)
+        self.assertTrue(coverage["columns"]["truncated"])
+        self.assertTrue(coverage["sample_rows"]["truncated"])
+        self.assertFalse(coverage["complete_for_scope"])
+
+    async def test_overlay_scan_reports_result_limit_separately_from_buffer_overflow(self) -> None:
+        await self.page.set_content(
+            "<div id='a' role='dialog' style='position:fixed;width:100px;height:50px'>A</div>"
+            "<div id='b' role='dialog' style='position:fixed;left:120px;width:100px;height:50px'>B</div>"
+            "<div id='c' role='dialog' style='position:fixed;left:240px;width:100px;height:50px'>C</div>"
+        )
+
+        result = await automation.scan_overlays(scope="all", max_results=1)
+
+        self.assertEqual(result["returned_count"], 1)
+        self.assertEqual(result["total_count"], 3)
+        self.assertTrue(result["has_more"])
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["coverage"]["complete_for_scope"])
+        self.assertEqual(result["coverage"]["reasons"], ["max_results"])
 
     async def test_static_scan_reads_current_dom_without_installing_observer(self) -> None:
         await self.page.set_content(
@@ -872,10 +934,10 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         by_kind = {item["kind"]: item for item in result["overlays"]}
 
         self.assertEqual(set(by_kind), {"dialog", "dropdown"})
+        self.assertEqual(by_kind["dropdown"]["parent_overlay_id"], by_kind["dialog"]["overlay_id"])
         self.assertEqual(
-            by_kind["dropdown"]["parent_overlay_id"], by_kind["dialog"]["overlay_id"]
+            result["context"]["focus_layer"]["overlay_id"], by_kind["dropdown"]["overlay_id"]
         )
-        self.assertEqual(result["context"]["focus_layer"]["overlay_id"], by_kind["dropdown"]["overlay_id"])
 
     async def test_topmost_popover_wins_over_dialog_by_stack(self) -> None:
         await self.page.set_content(
@@ -999,6 +1061,7 @@ class OverlayObserverTests(unittest.IsolatedAsyncioTestCase):
         # Verify that during drag, mousemove had buttons pressed
         drag_moves = [e for e in events if e["type"] == "mousemove" and e["buttons"] > 0]
         self.assertGreaterEqual(len(drag_moves), 8)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

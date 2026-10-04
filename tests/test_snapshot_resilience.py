@@ -17,8 +17,10 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_frame.locator = MagicMock(return_value=mock_root)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector=None)
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["snapshot"], "- document: root content")
@@ -31,19 +33,21 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_first = MagicMock()
         mock_first.wait_for = AsyncMock(return_value=None)
         mock_first.is_visible = AsyncMock(return_value=True)
-        mock_first.aria_snapshot = AsyncMock(return_value="- button \"Submit\"")
+        mock_first.aria_snapshot = AsyncMock(return_value='- button "Submit"')
         mock_target.first = mock_first
         mock_target.count = AsyncMock(return_value=1)
         mock_frame.locator = MagicMock(return_value=mock_target)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector="button.ant-btn")
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["match_count"], 1)
             self.assertTrue(res["visible"])
-            self.assertEqual(res["snapshot"], "- button \"Submit\"")
+            self.assertEqual(res["snapshot"], '- button "Submit"')
 
     async def test_snapshot_zero_elements_not_found(self) -> None:
         mock_frame = MagicMock()
@@ -55,8 +59,10 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_frame.locator = MagicMock(return_value=mock_target)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector="nonexistent-selector", timeout=0.1)
             self.assertEqual(res["status"], "not_found")
             self.assertEqual(res["match_count"], 0)
@@ -88,8 +94,10 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_frame.locator = MagicMock(return_value=mock_target)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector="div.ant-modal")
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["match_count"], 2)
@@ -119,8 +127,10 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_frame.locator = MagicMock(return_value=mock_target)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector="div.ant-modal", visible_only=True)
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["match_count"], 2)
@@ -146,8 +156,10 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_frame.locator = MagicMock(return_value=mock_target)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector="div.ant-modal", nth=1)
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["nth"], 1)
@@ -173,12 +185,20 @@ class SnapshotResilienceTest(unittest.IsolatedAsyncioTestCase):
         mock_frame.locator = MagicMock(return_value=mock_target)
         mock_frame.evaluate = AsyncMock(return_value=None)
 
-        with patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())), \
-             patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)):
+        with (
+            patch.object(snapshot, "_current_page_impl", AsyncMock(return_value=MagicMock())),
+            patch.object(snapshot, "resolve_frame", AsyncMock(return_value=mock_frame)),
+        ):
             res = await snapshot._dom_snapshot_impl(selector="li", max_elements=2)
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["match_count"], 5)
             self.assertEqual(res["shown_count"], 2)
+            self.assertTrue(res["truncated"])
+            self.assertTrue(res["elements_truncated"])
+            self.assertFalse(res["coverage"]["complete_for_scope"])
+            self.assertEqual(res["coverage"]["returned_count"], 2)
+            self.assertEqual(res["coverage"]["total_count"], 5)
+            self.assertTrue(res["coverage"]["has_more"])
             self.assertIn("Displayed 2", res["snapshot"])
             self.assertIn("inspect remaining 3 elements", res["snapshot"])
 
