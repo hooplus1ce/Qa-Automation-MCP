@@ -175,9 +175,7 @@ def _derive_urls(raw: dict[str, Any]) -> tuple[str, str, str, str]:
     login_page = str(raw.get("login_page") or "").strip() or (
         LOGIN_PAGE_TEMPLATE.format(host=host) if host else ""
     )
-    cookie_domain = str(raw.get("cookie_domain") or "").strip() or (
-        "." + ".".join(host.split(".")[-2:]) if host.count(".") >= 1 else host
-    )
+    cookie_domain = str(raw.get("cookie_domain") or "").strip() or host
     return origin, admin_url, login_page, cookie_domain
 
 
@@ -341,16 +339,23 @@ def save_session(
 ) -> dict[str, Any]:
     """写入登录态缓存（含明文 token，目录已在 .gitignore 中忽略）。"""
     now = time.time()
+    target_host = urlsplit(profile.admin_url or profile.origin).netloc
+    cleaned_cookies: list[dict[str, Any]] = []
+    for c in (cookies or []):
+        d = str(c.get("domain") or "").lstrip(".")
+        if target_host and d and d != target_host.lstrip("."):
+            continue
+        cleaned_cookies.append(c)
     payload = {
         "profile": profile.name,
         "username": profile.username,
         "origin": profile.origin,
         "admin_url": profile.admin_url,
         "token": token,
-        "cookies": cookies or [],
+        "cookies": cleaned_cookies,
         "saved_at": now,
         "expires_at": now + session_ttl(),
-        "cookie_names": sorted({c.get("name", "") for c in (cookies or []) if c.get("name")}),
+        "cookie_names": sorted({c.get("name", "") for c in cleaned_cookies if c.get("name")}),
     }
     _MEMORY_SESSIONS[profile.name] = payload
     if session_persist():
@@ -377,6 +382,12 @@ def load_session(profile: AccountProfile) -> dict[str, Any] | None:
     if float(payload.get("expires_at") or 0) <= time.time():
         clear_session(profile)
         return None
+    target_host = urlsplit(profile.admin_url or profile.origin).netloc
+    if target_host and payload.get("cookies"):
+        payload["cookies"] = [
+            c for c in payload["cookies"]
+            if str(c.get("domain") or "").lstrip(".") == target_host.lstrip(".")
+        ]
     return payload
 
 

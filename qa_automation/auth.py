@@ -112,15 +112,22 @@ def build_cookies_to_inject(
     cookies_dict: dict[str, str],
     token: str | None = None,
     target_host: str = "",
+    *,
+    include_parent_domain: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build Playwright-compatible cookie dictionaries for target domains and access tokens."""
+    """Build Playwright-compatible cookie dictionaries for target domains and access tokens.
+
+    默认只向精确的 target_host 注入 Cookie，避免向泛根域（如 .hoolinks.com）写入双份 Cookie
+    导致 RFC 6265 请求头顺序歧义、微服务鉴权遮蔽或跨子域环境相互踩踏。
+    若业务确有跨子域共享需求，可显式指定 include_parent_domain=True。
+    """
     domains = set()
     if target_host:
         domains.add(target_host)
-        parent = extract_parent_domain(target_host)
-        if parent:
-            domains.add(parent)
-
+        if include_parent_domain:
+            parent = extract_parent_domain(target_host)
+            if parent:
+                domains.add(parent)
     cookies_map: dict[str, str] = dict(cookies_dict)
     if token:
         for key in ("HL-Access-Token", "cookie_token", "UCTOKEN"):

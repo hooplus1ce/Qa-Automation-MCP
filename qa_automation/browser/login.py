@@ -325,7 +325,12 @@ async def _browser_login_impl(
                     )
             ctx = page.context
             await ctx.clear_cookies()
-            await ctx.add_cookies(api_res["cookies_to_inject"])
+            host_cookies = [
+                c
+                for c in api_res["cookies_to_inject"]
+                if not target_host or c.get("domain", "").lstrip(".") == target_host.lstrip(".")
+            ]
+            await ctx.add_cookies(host_cookies)
             admin_url = url
             if "/login" in admin_url:
                 admin_url = admin_url.split("/login")[0]

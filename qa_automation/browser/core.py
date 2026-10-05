@@ -655,6 +655,9 @@ async def _inject_cookies_impl(
                     cookie_dict["domain"] = effective_host
             if not cookie_dict.get("path"):
                 cookie_dict["path"] = "/"
+            c_domain = str(cookie_dict.get("domain") or "").lstrip(".")
+            if effective_host and c_domain and c_domain != effective_host.lstrip("."):
+                continue
             cookies_to_add.append(cookie_dict)
 
     # 2. 处理传入的 token

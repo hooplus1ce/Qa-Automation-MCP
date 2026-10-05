@@ -562,8 +562,17 @@ class AuthHelpersTests(unittest.TestCase):
         self.assertIn("cookie_token", names)
         self.assertIn("UCTOKEN", names)
         self.assertIn("demo18-scm.hoolinks.com", domains)
-        self.assertIn(".hoolinks.com", domains)
+        self.assertNotIn(".hoolinks.com", domains)
 
+        shared_cookies = build_cookies_to_inject(
+            cookies_dict={"SESSION": "sess-123"},
+            token="tok-456",
+            target_host="demo18-scm.hoolinks.com",
+            include_parent_domain=True,
+        )
+        shared_domains = {c["domain"] for c in shared_cookies}
+        self.assertIn("demo18-scm.hoolinks.com", shared_domains)
+        self.assertIn(".hoolinks.com", shared_domains)
     def test_recognize_captcha_digits_requires_four_digits(self) -> None:
         from qa_automation.auth import recognize_captcha_digits
 
