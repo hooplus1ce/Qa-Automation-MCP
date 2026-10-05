@@ -100,6 +100,10 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
         """列出表格中的所有子表清单及各子表规模（名称、sheet_id、行数、列数、活跃状态）。
 
         若传入 url_or_file_id 则直接列出目标文档的所有子表；未传入时自动使用当前已连接文档。
+
+        Args:
+            url_or_file_id: 腾讯文档 URL 或 16 位 file_id（省略时使用当前已连接文档）
+            token: 腾讯文档 MCP 访问凭证 Token（省略时自动从环境变量读取）
         """
         try:
             # connect 与读取 _sheets_by_name 必须在同一把状态锁内完成,
@@ -526,6 +530,65 @@ def create_server(include_legacy_aliases: bool | None = None) -> FastMCP:
             raise ToolError(f"读取单元格失败: {e}") from e
         except Exception as e:
             raise ToolError(f"读取单元格发生异常: {e}") from e
+
+    @mcp.tool(
+        tags={"tencent_sheet", "tencent_docs", "style", "audit"},
+        annotations={"title": "全维度扫描表格视觉样式与元数据", "readOnlyHint": True},
+    )
+    @instrument_tool
+    async def tencent_sheet_scan_styles(
+        sheet_name: str | None = None,
+        tab_id: str | None = None,
+        url_or_file_id: str | None = None,
+    ) -> dict[str, Any]:
+        """通过无头浏览器直接在 V8 内存中全维度提取腾讯文档表格的富文本样式与结构元数据。
+
+        解决腾讯文档官方 OpenAPI 仅下发纯文本、剥离所有视觉样式的重大缺陷。覆盖以下所有维度：
+        1. 文字排版：中划删除线（废弃字段）、字体颜色（红/蓝/绿变动）、加粗（标题与关键字段）；
+        2. 背景填充：单元格高亮颜色（表头、预警、分组色块）；
+        3. 结构布局：合并单元格（区域跨度、分组标题块）、功能区块检测；
+        4. 语义解析：自动归类作废字段（deleted_fields）与重点修订字段（modified_fields）。
+
+        Args:
+            sheet_name: 子表名称（如 '02_BOM同步' 或 '01_物料主数据同步'）
+            tab_id: 子表 Tab ID（如 '000005'）
+            url_or_file_id: 表格 URL 或 file_id（缺省时自动使用当前已连接文档）
+        """
+        from ...tencent_sheet.scanner import scan_sheet_styles
+
+        try:
+            return await scan_sheet_styles(
+                url_or_file_id=url_or_file_id,
+                tab_id=tab_id,
+                sheet_name=sheet_name,
+            )
+        except TencentDocError as e:
+            raise ToolError(f"扫描表格样式元数据失败: {e}") from e
+        except Exception as e:
+            raise ToolError(f"扫描表格样式元数据发生异常: {e}") from e
+
+    @mcp.tool(
+        tags={"tencent_sheet", "tencent_docs", "audit"},
+        annotations={"title": "极速扫描删除线与标红字段(兼容别名)", "readOnlyHint": True},
+    )
+    @instrument_tool
+    async def tencent_sheet_scan_deleted_fields(
+        sheet_name: str | None = None,
+        tab_id: str | None = None,
+        url_or_file_id: str | None = None,
+    ) -> dict[str, Any]:
+        """向后兼容别名：全维度扫描表格视觉样式（重点返回删除线与标红字段）。
+
+        Args:
+            sheet_name: 目标子表名称（如 "字段需求变更明细"；与 tab_id 二选一）
+            tab_id: 目标子表 6 位英文/数字 ID（如 "BB08J2"）
+            url_or_file_id: 腾讯文档 URL 或 file_id；省略时使用当前已连接的文档
+        """
+        return await tencent_sheet_scan_styles(
+            sheet_name=sheet_name,
+            tab_id=tab_id,
+            url_or_file_id=url_or_file_id,
+        )
 
     # =======================================================================
     # 历史保留工具集：testcase_* 兼容别名（默认不暴露，避免与 tencent_sheet_* 冲突引发 AI 决策犹豫）
